@@ -14,8 +14,6 @@ interface LoopStoreLike {
   get(id: string): LoopEntry | undefined;
   create(trigger: Trigger, prompt: string, opts: {
     recurring: boolean;
-    autoTask?: boolean;
-    taskBacklog?: boolean;
     readOnly?: boolean;
     maxFires?: number;
     dynamic?: Partial<NonNullable<LoopEntry["dynamic"]>>;
@@ -60,8 +58,6 @@ export interface LoopToolsOptions {
   getScheduler: () => SchedulerLike;
   getMonitorManager: () => MonitorManagerLike;
   updateWidget: () => void;
-  maybeBootstrapTaskLoop: (entry: LoopEntry) => Promise<boolean>;
-  isTaskSystemReady: () => boolean;
   onDynamicLoopActivated?: (entry: LoopEntry) => void;
   cancelOrchestration?: (id: string, action: "pause" | "delete") => Promise<boolean>;
 }
@@ -159,6 +155,9 @@ function continueDynamicLoop(
     return { applied: false, message: `nextInterval exceeds loop #${params.id}'s remaining lifetime.` };
   }
 
+  if (entry.maxFires && (entry.fireCount ?? 0) >= entry.maxFires) {
+    return { applied: false, message: `Loop #${params.id} reached its fire cap. Complete or pause it; renewing the goal requires explicit authorization.` };
+  }
   const resumed = entry.status === "paused";
   const updated = store.continueDynamic(params.id, {
     prompt: params.prompt,
@@ -215,8 +214,6 @@ export function registerLoopTools(options: LoopToolsOptions): void {
     getScheduler,
     getMonitorManager,
     updateWidget,
-    maybeBootstrapTaskLoop,
-    isTaskSystemReady,
     onDynamicLoopActivated,
     cancelOrchestration,
   } = options;
@@ -226,25 +223,22 @@ export function registerLoopTools(options: LoopToolsOptions): void {
     label: "LoopCreate",
     renderCall: renderToolCall("Loop", (args) => `create · ${String(toolArg(args, "prompt") ?? "scheduled work").slice(0, 56)}`),
     renderResult: renderToolResult,
-    description: `Create a persistent cron, event, hybrid, or idle loop for recurring checks, event reactions, or autonomous backlog processing; never use shell sleep loops. Polling needs maxFires; observation-only loops should be readOnly. A completed iteration, unchanged result, or temporarily empty check is not a reason to delete the loop.`,
+    description: `Create a persistent cron, event, hybrid, or idle loop for recurring checks, event reactions, or agent-paced continuation; never use shell sleep loops. Polling needs maxFires; observation-only loops should be readOnly. A completed iteration, unchanged result, or temporarily empty check is not a reason to delete the loop.`,
     promptGuidelines: [
-      "Prefer event triggers; use triggerType `idle` with trigger `idle` for agent-paced continuation of one evolving goal that does not need WorkflowCreate phases/outcomes.",
-      "For autonomous backlogs use event `tasks:created`, recurring true, taskBacklog true, and bounded maxFires; never combine taskBacklog with autoTask or manually delete its loop.",
+      "Use LoopCreate with event triggers when possible, or triggerType `idle` with trigger `idle` for agent-paced continuation of one evolving goal.",
       "Use LoopDelete only for explicit cancellation or a satisfied stop condition—not after a normal, empty, or unchanged iteration. Report the created loop ID.",
     ],
     parameters: Type.Object({
       trigger: Type.String({ description: "Cron expression (e.g., '5m', '1h', '0 9 * * 1-5'), event source (e.g., 'tool_execution_start'), hybrid spec, or literal 'idle' with triggerType='idle'" }),
       prompt: Type.String({ description: "Prompt to run when the loop fires" }),
       recurring: Type.Optional(Type.Boolean({ description: "Whether loop repeats (default: true)", default: true })),
-      autoTask: Type.Optional(Type.Boolean({ description: "Auto-create pi-tasks task on fire", default: false })),
-      taskBacklog: Type.Optional(Type.Boolean({ description: "Native task queue worker only: requires recurring event trigger 'tasks:created' and auto-deletes when pending tasks reach zero", default: false })),
       triggerType: Type.Optional(Type.String({ description: "cron, event, hybrid, or idle (cron/event inferred from trigger string if omitted)", enum: ["cron", "event", "hybrid", "idle"] })),
       debounceMs: Type.Optional(Type.Number({ description: "Debounce for hybrid triggers (default: 30000)", default: 30000 })),
       readOnly: Type.Optional(Type.Boolean({ description: "Restrict the agent to read-only tools when this loop fires (default: false)", default: false })),
       maxFires: Type.Optional(Type.Integer({ description: "Auto-stop after N fires. Prevents infinite token burn on polling loops.", minimum: 1 })),
-    }),
+    }, { additionalProperties: false }),
     async execute(_toolCallId, params) {
-      const { trigger: triggerInput, prompt, recurring, autoTask, taskBacklog, triggerType, debounceMs, readOnly, maxFires } = params;
+      const { trigger: triggerInput, prompt, recurring, triggerType, debounceMs, readOnly, maxFires } = params;
 
       let trigger: Trigger;
       const inferred = triggerType ?? inferTriggerType(triggerInput);
@@ -288,31 +282,10 @@ export function registerLoopTools(options: LoopToolsOptions): void {
           expanded: [validationError],
         }));
       }
-      let backlogEventSource: string | undefined;
-      if (trigger.type === "event") backlogEventSource = trigger.source;
-      else if (trigger.type === "hybrid") backlogEventSource = trigger.event.source;
-      let backlogError: string | undefined;
-      if (taskBacklog && autoTask) backlogError = "taskBacklog loops cannot enable autoTask; backlog workers adopt existing tasks instead of creating more.";
-      else if (taskBacklog && recurring === false) backlogError = "taskBacklog loops must be recurring.";
-      else if (taskBacklog && backlogEventSource !== "tasks:created") {
-        backlogError = 'taskBacklog loops require a "tasks:created" event trigger. For a broad goal, use trigger "idle" with triggerType "idle" and omit taskBacklog.';
-      }
-      if (backlogError) {
-        return Promise.resolve(textResult(backlogError, {
-          kind: "loop",
-          action: "create",
-          tone: "error",
-          summary: "Backlog loop was not created",
-          expanded: [backlogError],
-        }));
-      }
-
       const entry = getStore().create(trigger, prompt, {
-        recurring: taskBacklog ? true : recurring ?? (inferred !== "event"),
-        autoTask,
-        taskBacklog,
+        recurring: recurring ?? true,
         readOnly,
-        maxFires: maxFires ?? (taskBacklog ? 25 : undefined),
+        maxFires: maxFires ?? 25,
         dynamic: trigger.type === "dynamic"
           ? { goal: prompt, iteration: 0 }
           : undefined,
@@ -337,7 +310,6 @@ export function registerLoopTools(options: LoopToolsOptions): void {
         }
       }
 
-      const bootstrapped = await maybeBootstrapTaskLoop(entry);
       updateWidget();
 
       const triggerDesc = trigger.type === "dynamic" ? "idle-driven" : formatTrigger(trigger, "create");
@@ -347,10 +319,6 @@ export function registerLoopTools(options: LoopToolsOptions): void {
         `Trigger: ${triggerDesc}\n` +
         `Recurring: ${entry.recurring}\n` +
         (trigger.type === "dynamic" ? "Wake: when idle (first wake queued now)\n" : "") +
-        (entry.autoTask ? "Auto-create task: enabled\n" : "") +
-        (entry.taskBacklog ? "Backlog worker: enabled\n" : "") +
-        (bootstrapped ? "Backlog: initial wake queued for existing pending tasks\n" : "") +
-        (isTaskSystemReady() ? "" : "Task system: not ready yet — autoTask may not fire until native fallback or pi-tasks becomes available\n") +
         `ID: ${entry.id} (persists until explicitly canceled or a configured stop condition is met)`,
         {
           kind: "loop",
@@ -360,7 +328,6 @@ export function registerLoopTools(options: LoopToolsOptions): void {
           expanded: [
             `Goal: ${entry.prompt}`,
             `Trigger: ${triggerDesc}`,
-            entry.autoTask ? "Auto-task: enabled" : "Auto-task: off",
           ],
         },
       ));
@@ -407,8 +374,6 @@ export function registerLoopTools(options: LoopToolsOptions): void {
           line += ` age: ${formatRemaining(Math.max(0, now - entry.createdAt))}`;
         }
         if (entry.pause) line += ` [pause:${entry.pause.kind}]`;
-        if (entry.autoTask) line += " [auto-task]";
-        if (entry.taskBacklog) line += " [backlog-worker]";
         if (entry.orchestration) {
           const counts = getOrchestrationCounts(entry.orchestration);
           line += ` [orchestration:${entry.orchestration.status}]`;
@@ -492,6 +457,7 @@ export function registerLoopTools(options: LoopToolsOptions): void {
         }));
       }
       const message = outcome.message;
+      pi.appendEntry("herdr-loops.update.v1", { ...params, at: Date.now() });
       updateWidget();
       const tone = params.status === "paused" ? "warning" : "success";
       const summary = params.status === "completed"

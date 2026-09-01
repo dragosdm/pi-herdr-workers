@@ -4,10 +4,6 @@ import type { LoopEntry, LoopExpiryDisposition, LoopExpiryReason } from "../type
 import type { NotificationRuntime } from "./notification-runtime.js";
 import type { LoopScope } from "./scope.js";
 
-export interface SessionSwitchEvent {
-  reason?: string;
-}
-
 // Wall-clock cadence for the idle heartbeat that pumps the scheduler. Cron is
 // minute-granular, so 30s gives sub-minute wake latency while idle.
 const HEARTBEAT_MS = 30_000;
@@ -84,6 +80,8 @@ export function registerSessionRuntimeHooks(options: SessionRuntimeOptions): voi
   let persistedShown = false;
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
   let agentStartFireCounts: ReadonlyMap<string, number> | undefined;
+  let liveCtx: ExtensionContext | undefined;
+  let pumping = false;
 
   const isCurrentGeneration = (generation: number) => generation === getSessionGeneration();
 
@@ -92,7 +90,7 @@ export function registerSessionRuntimeHooks(options: SessionRuntimeOptions): voi
   // while the agent is idle would never fire and never re-wake the agent. The
   // timer is unref'd so it never keeps a one-shot (`pi -p`) process alive.
   function ensureHeartbeat(): void {
-    if (heartbeatTimer) return;
+    if (heartbeatTimer || (liveCtx?.mode !== "tui" && liveCtx?.mode !== "rpc")) return;
     heartbeatTimer = setInterval(() => {
       const generation = getSessionGeneration();
       void pumpLoops(generation)
@@ -113,9 +111,7 @@ export function registerSessionRuntimeHooks(options: SessionRuntimeOptions): voi
 
   function upgradeStoreIfNeeded(ctx: ExtensionContext) {
     if (storeUpgraded) return;
-    if ((getLoopScope() === "session" || getLoopScope() === "memory") && !getPiLoopEnv()) {
-      recreateSessionStore(ctx.sessionManager.getSessionId());
-    }
+    recreateSessionStore(ctx.sessionManager.getSessionId());
     storeUpgraded = true;
   }
 
@@ -134,11 +130,7 @@ export function registerSessionRuntimeHooks(options: SessionRuntimeOptions): voi
       emitLoopExpired(record.entry, record.disposition, record.reason, generation);
     }
     if (!isCurrentGeneration(generation) || !isContextCurrent()) return;
-    const staleEventLoops = store.expireEventLoopEntries(sessionStartedAt);
-    for (const record of staleEventLoops) {
-      if (!isCurrentGeneration(generation)) return;
-      emitLoopExpired(record.entry, record.disposition, record.reason, generation);
-    }
+    // A reload/resume re-subscribes existing event loops; it is not cancellation.
     await recoverOrchestrations();
     if (!isCurrentGeneration(generation)) return;
     const triggerSystem = getTriggerSystem();
@@ -151,6 +143,9 @@ export function registerSessionRuntimeHooks(options: SessionRuntimeOptions): voi
   }
 
   async function pumpLoops(generation = getSessionGeneration()): Promise<void> {
+    if (pumping || !isContextCurrent()) return;
+    pumping = true;
+    try {
     await pumpOrchestrations();
     if (!isCurrentGeneration(generation)) return;
     const store = getStore();
@@ -169,12 +164,15 @@ export function registerSessionRuntimeHooks(options: SessionRuntimeOptions): voi
     }
     if (!isCurrentGeneration(generation)) return;
     scheduler.pump(Date.now(), (entry) => !pendingTasks.has(entry.id));
+    } finally { pumping = false; }
   }
 
   pi.on("session_start", async (_event, ctx) => {
     const generation = getSessionGeneration();
+    liveCtx = ctx;
     setLatestCtx(ctx);
     setSessionId(ctx.sessionManager.getSessionId());
+    notificationRuntime.syncRuntimeState({ agentRunning: !ctx.isIdle(), hasPendingMessages: ctx.hasPendingMessages() });
     widget.setUICtx(ctx.ui);
     upgradeStoreIfNeeded(ctx);
     ensureHeartbeat();
@@ -215,7 +213,8 @@ export function registerSessionRuntimeHooks(options: SessionRuntimeOptions): voi
     agentStartFireCounts = new Map(getStore().list().map((entry) => [entry.id, entry.fireCount ?? 0]));
   });
 
-  pi.on("agent_end", async (_event, ctx) => {
+  pi.on("agent_settled", async (_event, ctx) => {
+    if (!ctx.isIdle()) return;
     const generation = getSessionGeneration();
     setLatestCtx(ctx);
     widget.setUICtx(ctx.ui);
@@ -231,7 +230,7 @@ export function registerSessionRuntimeHooks(options: SessionRuntimeOptions): voi
     agentStartFireCounts = undefined;
     await pumpOrchestrations();
     if (!isCurrentGeneration(generation)) return;
-    await flushPendingNotifications({ ignorePendingMessages: true });
+    await flushPendingNotifications();
     if (!isCurrentGeneration(generation)) return;
     await pumpLoops(generation);
   });
@@ -251,28 +250,13 @@ export function registerSessionRuntimeHooks(options: SessionRuntimeOptions): voi
     await shutdownMonitors();
   });
 
-  pi.on("session_switch" as never, async (event: SessionSwitchEvent, ctx: ExtensionContext) => {
-    const generation = advanceSessionGeneration();
-    clearWorkflowMonitorWaits();
-    getTriggerSystem().stop();
-    stopHeartbeat();
-    notificationRuntime.clear("session_switch");
-    releaseTaskBacklogWakes();
-    await shutdownOrchestrations();
-    setSessionId(undefined);
-    storeUpgraded = false;
-    persistedShown = false;
-    await shutdownMonitors();
-    if (!isCurrentGeneration(generation)) return;
-
+  // pi recreates the extension on /new, /resume, /fork and /reload.
+  // /tree stays in this runtime; controllers are operational facts, not replayable actions.
+  pi.on("session_tree", (_event, ctx) => {
+    liveCtx = ctx;
     setLatestCtx(ctx);
     widget.setUICtx(ctx.ui);
-    const isResume = event?.reason === "resume";
-    setSessionId(ctx.sessionManager.getSessionId());
-    upgradeStoreIfNeeded(ctx);
-    if (!isResume && getLoopScope() === "memory") clearAllLoops();
-    await showPersistedLoops(generation);
-    if (isCurrentGeneration(generation)) widget.update();
+    widget.update();
   });
 
   pi.on("tool_execution_end", async (event: unknown, ctx: ExtensionContext) => {

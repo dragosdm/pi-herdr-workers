@@ -29,9 +29,9 @@ export function registerMonitorTools(options: MonitorToolsOptions): void {
       command: Type.String({ description: "Shell command to run in a Monitor pane" }),
       description: Type.Optional(Type.String({ description: "Human-readable description" })),
     }),
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, signal, _onUpdate, ctx) {
       try {
-        const entry = await getMonitors().create(params.command, params.description);
+        const entry = await getMonitors().create(params.command, params.description, ctx.cwd, signal);
         updateWidget();
         const reuse = entry.reused ? "reused existing pane" : "new pane";
         return textResult(
@@ -63,7 +63,7 @@ export function registerMonitorTools(options: MonitorToolsOptions): void {
     renderResult: renderToolResult,
     description: "List Herdr Monitor panes with status, command, pane id, and a short output tail.",
     parameters: Type.Object({}),
-    async execute() {
+    async execute(_id, _params, signal) {
       const manager = getMonitors();
       const monitors = manager.list();
       if (monitors.length === 0) {
@@ -73,16 +73,18 @@ export function registerMonitorTools(options: MonitorToolsOptions): void {
       }
       const lines: string[] = [];
       for (const raw of monitors) {
-        const m: HerdrMonitor = await manager.refresh(raw);
+        const m: HerdrMonitor = await manager.refresh(raw, signal);
         const icon = m.status === "running" ? ">" : m.status === "idle" ? "ok" : "x";
         lines.push(`${icon} #${m.id} [${m.status}] ${m.command.slice(0, 60)} · pane ${m.paneId} (${formatAge(Date.now() - m.startedAt)})`);
         try {
-          const tail = await manager.readTail(m.paneId, 5);
+          const tail = await manager.readTail(m.paneId, 5, signal);
           for (const out of tail) lines.push(`  | ${out.slice(0, 100)}`);
         } catch {
+          signal?.throwIfAborted();
           lines.push("  | (could not read pane)");
         }
       }
+      updateWidget();
       const running = monitors.filter((monitor) => monitor.status === "running").length;
       return textResult(lines.join("\n"), {
         kind: "monitor",
@@ -103,8 +105,8 @@ export function registerMonitorTools(options: MonitorToolsOptions): void {
     parameters: Type.Object({
       monitorId: Type.String({ description: "Monitor ID to stop" }),
     }),
-    async execute(_toolCallId, params) {
-      const stopped = await getMonitors().stop(params.monitorId);
+    async execute(_toolCallId, params, signal) {
+      const stopped = await getMonitors().stop(params.monitorId, signal);
       updateWidget();
       if (stopped) {
         return textResult(`Monitor #${params.monitorId} interrupted; pane kept for reuse`, {

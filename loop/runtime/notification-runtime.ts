@@ -58,11 +58,14 @@ export interface NotificationRuntimeOptions {
   hasPendingTasks: () => Promise<number>;
   cleanDoneTasks: () => Promise<void>;
   getHasPendingMessages: () => boolean;
-  onLoopNotificationDelivered?: (data: { loopId: string; orchestrationWakeSequence?: number }) => void;
+  onLoopNotificationDelivered?: (data: { loopId: string; readOnly?: boolean; orchestrationWakeSequence?: number }) => void;
+  onPendingChanged?: (pending: ReducerNotification[]) => void;
   debug?: (...args: unknown[]) => void;
 }
 
 export interface NotificationRuntime {
+  restore(pending: ReducerNotification[]): void;
+  acknowledge(deliveryKey: string): void;
   syncRuntimeState(options?: { agentRunning?: boolean; hasPendingMessages?: boolean }): void;
   queueOrDeliverNotification(data: LoopFireEvent): Promise<void>;
   queueOrDeliverLoopExpired(data: LoopExpiredPayload & { sessionGeneration?: number }): Promise<void>;
@@ -82,6 +85,7 @@ export function createNotificationRuntime(options: NotificationRuntimeOptions): 
   };
   let flushPromise: Promise<void> | undefined;
   let sessionGeneration = 0;
+  const inFlight = new Map<string, ReducerNotification>();
 
   type NotificationDispatchResult = {
     kind: "delivery";
@@ -91,13 +95,14 @@ export function createNotificationRuntime(options: NotificationRuntimeOptions): 
   const notificationReducerHandler: ReducerHandler = (incoming: ReducerEvent) => {
     const result = reduceNotificationState(notificationState, incoming as NotificationReducerEvent);
     notificationState = result.state;
+    checkpoint(incoming.type);
     return result.effects;
   };
 
   const notificationCoordinator = createCoordinator<NotificationDispatchResult>({
     reducers: [notificationReducerHandler],
     effectHandlers: {
-      REQUEST_NOTIFICATION_FLUSH: () => {},
+      REQUEST_NOTIFICATION_FLUSH: () => undefined,
       DELIVER_NOTIFICATION: async (effect: ReducerEffect) => ({
         kind: "delivery",
         delivered: await deliverNotification(
@@ -110,7 +115,15 @@ export function createNotificationRuntime(options: NotificationRuntimeOptions): 
   function applyNotificationEvent(event: NotificationReducerEvent) {
     const result = reduceNotificationState(notificationState, event);
     notificationState = result.state;
+    checkpoint(event.type);
     return result;
+  }
+
+  function checkpoint(type: string) {
+    // Never journal transient idle flags or remove an in-flight wake before delivery.
+    if (type === "NOTIFICATION_QUEUED" || type === "NOTIFICATION_DROPPED" || type === "delivered") {
+      options.onPendingChanged?.(structuredClone([...Object.values(notificationState.notificationsByKey), ...inFlight.values()]));
+    }
   }
 
   function syncRuntimeState(options?: { agentRunning?: boolean; hasPendingMessages?: boolean }) {
@@ -259,6 +272,7 @@ export function createNotificationRuntime(options: NotificationRuntimeOptions): 
       if (dynamic?.state) lines.push(`State: ${dynamic.state}`);
       if (dynamic?.metrics) lines.push(`Metrics: ${dynamic.metrics}`);
       if (dynamic?.doneCriteria) lines.push(`Done criteria: ${dynamic.doneCriteria}`);
+      if (data.fireLimitReached) lines.push("Fire cap reached: no further automatic wake is allowed. Use LoopUpdate completed if done, or paused if unfinished; renewal needs explicit authorization.");
       lines.push(
         `Loop lifecycle: Loop #${loopId} is the persistent controller for the overall goal. Do not call LoopDelete after this iteration.`,
         "Before ending this turn, call LoopUpdate exactly once: use status=\"completed\" only when the overall goal and done criteria are satisfied; use status=\"continue\" when any work remains, with state/metrics and optional nextInterval; use status=\"paused\" only when genuinely blocked. Omit nextInterval for an idle-driven rewake.",
@@ -357,12 +371,15 @@ export function createNotificationRuntime(options: NotificationRuntimeOptions): 
       return false;
     }
     syncRuntimeState({ agentRunning: true });
+    const deliveryKey = `${notification.key}:${notification.timestamp}`;
+    inFlight.set(deliveryKey, notification);
     pi.sendMessage({
       customType: "pi-loop",
       content: notification.message,
       display: false,
       details: {
         loopId: notification.loopId,
+        deliveryKey,
         trigger: notification.trigger,
         recurring: notification.recurring,
         persistent: notification.persistent,
@@ -380,6 +397,7 @@ export function createNotificationRuntime(options: NotificationRuntimeOptions): 
     try {
       onLoopNotificationDelivered?.({
         loopId: notification.loopId,
+        readOnly: notification.readOnly,
         orchestrationWakeSequence: (notification as ReducerNotification & { orchestrationWakeSequence?: number }).orchestrationWakeSequence,
       });
     } catch (error) {
@@ -499,6 +517,12 @@ export function createNotificationRuntime(options: NotificationRuntimeOptions): 
   }
 
   return {
+    acknowledge(deliveryKey) {
+      if (inFlight.delete(deliveryKey)) checkpoint("delivered");
+    },
+    restore(pending) {
+      notificationState.notificationsByKey = Object.fromEntries(pending.map((n) => [n.key, { ...n, sessionGeneration }]));
+    },
     syncRuntimeState,
     queueOrDeliverNotification,
     queueOrDeliverLoopExpired,

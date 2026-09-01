@@ -32,6 +32,8 @@ function truncateToolContent(content: string): string {
 }
 
 export function textResult(msg: string, details?: ToolDisplayDetails) {
+  // Returning an error-colored result is still a SUCCESS to pi. Throw for isError semantics.
+  if (details?.tone === "error") throw new Error(truncateToolContent(msg));
   const display = details
     ? { ...details, expandable: details.expandable ?? Boolean(details.expanded?.length) }
     : undefined;

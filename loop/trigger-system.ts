@@ -66,6 +66,7 @@ export class TriggerSystem {
     if (subs.has(entry.id)) return;
 
     const unsub = this.pi.events.on(source, (data: unknown) => {
+      if (!this.matchesFilter(data, filter)) return;
       if (entry.trigger.type === "hybrid") {
         this.handleHybridFire(entry, data);
       } else {
@@ -99,6 +100,7 @@ export class TriggerSystem {
       this.fireLoop(entry);
     }, remaining);
 
+    timer.unref?.();
     this.hybridTimers.set(entry.id, timer);
   }
 

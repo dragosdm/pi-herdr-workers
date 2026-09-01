@@ -14,7 +14,7 @@
  *   /orchestrated-by <id>          same
  *
  * Both sides get the SendToAgent tool. Delivery goes through a per-pane inbox that this
- * extension watches; receivers inject the message as a user message (steer when priority,
+ * extension watches; receivers inject a durable custom message (steer when priority,
  * follow-up otherwise). Targets that are not a listening pi fall back to `herdr agent prompt`.
  */
 
@@ -70,6 +70,8 @@ interface WorkerMeta {
 }
 
 interface State {
+	version?: 1;
+	sessionId?: string;
 	teamMode?: boolean; // set once /team is used here -> this pi is an orchestrator
 	workers: string[]; // herdr agent names we orchestrate
 	meta?: Record<string, WorkerMeta>;
@@ -137,6 +139,11 @@ export default function (pi: ExtensionAPI) {
 	let watcher: fs.FSWatcher | undefined;
 	let poller: ReturnType<typeof setInterval> | undefined;
 	let draining = false;
+	let stopped = false;
+	const lifetime = new AbortController();
+	let createQueue = Promise.resolve();
+	const inFlightEnvelopes = new Set<string>();
+	const interactive = () => HERDR_ENV && !!SELF_PANE && ctxRef?.mode === "tui" && !stopped;
 
 	pi.registerFlag("orchestrated-by", {
 		description: "Herdr worker: id (agent name or pane id) of the orchestrator controlling this pi",
@@ -150,7 +157,11 @@ export default function (pi: ExtensionAPI) {
 	// ── herdr helpers ──
 
 	async function herdr(args: string[], opts: { timeout?: number; signal?: AbortSignal } = {}): Promise<any> {
-		const res = await pi.exec("herdr", args, { timeout: opts.timeout ?? 15000, signal: opts.signal });
+		const operationSignal = opts.signal ?? ctxRef?.signal;
+		const signal = operationSignal ? AbortSignal.any([operationSignal, lifetime.signal]) : lifetime.signal;
+		signal.throwIfAborted();
+		const res = await pi.exec("herdr", args, { timeout: opts.timeout ?? 15000, signal });
+		signal.throwIfAborted();
 		const out = (res.stdout || "").trim();
 		const err = (res.stderr || "").trim();
 		if (res.code !== 0) {
@@ -210,7 +221,10 @@ export default function (pi: ExtensionAPI) {
 	// ── persistence + ui ──
 
 	function persist() {
-		pi.appendEntry(ENTRY_TYPE, state);
+		if (stopped || !ctxRef) return;
+		state.version = 1;
+		state.sessionId = ctxRef.sessionManager.getSessionId();
+		pi.appendEntry(ENTRY_TYPE, structuredClone(state));
 	}
 
 	function restore(ctx: ExtensionContext) {
@@ -218,23 +232,25 @@ export default function (pi: ExtensionAPI) {
 		for (const entry of ctx.sessionManager.getBranch()) {
 			if (entry.type === "custom" && entry.customType === ENTRY_TYPE) found = entry.data as State;
 		}
-		state = found ? { ...found, workers: [...(found.workers ?? [])], meta: { ...(found.meta ?? {}) } } : { workers: [] };
+		// A clone must not acquire the source session's live team authority.
+		if (found?.sessionId && found.sessionId !== ctx.sessionManager.getSessionId()) found = undefined;
+		state = found && Array.isArray(found.workers) ? structuredClone(found) : { workers: [] };
 	}
 
 	function statusText(): string | undefined {
 		const parts: string[] = [];
-		if (state.workers.length) parts.push(`Orchestrating: ${state.workers.join(", ")}`);
-		else if (state.teamMode && !state.orchestratedBy) parts.push("Orchestrator (no workers yet)");
-		if (state.orchestratedBy) parts.push(`Orchestrated by: ${state.orchestratedBy}`);
+		if (state.workers.length) parts.push(`team · ${state.workers.length} worker${state.workers.length === 1 ? "" : "s"} · /team list`);
+		else if (state.teamMode && !state.orchestratedBy) parts.push("team · orchestrator");
+		if (state.orchestratedBy) parts.push(`team ⇐ ${state.orchestratedBy.replace(/[\x00-\x1f\x7f-\x9f]/g, " ").slice(0, 40)}`);
 		return parts.length ? parts.join(" · ") : undefined;
 	}
 
 	function inTeam(): boolean {
-		return state.workers.length > 0 || !!state.orchestratedBy;
+		return interactive() && (state.workers.length > 0 || !!state.orchestratedBy);
 	}
 
 	function isOrchestrator(): boolean {
-		return HERDR_ENV && !!state.teamMode && !state.orchestratedBy;
+		return interactive() && !!state.teamMode && !state.orchestratedBy;
 	}
 
 	/**
@@ -257,7 +273,7 @@ export default function (pi: ExtensionAPI) {
 		const ctx = ctxRef;
 		if (!ctx?.hasUI) return;
 		const text = statusText();
-		ctx.ui.setStatus(STATUS_KEY, text ? ctx.ui.theme.fg("accent", text) : undefined);
+		ctx.ui.setStatus(STATUS_KEY, text);
 		void updatePaneTitle();
 	}
 
@@ -278,7 +294,7 @@ export default function (pi: ExtensionAPI) {
 	// ── inbox (receiving) ──
 
 	function startListening() {
-		if (!HERDR_ENV || !SELF_PANE || watcher) return;
+		if (!interactive() || watcher || poller) return;
 		const dir = inboxDir(SELF_PANE);
 		fs.mkdirSync(dir, { recursive: true });
 		fs.writeFileSync(listeningFile(SELF_PANE), JSON.stringify({ pid: process.pid, ts: Date.now(), id: selfId() }));
@@ -301,7 +317,7 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	async function drainInbox() {
-		if (draining || !SELF_PANE) return;
+		if (draining || !interactive()) return;
 		draining = true;
 		try {
 			const dir = inboxDir(SELF_PANE);
@@ -312,16 +328,22 @@ export default function (pi: ExtensionAPI) {
 				return;
 			}
 			for (const f of files) {
+				if (stopped) return;
+				if (inFlightEnvelopes.has(f)) continue;
 				const full = path.join(dir, f);
+				const acknowledged = ctxRef?.sessionManager.getEntries().some((e) => e.type === "custom_message" && e.customType === "herdr-worker.message" && (e.details as { envelopeId?: string })?.envelopeId === f);
+				if (acknowledged) { fs.rmSync(full, { force: true }); continue; }
 				let env: Envelope | undefined;
 				try {
 					env = JSON.parse(fs.readFileSync(full, "utf8"));
 				} catch {
 					continue; // probably mid-write; next drain picks it up
 				}
-				fs.rmSync(full, { force: true });
-				if (env) await deliver(env);
+				if (env) await deliver(env, f);
+				if (!stopped && !inFlightEnvelopes.has(f)) fs.rmSync(full, { force: true });
 			}
+		} catch (error) {
+			if (!stopped && ctxRef?.hasUI) ctxRef.ui.notify(`Team inbox: ${error instanceof Error ? error.message : String(error)}`, "warning");
 		} finally {
 			draining = false;
 		}
@@ -343,9 +365,11 @@ export default function (pi: ExtensionAPI) {
 		return out;
 	}
 
-	async function deliver(env: Envelope) {
+	async function deliver(env: Envelope, envelopeId: string) {
 		const ctx = ctxRef;
+		if (!env.from || typeof env.from.id !== "string" || typeof env.message !== "string") return;
 		const peers = await knownPeerPanes();
+		if (stopped) return;
 		const known = env.from?.paneId ? peers.get(env.from.paneId) : undefined;
 
 		if (env.type === "control") {
@@ -359,7 +383,7 @@ export default function (pi: ExtensionAPI) {
 				persist();
 				updateUi();
 				ctx?.hasUI && ctx.ui.notify(`Now orchestrated by ${env.from.id}`, "info");
-			} else if (env.action === "released" && state.orchestratedBy === env.from.id) {
+			} else if (env.action === "released" && known && state.orchestratedBy === env.from.id) {
 				state.orchestratedBy = undefined;
 				persist();
 				updateUi();
@@ -376,11 +400,10 @@ export default function (pi: ExtensionAPI) {
 				);
 			return;
 		}
-		const text = frameMessage(env);
-		const idle = ctx?.isIdle() ?? true;
-		if (idle) pi.sendUserMessage(text);
-		else pi.sendUserMessage(text, { deliverAs: env.priority ? "steer" : "followUp" });
-		ctx?.hasUI && ctx.ui.notify(`Message from ${env.from.id}${idle ? "" : env.priority ? " (steer)" : " (follow-up)"}`, "info");
+		inFlightEnvelopes.add(envelopeId);
+		// The mailbox is the outbox until pi actually persists this custom message.
+		pi.sendMessage({ customType: "herdr-worker.message", content: frameMessage(env), display: true,
+			details: { envelopeId, from: env.from } }, { triggerTurn: true, deliverAs: env.priority ? "steer" : "followUp" });
 	}
 
 	// ── sending ──
@@ -401,7 +424,7 @@ export default function (pi: ExtensionAPI) {
 		fs.mkdirSync(dir, { recursive: true });
 		const name = `${String(env.ts).padStart(15, "0")}-${Math.random().toString(36).slice(2, 8)}.json`;
 		const tmp = path.join(dir, `.${name}.tmp`);
-		fs.writeFileSync(tmp, JSON.stringify(env));
+		fs.writeFileSync(tmp, JSON.stringify(env), { mode: 0o600 });
 		fs.renameSync(tmp, path.join(dir, name));
 	}
 
@@ -460,7 +483,7 @@ export default function (pi: ExtensionAPI) {
 		label: "Send To Agent",
 		description:
 			"Send a message to another of your user's agents running in a herdr pane (an orchestrator or a worker). " +
-			"The message is delivered asynchronously and shows up in their chat as an '[agent] ...' user message; replies come back the same way on a later turn. " +
+			"The message is delivered asynchronously and shows up in their chat as an '[agent] ...' custom message; replies come back the same way on a later turn. " +
 			"target_id is the herdr agent name (e.g. a worker name) or pane id. priority=true steers the target mid-task (interrupts its current turn); priority=false queues a follow-up after its current work finishes.",
 		promptSnippet: "Message another herdr-hosted agent (orchestrator ↔ worker) asynchronously",
 		promptGuidelines: [
@@ -532,7 +555,8 @@ export default function (pi: ExtensionAPI) {
 		const base = (requested.startsWith(WORKER_PREFIX) ? requested : `${WORKER_PREFIX}${requested}`).slice(0, 32);
 		if (!taken.has(base)) return base;
 		for (let i = 2; i < 1000; i++) {
-			const candidate = `${base}-${i}`.slice(0, 32);
+			const suffix = `-${i}`;
+			const candidate = `${base.slice(0, 32 - suffix.length)}${suffix}`;
 			if (!taken.has(candidate)) return candidate;
 		}
 		throw new Error(`Could not find a free name based on "${base}"`);
@@ -629,6 +653,7 @@ export default function (pi: ExtensionAPI) {
 		const split = await herdr(["pane", "split", target.pane, "--direction", target.direction, "--cwd", ctx.cwd, "--no-focus"]);
 		const paneId: string | undefined = split?.result?.pane?.pane_id;
 		if (!paneId) throw new Error(`pane split returned no pane id: ${JSON.stringify(split)}`);
+		pi.appendEntry("herdr-worker.operation.v1", { name, paneId, phase: "pane-created", at: Date.now() });
 		if (target.swap) {
 			await herdr(["pane", "swap", "--source-pane", SELF_PANE, "--target-pane", paneId]).catch(() => {});
 		}
@@ -641,6 +666,7 @@ export default function (pi: ExtensionAPI) {
 		try {
 			await herdr(["agent", "start", name, "--kind", "pi", "--pane", paneId, "--timeout", "60000", "--", ...piArgs], { timeout: 70000 });
 		} catch (e: any) {
+			if (!stopped) pi.appendEntry("herdr-worker.operation.v1", { name, paneId, phase: "start-failed", at: Date.now() });
 			throw new Error(`Started pane ${paneId} but agent start failed: ${e.message}. Check \`herdr pane read ${paneId}\`.`);
 		}
 
@@ -700,11 +726,14 @@ export default function (pi: ExtensionAPI) {
 		}),
 		async execute(_id, params, _signal, onUpdate, ctx) {
 			if (!isOrchestrator()) throw new Error("CreateAgentPanel is only available to an orchestrator (run /team here first).");
-			onUpdate?.({ content: [{ type: "text", text: "Splitting pane and starting worker…" }] });
-			const r = await createAgent(
+			onUpdate?.({ content: [{ type: "text", text: "Splitting pane and starting worker…" }], details: {} });
+			const create = () => createAgent(
 				{ name: params.name, direction: params.direction as Direction | undefined, type: params.type, purpose: params.purpose, model: params.model, thinking: params.thinking, initialPrompt: params.initial_prompt },
 				ctx,
 			);
+			const pending = createQueue.then(() => { _signal?.throwIfAborted(); return create(); });
+			createQueue = pending.then(() => {}, () => {});
+			const r = await pending;
 			const meta = state.meta?.[r.name];
 			const text = [
 				`Worker ${r.name} ready in pane ${r.paneId} (${r.how}).`,
@@ -782,6 +811,7 @@ export default function (pi: ExtensionAPI) {
 		},
 		handler: async (args, ctx) => {
 			const [verb, ...rest] = args.trim().split(/\s+/).filter(Boolean);
+			if (!interactive()) { ctx.ui.notify("Teams require an interactive pi in Herdr.", "error"); return; }
 			try {
 				let msg: string;
 				if (!state.orchestratedBy && !state.teamMode) {
@@ -790,7 +820,7 @@ export default function (pi: ExtensionAPI) {
 					updateUi();
 				}
 				if (!verb || verb === "list" || verb === "status") {
-					msg = statusText() ?? "Team mode on (CreateAgentPanel available). Usage: /team add [right|down|left|up] [type] [purpose…]";
+					msg = [statusText(), ...state.workers.map((w) => `${w}${state.meta?.[w]?.paneId ? ` · ${state.meta[w].paneId}` : ""}`)].filter(Boolean).join("\n") || "No team.";
 				} else if (verb === "release") {
 					msg = await release(rest[0] ?? "");
 				} else if (verb === "from") {
@@ -816,6 +846,7 @@ export default function (pi: ExtensionAPI) {
 		description: "Herdr: mark this pi as a worker controlled by <agent name or pane id>",
 		handler: async (args, ctx) => {
 			try {
+				if (!interactive()) throw new Error("Teams require an interactive pi in Herdr.");
 				ctx.ui.notify(await setOrchestrator(args.trim()), "info");
 			} catch (e: any) {
 				ctx.ui.notify(e.message ?? String(e), "error");
@@ -843,13 +874,13 @@ export default function (pi: ExtensionAPI) {
 				`- Respect each worker's charter: do not ask an explore-only agent to edit files; spawn an implement agent instead.`,
 				`- Delegate with SendToAgent({ target_id, message, priority }). Briefs must be self-contained: goal, relevant context you already have, constraints, definition of done, and what to report back.`,
 				`- priority: true steers the worker mid-task (interrupts its current turn) — use for corrections/stop. priority: false (default) queues a follow-up after its current work.`,
-				`- Replies arrive asynchronously as "[agent]" user messages on a later turn. Do not poll or block for them; finish your turn. To peek at a worker: \`herdr agent get <id>\`, \`herdr agent read <id> --source recent-unwrapped --lines 80\`.`,
+				`- Replies arrive asynchronously as "[agent]" custom messages on a later turn. Do not poll or block for them; finish your turn. To peek at a worker: \`herdr agent get <id>\`, \`herdr agent read <id> --source recent-unwrapped --lines 80\`.`,
 				`- Your id (workers reply to it): ${me}.`,
 			);
 		}
 		if (state.orchestratedBy) {
 			sections.push(
-				`You are being controlled by an orchestrator: ${state.orchestratedBy} — another of your user's pi agents in a neighboring herdr pane. Task briefs arrive as "[agent]" user messages; your user sees them too and may chime in directly.`,
+				`You are being controlled by an orchestrator: ${state.orchestratedBy} — another of your user's pi agents in a neighboring herdr pane. Task briefs arrive as "[agent]" custom messages; your user sees them too and may chime in directly.`,
 				...(state.role?.type || state.role?.purpose
 					? [
 							`- Your role in the team: ${[state.role.type, state.role.purpose].filter(Boolean).join(" — ")}.${state.role.type && TYPE_HINTS[state.role.type] ? ` ${TYPE_HINTS[state.role.type]}` : ""} Stay within this charter; if a request falls outside it, say so to the orchestrator instead of doing it.`,
@@ -868,7 +899,7 @@ export default function (pi: ExtensionAPI) {
 	pi.on("session_start", async (event, ctx) => {
 		ctxRef = ctx;
 		restore(ctx);
-		if (!HERDR_ENV) {
+		if (!interactive()) {
 			state = { workers: [] };
 			syncTool(); // no herdr -> no team -> no tool
 			return;
@@ -890,10 +921,31 @@ export default function (pi: ExtensionAPI) {
 		updateUi(); // also gates the SendToAgent tool
 	});
 
-	pi.on("session_shutdown", async () => {
-		stopListening();
-		if (HERDR_ENV && SELF_PANE) {
-			await herdr(["pane", "report-metadata", SELF_PANE, "--source", META_SOURCE, "--clear-title"]).catch(() => {});
+	function acknowledgePersistedInbox(ctx: ExtensionContext) {
+		if (!inFlightEnvelopes.size) return;
+		// message_end precedes persistence; only acknowledge records actually in SessionManager.
+		for (const entry of ctx.sessionManager.getEntries()) {
+			if (entry.type !== "custom_message" || entry.customType !== "herdr-worker.message") continue;
+			const id = (entry.details as { envelopeId?: string })?.envelopeId;
+			if (id && inFlightEnvelopes.delete(id) && /^[a-zA-Z0-9_.-]+\.json$/.test(id)) {
+				try { fs.rmSync(path.join(inboxDir(SELF_PANE), id), { force: true }); } catch {}
+			}
 		}
+	}
+	pi.on("context", (_event, ctx) => acknowledgePersistedInbox(ctx));
+	pi.on("agent_settled", (_event, ctx) => acknowledgePersistedInbox(ctx));
+	pi.on("session_tree", (_event, ctx) => {
+		ctxRef = ctx;
+		restore(ctx);
+		updateUi();
+	});
+	pi.on("session_shutdown", async () => {
+		// Headless sessions must not remove the interactive pane's listener file.
+		const wasListening = !!watcher || !!poller;
+		stopped = true;
+		lifetime.abort();
+		if (wasListening) stopListening();
+		if (ctxRef?.hasUI) ctxRef.ui.setStatus(STATUS_KEY, undefined);
+		ctxRef = undefined;
 	});
 }

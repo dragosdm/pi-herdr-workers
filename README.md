@@ -1,6 +1,6 @@
 # pi-herdr-workers
 
-One Pi package for **teams of agents in [Herdr](https://herdr.dev) panes**, **scheduled/event/idle `/loop` re-wakes**, and **background monitors** that are just Herdr panes.
+One Pi package for **teams of agents in [Herdr](https://herdr.dev) panes**, **`/split-handoff` / `/split-fork`**, **scheduled/event/idle `/loop` re-wakes**, and **background monitors** that are just Herdr panes.
 
 No extra npm dependencies. Peer APIs come from Pi (`pi-coding-agent`, `pi-tui`, `typebox`). Requires a Herdr-managed pane (`HERDR_ENV=1`) for `/team` and monitors.
 
@@ -48,7 +48,21 @@ Workers are named `agent-<name>` (or `agent-<type>` / `agent-N`). First worker o
 { "target_id": "agent-explore", "message": "…", "priority": false }
 ```
 
-`priority: true` steers; otherwise follow-up. Transport is a per-pane inbox under `$XDG_RUNTIME_DIR/pi-herdr-worker/`. Non-Pi targets fall back to `herdr agent prompt`.
+`priority: true` steers; otherwise follow-up. Transport is a per-pane inbox under `$XDG_RUNTIME_DIR/pi-herdr-worker/`. Pi receives a durable, model-visible custom message attributed to the sending agent, not a fabricated user message. Non-Pi targets fall back to `herdr agent prompt`.
+
+---
+
+## `/split-handoff` and `/split-fork`
+
+Unfocused named Pi splits in the current Herdr tab (first split right, later ones down).
+
+| Command | Effect |
+|---|---|
+| `/split-handoff [goal]` | Runs a **summarize/crystallize** pass on this thread (current model), then starts a new Pi in a split with that handoff — not a raw transcript dump |
+| `/split-fork [instruction]` | Clones the active session branch into a new pane; this pane keeps going |
+| `/splits` | Durable split history; `/splits cancel` aborts a startup |
+
+Status bar shows `split · summarizing` then pane/start/prompt. Herdr layout is the same as before; the missing piece was the handoff write-up.
 
 ---
 
@@ -68,7 +82,13 @@ Tools: `LoopCreate`, `LoopList`, `LoopUpdate`, `LoopDelete`.
 - Event: a Pi event source
 - Idle/dynamic: `/loop <goal>` then `LoopUpdate` with `continue` / `paused` / `completed`
 
-State lives under `.pi/loops/` (session-scoped by default). Recurring loops expire after seven days unless recreated. Cap: 25 loops.
+State is journaled in pi's session JSONL via `appendEntry` by default. Existing session-specific `.pi/loops/` snapshots are imported on first use, without deleting the originals. Explicit project/shared-file scopes still use the locked file store, with a session-log audit mirror. `PI_LOOP_SCOPE=memory` remains ephemeral.
+
+Recurring loops expire after seven days unless recreated. Cap: 25 loops. `LoopCreate` defaults to 25 wakes unless `maxFires` is supplied; `/loop` scheduled/event loops cap at 25, and dynamic goals at 20.
+
+Event subscriptions survive reload/resume. Wakes wait for `agent_settled`, not the end of an individual retry or tool cycle. Built-in `tool_execution_start`, `tool_execution_end`, `turn_start`, `turn_end`, and `agent_settled` events are bridged onto the extension bus; Loop tools do not trigger their own tool-event loops. Other sources must be emitted by an extension.
+
+Read-only wakes enforce a tool-call gate (read/search/list and loop bookkeeping only); shell commands and arbitrary custom tools are blocked until the run settles. This deliberately stays conservative if other work is queued during that run.
 
 ---
 
@@ -78,9 +98,11 @@ State lives under `.pi/loops/` (session-scoped by default). Recurring loops expi
 
 - Ensures a **Monitor** tab in the current workspace
 - Each command gets a **down-split** pane titled `mon:<hash> <command>`
-- **The same command reuses that pane**
+- **The same command in the same cwd reuses that pane**
 - Panes **stay open** when the command finishes
-- `MonitorStop` sends `ctrl+c` only — it does not close the pane
+- Creating an already-running monitor attaches to it; it never sends `ctrl+c` or restarts it
+- `MonitorStop` validates the pane identity and current process state before sending `ctrl+c` — it does not close the pane
+- Handles and command/cwd metadata survive reload; restored process status starts **unknown**, and `MonitorList` refreshes it
 
 ```text
 MonitorCreate command="npm test" description="Run test suite"
@@ -89,6 +111,16 @@ MonitorStop monitorId="1"
 ```
 
 ---
+
+## Durable state and lifecycle
+
+- Team snapshots are immutable, versioned, restored on `session_start` and `/tree`, and scoped to the source session. A new fork does not inherit another session's worker-control authority. Legacy unversioned team records remain readable.
+- Loops and monitor handles are **operational facts**: `/tree` does not undo an external launch or resurrect a deleted controller. New session IDs do not inherit active controllers or monitor handles. In explicit shared-store mode, the shared file remains authoritative.
+- Pending loop wakes are journaled before delivery and acknowledged only after their custom message is present in SessionManager. Team messages retain their mailbox file until that same persistence boundary. `message_end` is too early: pi invokes that hook before saving the message.
+- Restoring state never creates panes, restarts commands, or re-sends an already recorded wake. A dynamic iteration awaiting `LoopUpdate` stays awaiting an update after reload; interrupted external work is not blindly repeated. Inspect it and provide the update, or pause/resume it explicitly from `/loop` when safe. A reached fire cap cannot be resumed; renewal requires a new authorized controller.
+- Timers, subscriptions, in-flight requests, sampled process status and UI contexts are runtime resources, not replayed state. Shutdown aborts/cleans them without killing worker or monitor panes. Headless pi instances do not claim a pane's team mailbox.
+- Status items are compact counts, next-wake/awaiting-update state and unverified/unavailable monitors. Detailed rosters remain in `/team list`, `LoopList`, and `MonitorList`.
+- Durability follows pi's session storage contract: `--no-session` is still ephemeral, and a brand-new session may buffer entries until its first assistant response. External side effects and local journal appends are not a distributed transaction; inspect ambiguous interrupted operations rather than automatically retrying them.
 
 ## What’s not in this package
 
@@ -101,5 +133,6 @@ MonitorStop monitorId="1"
 
 ```text
 extensions/herdr-worker.ts   /team, CreateAgentPanel, SendToAgent
+extensions/split-handoff.ts  /split-handoff, /split-fork, /splits
 loop/                        /loop + Monitor* (Herdr-backed)
 ```

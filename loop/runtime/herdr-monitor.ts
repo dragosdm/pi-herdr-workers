@@ -1,17 +1,12 @@
-import { execFile } from "node:child_process";
 import { createHash } from "node:crypto";
-import { promisify } from "node:util";
+import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
-const execFileAsync = promisify(execFile);
-const TAB_LABEL = "Monitor";
-const MAX_RUNNING = 25;
-
-export type HerdrMonitorStatus = "running" | "idle" | "stopped" | "error";
-
+export type HerdrMonitorStatus = "running" | "idle" | "stopped" | "error" | "unknown";
 export interface HerdrMonitor {
   id: string;
   key: string;
   command: string;
+  cwd: string;
   description?: string;
   paneId: string;
   tabId: string;
@@ -19,222 +14,147 @@ export interface HerdrMonitor {
   startedAt: number;
   reused: boolean;
 }
-
-interface HerdrJson {
-  result?: Record<string, unknown>;
-}
-
-function commandKey(command: string): string {
-  return createHash("sha256").update(command.trim()).digest("hex").slice(0, 8);
-}
-
-function paneLabel(key: string, command: string): string {
-  const snippet = command.trim().replace(/\s+/g, " ").slice(0, 40);
-  return `mon:${key} ${snippet}`;
-}
-
-function isHerdr(): boolean {
-  return process.env.HERDR_ENV === "1" && Boolean(process.env.HERDR_WORKSPACE_ID);
-}
-
-async function herdr(args: string[]): Promise<HerdrJson> {
-  const { stdout, stderr } = await execFileAsync("herdr", args, {
-    encoding: "utf8",
-    maxBuffer: 2_000_000,
-    env: process.env,
-  });
-  const text = stdout.trim() || stderr.trim();
-  if (!text) return {};
-  try {
-    return JSON.parse(text) as HerdrJson;
-  } catch {
-    return { result: { text } };
-  }
-}
-
-function asRecord(value: unknown): Record<string, unknown> | undefined {
-  return value && typeof value === "object" && !Array.isArray(value) ? value as Record<string, unknown> : undefined;
-}
-
-function asArray(value: unknown): unknown[] {
-  return Array.isArray(value) ? value : [];
-}
+export interface MonitorSnapshot { nextId: number; monitors: HerdrMonitor[] }
+export const commandKey = (command: string, cwd: string) => createHash("sha256").update(`${cwd}\0${command.trim()}`).digest("hex").slice(0, 12);
+const clean = (text: string) => text.replace(/[\x00-\x1f\x7f-\x9f]/g, " ");
 
 export class HerdrMonitorManager {
   private byId = new Map<string, HerdrMonitor>();
   private nextId = 1;
+  private mutation = Promise.resolve();
+  private lifetime = new AbortController();
+  dispose() { this.lifetime.abort(); this.onChange = undefined; }
+  onChange?: (snapshot: MonitorSnapshot) => void;
+  constructor(private exec: ExtensionAPI["exec"]) {}
 
-  list(): HerdrMonitor[] {
-    return [...this.byId.values()];
+  snapshot(): MonitorSnapshot { return structuredClone({ nextId: this.nextId, monitors: this.list() }); }
+  restore(snapshot: MonitorSnapshot) {
+    if (!Number.isSafeInteger(snapshot.nextId) || snapshot.nextId < 1 || !Array.isArray(snapshot.monitors)) throw new Error("Invalid monitor snapshot");
+    this.nextId = snapshot.nextId;
+    // Last observed process state is not proof it is still running.
+    this.byId = new Map(snapshot.monitors.filter((m) => typeof m.paneId === "string" && typeof m.key === "string")
+      .map((m) => [m.id, { ...m, status: "unknown" }]));
   }
-
-  get(id: string): HerdrMonitor | undefined {
-    return this.byId.get(id);
+  list(): HerdrMonitor[] { return [...this.byId.values()]; }
+  get(id: string): HerdrMonitor | undefined { return this.byId.get(id); }
+  private persist() { this.onChange?.(this.snapshot()); }
+  private async herdr(args: string[], signal?: AbortSignal): Promise<any> {
+    if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_WORKSPACE_ID) throw new Error("Monitors require a Herdr-managed pane.");
+    signal = signal ? AbortSignal.any([signal, this.lifetime.signal]) : this.lifetime.signal;
+    signal.throwIfAborted();
+    const result = await this.exec("herdr", args, { timeout: 15000, signal });
+    signal?.throwIfAborted();
+    if (result.code !== 0 || result.killed) throw new Error(clean(result.stderr || result.stdout || "Herdr request failed"));
+    return result.stdout.trim() ? JSON.parse(result.stdout) : {};
   }
-
-  async create(command: string, description?: string): Promise<HerdrMonitor> {
-    if (!isHerdr()) {
-      throw new Error("Monitors require a Herdr pane (HERDR_ENV=1). This agent is not running inside Herdr.");
-    }
-    const running = this.list().filter((m) => m.status === "running").length;
-    if (running >= MAX_RUNNING) throw new Error(`Maximum of ${MAX_RUNNING} running monitors reached.`);
-
-    const workspaceId = process.env.HERDR_WORKSPACE_ID!;
-    const cwd = process.cwd();
-    const key = commandKey(command);
-    const label = paneLabel(key, command);
-    const tab = await this.ensureMonitorTab(workspaceId, cwd);
-    const existingPane = await this.findPaneByKey(tab.tabId, key);
-
-    let paneId: string;
-    let reused = false;
-    if (existingPane) {
-      paneId = existingPane;
-      reused = true;
-      const live = [...this.byId.values()].find((m) => m.key === key);
-      if (live && await this.paneIsBusy(paneId)) {
-        live.reused = true;
-        live.status = "running";
-        return live;
+  private serialize<T>(fn: () => Promise<T>): Promise<T> {
+    const next = this.mutation.then(fn);
+    this.mutation = next.then(() => {}, () => {});
+    return next;
+  }
+  create(command: string, description?: string, cwd = process.cwd(), signal?: AbortSignal): Promise<HerdrMonitor> {
+    return this.serialize(async () => {
+      signal?.throwIfAborted();
+      if (!command.trim()) throw new Error("Monitor command cannot be empty.");
+      const key = commandKey(command, cwd);
+      const tab = await this.ensureMonitorTab(cwd, signal);
+      const panes = await this.panes(tab.tabId, signal);
+      const existing = panes.find((p: any) => p.label?.startsWith(`mon:${key} `));
+      const previous = this.list().find((m) => m.key === key && m.paneId === existing?.pane_id);
+      let paneId: string;
+      if (existing) paneId = existing.pane_id;
+      else {
+        if (this.list().filter((m) => m.status === "running" || m.status === "unknown").length >= 25) throw new Error("25 monitors tracked; inspect MonitorList before starting more.");
+        const root = panes[0];
+        if (panes.length === 1 && !root.label && !(await this.paneIsBusy(root.pane_id, signal))) paneId = root.pane_id;
+        else {
+          const from = panes.at(-1)?.pane_id || tab.rootPaneId;
+          const split = await this.herdr(["pane", "split", "--pane", from, "--direction", "down", "--cwd", cwd, "--no-focus"], signal);
+          paneId = split?.result?.pane?.pane_id;
+          if (!paneId) throw new Error("Herdr split returned no pane ID.");
+        }
+        await this.herdr(["pane", "rename", paneId, `mon:${key} ${clean(command).slice(0, 40)}`], signal);
       }
-    } else {
-      paneId = await this.allocatePane(tab.tabId, tab.rootPaneId, cwd);
-      await herdr(["pane", "rename", paneId, label]);
-    }
-
-    if (await this.paneIsBusy(paneId)) {
-      await herdr(["pane", "send-keys", paneId, "ctrl+c"]);
-    }
-    await herdr(["pane", "run", paneId, command]);
-
-    const monitor: HerdrMonitor = {
-      id: String(this.nextId++),
-      key,
-      command,
-      description,
-      paneId,
-      tabId: tab.tabId,
-      status: "running",
-      startedAt: Date.now(),
-      reused,
-    };
-    for (const [id, entry] of this.byId) {
-      if (entry.key === key) this.byId.delete(id);
-    }
-    this.byId.set(monitor.id, monitor);
-    return monitor;
+      const monitor: HerdrMonitor = previous || {
+        id: String(this.nextId++), key, command, cwd, description, paneId, tabId: tab.tabId,
+        status: "unknown", startedAt: Date.now(), reused: !!existing,
+      };
+      monitor.reused = !!existing;
+      this.byId.set(monitor.id, monitor);
+      this.persist(); // Keep a recoverable handle BEFORE running anything.
+      if (await this.paneIsBusy(paneId, signal)) {
+        monitor.status = "running";
+        this.persist();
+        return monitor; // Attach; NEVER interrupt an existing process on create/recovery.
+      }
+      try {
+        const quote = (s: string) => `'${s.replace(/'/g, `'"'"'`)}'`;
+        await this.herdr(["pane", "run", paneId, `cd -- ${quote(cwd)} && ${command}`], signal);
+        monitor.status = "running";
+        monitor.startedAt = Date.now();
+        this.persist();
+        return monitor;
+      } catch (error) {
+        monitor.status = "unknown"; // The CLI may have sent input before timing out.
+        this.persist();
+        throw new Error(`Monitor pane ${paneId} needs inspection before retrying`, { cause: error });
+      }
+    });
   }
-
-  async refresh(monitor: HerdrMonitor): Promise<HerdrMonitor> {
+  private async ownsPane(m: HerdrMonitor, signal?: AbortSignal) {
+    const got = await this.herdr(["pane", "get", m.paneId], signal);
+    return got?.result?.pane?.label?.startsWith(`mon:${m.key} `) === true;
+  }
+  async refresh(m: HerdrMonitor, signal?: AbortSignal): Promise<HerdrMonitor> {
+    const old = m.status;
     try {
-      monitor.status = (await this.paneIsBusy(monitor.paneId)) ? "running" : "idle";
-    } catch {
-      monitor.status = "error";
-    }
-    return monitor;
+      if (!(await this.ownsPane(m, signal))) m.status = "error";
+      else m.status = await this.paneIsBusy(m.paneId, signal) ? "running" : old === "stopped" ? "stopped" : "idle";
+    } catch { signal?.throwIfAborted(); m.status = "error"; }
+    if (m.status !== old) this.persist();
+    return m;
   }
-
-  async readTail(paneId: string, lines = 5): Promise<string[]> {
-    const raw = await herdr(["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", String(lines)]);
+  async readTail(paneId: string, lines = 5, signal?: AbortSignal): Promise<string[]> {
+    const raw = await this.herdr(["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", String(lines)], signal);
     const result = raw.result ?? {};
-    const text = typeof result.text === "string"
-      ? result.text
-      : typeof result.output === "string"
-        ? result.output
-        : JSON.stringify(result);
-    return text.split("\n").filter(Boolean).slice(-lines);
+    const text = result.text ?? result.output ?? JSON.stringify(result);
+    return String(text).split("\n").filter(Boolean).slice(-lines);
   }
-
-  async stop(id: string): Promise<boolean> {
-    const monitor = this.byId.get(id);
-    if (!monitor) return false;
-    if (monitor.status !== "running") return false;
-    await herdr(["pane", "send-keys", monitor.paneId, "ctrl+c"]);
-    monitor.status = "stopped";
-    return true;
+  stop(id: string, signal?: AbortSignal): Promise<boolean> {
+    return this.serialize(async () => {
+      const m = this.get(id);
+      if (!m || (await this.refresh(m, signal)).status !== "running") return false;
+      await this.herdr(["pane", "send-keys", m.paneId, "ctrl+c"], signal);
+      m.status = "stopped";
+      this.persist();
+      return true;
+    });
   }
-
-  private async ensureMonitorTab(workspaceId: string, cwd: string): Promise<{ tabId: string; rootPaneId: string }> {
-    const listed = await herdr(["tab", "list", "--workspace", workspaceId]);
-    const tabs = asArray(asRecord(listed.result)?.tabs);
-    for (const tab of tabs) {
-      const rec = asRecord(tab);
-      if (rec?.label === TAB_LABEL && typeof rec.tab_id === "string") {
-        const panes = await this.panesInTab(rec.tab_id);
-        return { tabId: rec.tab_id, rootPaneId: panes[0] ?? await this.tabRootPane(rec.tab_id) };
-      }
+  private async panes(tabId: string, signal?: AbortSignal): Promise<any[]> {
+    const raw = await this.herdr(["pane", "list", "--workspace", process.env.HERDR_WORKSPACE_ID!], signal);
+    return (raw?.result?.panes ?? []).filter((p: any) => p.tab_id === tabId);
+  }
+  private async ensureMonitorTab(cwd: string, signal?: AbortSignal): Promise<{ tabId: string; rootPaneId: string }> {
+    const workspace = process.env.HERDR_WORKSPACE_ID!;
+    const raw = await this.herdr(["tab", "list", "--workspace", workspace], signal);
+    const tab = raw?.result?.tabs?.find((t: any) => t.label === "Monitor");
+    if (tab) {
+      const panes = await this.panes(tab.tab_id, signal);
+      if (!panes[0]) throw new Error("Monitor tab has no available root pane.");
+      return { tabId: tab.tab_id, rootPaneId: panes[0].pane_id };
     }
-    const created = await herdr(["tab", "create", "--workspace", workspaceId, "--label", TAB_LABEL, "--cwd", cwd, "--no-focus"]);
-    const result = asRecord(created.result) ?? {};
-    const tab = asRecord(result.tab) ?? result;
-    const root = asRecord(result.root_pane) ?? asRecord(result.pane);
-    const tabId = String(tab.tab_id ?? tab.id ?? "");
-    const rootPaneId = String(root?.pane_id ?? root?.id ?? "");
-    if (!tabId || !rootPaneId) throw new Error(`herdr tab create did not return IDs: ${JSON.stringify(created)}`);
+    const made = await this.herdr(["tab", "create", "--workspace", workspace, "--label", "Monitor", "--cwd", cwd, "--no-focus"], signal);
+    const tabId = made?.result?.tab?.tab_id;
+    const rootPaneId = made?.result?.root_pane?.pane_id;
+    if (!tabId || !rootPaneId) throw new Error("Herdr tab create returned no IDs.");
     return { tabId, rootPaneId };
   }
-
-  private async tabRootPane(tabId: string): Promise<string> {
-    const got = await herdr(["tab", "get", tabId]);
-    const result = asRecord(got.result) ?? {};
-    const tab = asRecord(result.tab) ?? result;
-    const root = asRecord(result.root_pane) ?? asRecord(tab.root_pane);
-    const paneId = root?.pane_id ?? tab.pane_id;
-    if (typeof paneId !== "string") throw new Error(`Monitor tab ${tabId} has no root pane`);
-    return paneId;
-  }
-
-  private async panesInTab(tabId: string): Promise<string[]> {
-    const workspaceId = process.env.HERDR_WORKSPACE_ID!;
-    const listed = await herdr(["pane", "list", "--workspace", workspaceId]);
-    const panes = asArray(asRecord(listed.result)?.panes);
-    const ids: string[] = [];
-    for (const pane of panes) {
-      const rec = asRecord(pane);
-      if (rec?.tab_id === tabId && typeof rec.pane_id === "string") ids.push(rec.pane_id);
-    }
-    return ids;
-  }
-
-  private async findPaneByKey(tabId: string, key: string): Promise<string | undefined> {
-    const workspaceId = process.env.HERDR_WORKSPACE_ID!;
-    const listed = await herdr(["pane", "list", "--workspace", workspaceId]);
-    const panes = asArray(asRecord(listed.result)?.panes);
-    const prefix = `mon:${key}`;
-    for (const pane of panes) {
-      const rec = asRecord(pane);
-      if (rec?.tab_id !== tabId) continue;
-      const title = String(rec.title ?? rec.terminal_title_stripped ?? "");
-      if (title.startsWith(prefix) && typeof rec.pane_id === "string") return rec.pane_id;
-    }
-    return undefined;
-  }
-
-  private async allocatePane(tabId: string, rootPaneId: string, cwd: string): Promise<string> {
-    const existing = await this.panesInTab(tabId);
-    if (existing.length === 0) return rootPaneId;
-    const unused = existing.find((id) => ![...this.byId.values()].some((m) => m.paneId === id));
-    // First monitor uses the tab's empty root pane.
-    if (existing.length === 1 && unused === existing[0]) {
-      const busy = await this.paneIsBusy(existing[0]!);
-      if (!busy) return existing[0]!;
-    }
-    const splitFrom = existing[existing.length - 1] ?? rootPaneId;
-    const split = await herdr(["pane", "split", splitFrom, "--direction", "down", "--cwd", cwd, "--no-focus"]);
-    const pane = asRecord(asRecord(split.result)?.pane) ?? asRecord(split.result);
-    const paneId = pane?.pane_id;
-    if (typeof paneId !== "string") throw new Error(`herdr pane split did not return a pane id: ${JSON.stringify(split)}`);
-    return paneId;
-  }
-
-  private async paneIsBusy(paneId: string): Promise<boolean> {
-    const info = await herdr(["pane", "process-info", "--pane", paneId]);
-    const processInfo = asRecord(asRecord(info.result)?.process_info) ?? asRecord(info.result);
-    const foreground = asArray(processInfo?.foreground_processes);
-    return foreground.some((proc) => {
-      const rec = asRecord(proc);
-      const name = String(rec?.name ?? rec?.cmdline ?? "");
-      return name !== "" && name !== "bash" && name !== "zsh" && name !== "fish" && name !== "sh";
-    });
+  private async paneIsBusy(paneId: string, signal?: AbortSignal): Promise<boolean> {
+    const raw = await this.herdr(["pane", "process-info", "--pane", paneId], signal);
+    const info = raw?.result?.process_info;
+    const foreground = info?.foreground_processes;
+    // Unknown is NOT an available shell. Never type into an unclassified foreground process.
+    if (!Array.isArray(foreground) || foreground.length === 0) throw new Error(`Cannot establish shell readiness for ${paneId}`);
+    return !foreground.every((p: any) => p.pid === info.shell_pid && ["bash", "zsh", "fish", "sh"].includes(p.name));
   }
 }

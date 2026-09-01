@@ -102,6 +102,19 @@ export abstract class ReducerBackedStore<
   protected filePath: string | undefined;
   protected lockPath: string | undefined;
   private lastLoadedSignature: string | undefined;
+  /** Session-log persistence for memory-backed stores; optional audit mirror for shared stores. */
+  onChange: ((snapshot: TData) => void) | undefined;
+
+  snapshot(): TData {
+    return structuredClone(this.config.serialize(this.nextId, this.entries));
+  }
+
+  restoreSnapshot(data: TData): void {
+    const restored = this.config.deserialize(structuredClone(data));
+    if (!Number.isSafeInteger(restored.nextId) || restored.nextId < 1) throw new Error("Invalid store nextId");
+    this.nextId = restored.nextId;
+    this.entries = restored.entries;
+  }
 
   protected nextId = 1;
   protected entries = new Map<string, TEntry>();
@@ -234,15 +247,24 @@ export abstract class ReducerBackedStore<
   }
 
   protected withLock<T>(fn: () => T, shouldSave: (result: T) => boolean = () => true): T {
-    if (!this.lockPath) return fn();
-    acquireLock(this.lockPath);
+    if (this.lockPath) acquireLock(this.lockPath);
+    let before: TData | undefined;
     try {
       this.load(true, true);
+      before = this.snapshot();
       const result = fn();
-      if (shouldSave(result)) this.save();
+      const after = this.snapshot();
+      if (shouldSave(result) && JSON.stringify(before) !== JSON.stringify(after)) {
+        this.save();
+        this.onChange?.(after);
+      }
       return result;
+    } catch (error) {
+      // A failed append must not leave an unjournaled mutation live in memory.
+      if (before && !this.filePath) this.restoreSnapshot(before);
+      throw error;
     } finally {
-      releaseLock(this.lockPath);
+      if (this.lockPath) releaseLock(this.lockPath);
     }
   }
 

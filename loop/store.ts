@@ -202,7 +202,8 @@ export class LoopStore extends ReducerBackedStore<LoopEntry, LoopReducerState, L
   resume(id: string): LoopEntry | undefined {
     return this.withLock(() => {
       const entry = this.entries.get(id);
-      if (!entry || Date.now() >= entry.expiresAt || isTerminalWorkflowRun(entry.workflow)) return undefined;
+      if (!entry || Date.now() >= entry.expiresAt || isTerminalWorkflowRun(entry.workflow)
+        || (entry.maxFires && (entry.fireCount ?? 0) >= entry.maxFires)) return undefined;
       this.applyReducerEvent({
         type: "LOOP_RESUMED",
         at: Date.now(),

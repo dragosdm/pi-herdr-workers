@@ -14,8 +14,6 @@ interface LoopStoreLike {
   get(id: string): LoopEntry | undefined;
   create(trigger: Trigger, prompt: string, options: {
     recurring: boolean;
-    autoTask?: boolean;
-    taskBacklog?: boolean;
     readOnly?: boolean;
     maxFires?: number;
     dynamic?: Partial<DynamicLoopState>;
@@ -35,7 +33,6 @@ export interface LoopCommandOptions {
   getStore: () => LoopStoreLike;
   getTriggerSystem: () => TriggerSystemLike;
   updateWidget: () => void;
-  maybeBootstrapTaskLoop?: (entry: LoopEntry) => Promise<boolean>;
   onDynamicLoopActivated?: (entry: LoopEntry) => void;
   cancelOrchestration?: (id: string, action: "pause" | "delete") => Promise<boolean>;
 }
@@ -79,14 +76,14 @@ function parseLoopCommandRoute(input: string): LoopCommandRoute {
 }
 
 export function registerLoopCommand(options: LoopCommandOptions): void {
-  const { pi, getStore, getTriggerSystem, updateWidget, maybeBootstrapTaskLoop, onDynamicLoopActivated, cancelOrchestration } = options;
+  const { pi, getStore, getTriggerSystem, updateWidget, onDynamicLoopActivated, cancelOrchestration } = options;
 
   function createCronLoop(ui: ExtensionUIContext, interval: string, prompt: string, notifyEvery: boolean) {
     let entry: LoopEntry | undefined;
     try {
       const parsed = parseInterval(interval);
       const trigger: Trigger = { type: "cron", schedule: parsed.cron };
-      entry = getStore().create(trigger, prompt, { recurring: true });
+      entry = getStore().create(trigger, prompt, { recurring: true, maxFires: 25 });
       getTriggerSystem().add(entry);
       updateWidget();
       const cadence = notifyEvery ? `every ${parsed.description}` : parsed.description;
@@ -119,19 +116,10 @@ export function registerLoopCommand(options: LoopCommandOptions): void {
     if (!source) return;
 
     const trigger: Trigger = { type: "event", source };
-    const taskBacklog = source === "tasks:created";
-    const entry = getStore().create(trigger, p, {
-      recurring: true,
-      taskBacklog,
-      maxFires: taskBacklog ? 25 : undefined,
-    });
+    const entry = getStore().create(trigger, p, { recurring: true, maxFires: 25 });
     getTriggerSystem().add(entry);
     updateWidget();
-    const bootstrapped = taskBacklog ? await maybeBootstrapTaskLoop?.(entry) : false;
-    const adoption = taskBacklog
-      ? `; adopts unfinished tasks${bootstrapped ? " (initial wake queued)" : ""}`
-      : "";
-    ui.notify(`Event loop #${entry.id} created: fires on "${source}"${adoption}`, "info");
+    ui.notify(`Event loop #${entry.id} created: fires on "${source}" (up to 25 wakes)`, "info");
   }
 
   function dynamicLoop(ui: ExtensionUIContext, goal: string) {
@@ -176,6 +164,7 @@ export function registerLoopCommand(options: LoopCommandOptions): void {
           && Date.now() < entry.expiresAt
           && !entry.orchestration
           && !isTerminalWorkflowRun(entry.workflow)
+          && !(entry.maxFires && (entry.fireCount ?? 0) >= entry.maxFires)
         ) actions.unshift("* Resume");
         actions.push("< Back");
 
@@ -223,6 +212,7 @@ export function registerLoopCommand(options: LoopCommandOptions): void {
   pi.registerCommand("loop", {
     description: "Create a loop. Use /loop [interval] [prompt] for scheduled loops, /loop event <source> <prompt> for event loops, or /loop <goal> for a dynamic goal loop.",
     handler: async (args: string, ctx: ExtensionCommandContext) => {
+      if (!ctx.hasUI) throw new Error("/loop requires a UI; use LoopCreate in headless mode.");
       const ui = ctx.ui;
       const route = parseLoopCommandRoute(args);
 

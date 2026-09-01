@@ -34,15 +34,8 @@ export class CronScheduler {
         this.expiryTimes.set(entry.id, entry.expiresAt);
         continue;
       }
-      if (entry.trigger.type === "dynamic" && entry.dynamic?.awaitingUpdate && !this.fireTimes.has(entry.id)) {
-        entry = this.store.updateDynamic(entry.id, {
-          dynamic: {
-            awaitingUpdate: false,
-            nextWakeAt: undefined,
-            lastUpdatedAt: Date.now(),
-          },
-        }) ?? entry;
-      }
+      // A dispatched iteration remains awaiting its durable LoopUpdate after reload.
+      // Re-arming it here would repeat external work (and race a recovered pending wake).
       this.armTimer(entry);
     }
   }
@@ -78,7 +71,7 @@ export class CronScheduler {
   }
 
   private retire(entry: LoopEntry): void {
-    if (entry.workflow || entry.taskBacklog) this.store.pause(entry.id, "controller_limit", "scheduler fire cap reached");
+    if (entry.dynamic || entry.workflow || entry.taskBacklog) this.store.pause(entry.id, "controller_limit", "scheduler fire cap reached");
     else this.store.delete(entry.id);
     this.remove(entry.id);
   }
