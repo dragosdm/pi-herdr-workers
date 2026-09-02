@@ -77,6 +77,39 @@ test("addressed spawn forwards bounded input once and returns worker facts", asy
   assert.deepEqual(reply, { requestId: "spawn", protocol: 1, ok: true, data: { name: "agent-scout", paneId: "%2", cwd: "/workspace", model: "test/model", type: "explore", purpose: "Investigate", adopted: false } });
 });
 
+test("send validates before delegation and returns typed transport facts", async () => {
+  const events = new FakeEventBus();
+  const inputs: unknown[] = [];
+  registerWorkerRpcServer({
+    events,
+    service: service({ send: async (input) => {
+      inputs.push(input);
+      return input.mode === "steer"
+        ? { target: "worker", paneId: "%1", kind: "pi", status: "idle", transport: "inbox", requestedMode: "steer", priorityApplied: true }
+        : { target: "worker", paneId: "%1", kind: "shell", transport: "herdr-prompt", requestedMode: "follow-up", priorityApplied: false };
+    } }),
+    getProviderState: () => ({ available: true }),
+    createInstanceId: () => "instance",
+  });
+  const replies: RpcReply[] = [];
+  for (const id of ["invalid-send", "steer", "follow-up"]) events.on(replyChannel(CHANNELS.send, id), (payload) => { replies.push(payload as RpcReply); });
+  events.emit(CHANNELS.send, { requestId: "invalid-send", providerInstanceId: "instance", protocol: 1, target: "worker", message: "" });
+  events.emit(CHANNELS.send, { requestId: "steer", providerInstanceId: "instance", protocol: 1, target: "worker", message: "private steer body", mode: "steer" });
+  events.emit(CHANNELS.send, { requestId: "follow-up", providerInstanceId: "instance", protocol: 1, target: "worker", message: "private follow-up body", priority: false });
+  await flush();
+  assert.equal(inputs.length, 2);
+  assert.deepEqual(inputs, [
+    { target: "worker", message: "private steer body", mode: "steer" },
+    { target: "worker", message: "private follow-up body", priority: false },
+  ]);
+  assert.equal(replies[0].ok, false);
+  assert.deepEqual(replies.slice(1).map((reply) => reply.ok && reply.data), [
+    { target: "worker", paneId: "%1", kind: "pi", status: "idle", transport: "inbox", requestedMode: "steer", priorityApplied: true },
+    { target: "worker", paneId: "%1", kind: "shell", transport: "herdr-prompt", requestedMode: "follow-up", priorityApplied: false },
+  ]);
+  assert.doesNotMatch(JSON.stringify(replies), /private .* body/);
+});
+
 test("explicit domain failures cross the wire safely", async () => {
   const events = new FakeEventBus();
   registerWorkerRpcServer({

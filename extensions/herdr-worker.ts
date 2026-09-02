@@ -26,7 +26,7 @@ import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { registerWorkerRpcServer, type WorkerRpcService } from "../rpc/server.js";
-import type { InspectInput, Inspection, SendInput, DeliveryReceipt, SpawnInput } from "../rpc/protocol.js";
+import { WorkerRpcServiceError, type InspectInput, type Inspection, type SendInput, type DeliveryReceipt, type SpawnInput } from "../rpc/protocol.js";
 
 // ───────────────────────── herdr env ─────────────────────────
 
@@ -134,7 +134,11 @@ function frameMessage(env: Envelope): string {
 
 // ───────────────────────── extension ─────────────────────────
 
-interface HerdrWorkerTestOptions { disableInbox?: boolean }
+interface HerdrWorkerTestOptions {
+	disableInbox?: boolean;
+	isListening?: (paneId: string) => boolean;
+	writeEnvelope?: (paneId: string, envelope: Envelope) => void;
+}
 
 export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions = {}) {
 	let state: State = { workers: [] };
@@ -420,6 +424,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	// ── sending ──
 
 	function isListening(paneId: string): boolean {
+		if (testOptions.isListening) return testOptions.isListening(paneId);
 		try {
 			const j = JSON.parse(fs.readFileSync(listeningFile(paneId), "utf8"));
 			if (typeof j.pid !== "number") return false;
@@ -431,6 +436,10 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	}
 
 	function writeEnvelope(paneId: string, env: Envelope) {
+		if (testOptions.writeEnvelope) {
+			testOptions.writeEnvelope(paneId, env);
+			return;
+		}
 		const dir = inboxDir(paneId);
 		fs.mkdirSync(dir, { recursive: true });
 		const name = `${String(env.ts).padStart(15, "0")}-${Math.random().toString(36).slice(2, 8)}.json`;
@@ -451,19 +460,23 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		};
 	}
 
-	async function send(targetId: string, message: string, priority: boolean, signal?: AbortSignal): Promise<string> {
+	class SendServiceError extends WorkerRpcServiceError {
+		constructor(code: "NOT_FOUND" | "NOT_TEAM_MEMBER", message: string, readonly toolMessage: string) {
+			super(code, message);
+		}
+	}
+
+	async function send(targetId: string, message: string, priority: boolean, signal?: AbortSignal): Promise<DeliveryReceipt> {
 		if (!HERDR_ENV) throw new Error("Not running inside herdr (HERDR_ENV != 1); SendToAgent is unavailable.");
 		const target = await agentGet(targetId);
 		if (!target) {
 			const known = (await agentList()).map((a) => a.name ?? a.paneId);
-			throw new Error(`No live herdr agent "${targetId}". Known agents: ${known.join(", ") || "(none)"}${state.workers.length ? `. Your workers: ${state.workers.join(", ")}` : ""}${state.orchestratedBy ? `. Your orchestrator: ${state.orchestratedBy}` : ""}`);
+			throw new SendServiceError("NOT_FOUND", "Target agent was not found.", `No live herdr agent "${targetId}". Known agents: ${known.join(", ") || "(none)"}${state.workers.length ? `. Your workers: ${state.workers.join(", ")}` : ""}${state.orchestratedBy ? `. Your orchestrator: ${state.orchestratedBy}` : ""}`);
 		}
-		if (target.paneId === SELF_PANE) throw new Error("Refusing to send a message to yourself.");
+		if (target.paneId === SELF_PANE) throw new SendServiceError("NOT_TEAM_MEMBER", "Target is not a team member.", "Refusing to send a message to yourself.");
 		const peer = state.workers.includes(targetId) || state.workers.includes(target.name ?? "") || state.workers.includes(target.paneId) || [state.orchestratedBy].includes(targetId) || [state.orchestratedBy].includes(target.name ?? "") || [state.orchestratedBy].includes(target.paneId);
 		if (!peer) {
-			throw new Error(
-				`"${targetId}" is not in your team (it would drop the message anyway). Workers: ${state.workers.join(", ") || "(none)"}; orchestrator: ${state.orchestratedBy ?? "(none)"}. Use /team add or /team adopt first.`,
-			);
+			throw new SendServiceError("NOT_TEAM_MEMBER", "Target is not a team member.", `"${targetId}" is not in your team (it would drop the message anyway). Workers: ${state.workers.join(", ") || "(none)"}; orchestrator: ${state.orchestratedBy ?? "(none)"}. Use /team add or /team adopt first.`);
 		}
 
 		const env = await makeEnvelope(targetId, target, message, priority);
@@ -471,12 +484,17 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 
 		if (target.kind === "pi" && isListening(target.paneId)) {
 			writeEnvelope(target.paneId, env);
-			return `Delivered to ${label} (pane ${target.paneId}, ${target.status ?? "unknown"}) via inbox as ${priority ? "steer (priority)" : "follow-up"}. Replies arrive on a later turn.`;
+			return { target: label, paneId: target.paneId, ...(target.kind === undefined ? {} : { kind: target.kind }), ...(target.status === undefined ? {} : { status: target.status }), transport: "inbox", requestedMode: priority ? "steer" : "follow-up", priorityApplied: priority };
 		}
 
 		// Fallback: type it into the agent's pane. No steer/follow-up control here.
 		await herdr(["agent", "prompt", target.paneId, frameMessage(env)], { timeout: 20000, signal });
-		return `Typed into ${label} (pane ${target.paneId}, ${target.kind ?? "agent"}, no inbox listener) via \`herdr agent prompt\`. Priority flag not applicable there.`;
+		return { target: label, paneId: target.paneId, ...(target.kind === undefined ? {} : { kind: target.kind }), ...(target.status === undefined ? {} : { status: target.status }), transport: "herdr-prompt", requestedMode: priority ? "steer" : "follow-up", priorityApplied: false };
+	}
+
+	function sendReceiptText(receipt: DeliveryReceipt): string {
+		if (receipt.transport === "inbox") return `Delivered to ${receipt.target} (pane ${receipt.paneId}, ${receipt.status ?? "unknown"}) via inbox as ${receipt.requestedMode === "steer" ? "steer (priority)" : "follow-up"}. Replies arrive on a later turn.`;
+		return `Typed into ${receipt.target} (pane ${receipt.paneId}, ${receipt.kind ?? "agent"}, no inbox listener) via \`herdr agent prompt\`. Priority flag not applicable there.`;
 	}
 
 	async function sendControl(targetId: string, action: NonNullable<Envelope["action"]>): Promise<boolean> {
@@ -507,7 +525,14 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			priority: Type.Optional(Type.Boolean({ description: "true = steer (interrupt recipient's current turn). false/omitted = follow-up after its current work.", default: false })),
 		}),
 		async execute(_id, params, signal) {
-			const text = await send(params.target_id, params.message, params.priority ?? false, signal);
+			let receipt: DeliveryReceipt;
+			try {
+				receipt = await service.send({ target: params.target_id, message: params.message, priority: params.priority ?? false }, signal);
+			} catch (error) {
+				if (error instanceof SendServiceError) throw new Error(error.toolMessage);
+				throw error;
+			}
+			const text = sendReceiptText(receipt);
 			return { content: [{ type: "text", text }], details: { target: params.target_id, priority: params.priority ?? false, message: params.message, status: text } };
 		},
 		// Inline UX: the interesting part is the message itself, not that one was sent.
@@ -750,8 +775,9 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 				...(result.purpose === undefined ? {} : { purpose: result.purpose }),
 			};
 		},
-		async send(_input: SendInput, _signal?: AbortSignal): Promise<DeliveryReceipt> {
-			throw new Error("RPC send is not connected yet.");
+		async send(input: SendInput, signal?: AbortSignal): Promise<DeliveryReceipt> {
+			const priority = input.mode === undefined ? input.priority ?? false : input.mode === "steer";
+			return send(input.target, input.message, priority, signal);
 		},
 		async inspect(_input: InspectInput, _signal?: AbortSignal): Promise<Inspection> {
 			throw new Error("RPC inspect is not connected yet.");
