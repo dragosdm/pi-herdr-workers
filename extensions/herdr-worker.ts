@@ -26,7 +26,7 @@ import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { registerWorkerRpcServer, type WorkerRpcService } from "../rpc/server.js";
-import type { InspectInput, Inspection, SendInput, DeliveryReceipt, SpawnInput, WorkerReference } from "../rpc/protocol.js";
+import type { InspectInput, Inspection, SendInput, DeliveryReceipt, SpawnInput } from "../rpc/protocol.js";
 
 // ───────────────────────── herdr env ─────────────────────────
 
@@ -718,7 +718,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		return value;
 	}
 
-	type SpawnOptions = SpawnInput & { direction?: Direction; thinking?: string };
+	type SpawnOptions = SpawnInput;
 	async function spawnWorker(input: SpawnOptions, signal?: AbortSignal): Promise<CreateResult> {
 			const ctx = ctxRef;
 			if (!ctx) throw new Error("Session is not ready.");

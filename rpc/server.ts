@@ -96,7 +96,9 @@ export function registerWorkerRpcServer(options: WorkerRpcServerOptions): Worker
         const input = request as unknown as SpawnInput;
         data = await options.service.spawn({
           ...(input.name === undefined ? {} : { name: input.name }),
+          ...(input.direction === undefined ? {} : { direction: input.direction }),
           ...(input.model === undefined ? {} : { model: input.model }),
+          ...(input.thinking === undefined ? {} : { thinking: input.thinking }),
           ...(input.type === undefined ? {} : { type: input.type }),
           ...(input.purpose === undefined ? {} : { purpose: input.purpose }),
           ...(input.cwd === undefined ? {} : { cwd: input.cwd }),

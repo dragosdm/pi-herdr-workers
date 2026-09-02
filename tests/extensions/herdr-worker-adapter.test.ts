@@ -34,6 +34,8 @@ async function harness() {
 		sendUserMessage() {},
 		async exec(_command: string, args: string[]) {
 			execCalls.push(args);
+			if (args[0] === "pane" && args[1] === "layout") return { code: 0, stdout: JSON.stringify({ result: { layout: { panes: [] } } }), stderr: "" };
+			if (args[0] === "pane" && args[1] === "split") return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "new-pane" } } }), stderr: "" };
 			if (args[0] === "agent" && args[1] === "get") {
 				const target = args[2];
 				const agent = target === "self-pane"
@@ -113,4 +115,20 @@ test("CreateAgentPanel preserves parameter mapping through the shared spawn faca
 	assert.match(result.content[0].text, /Worker agent-scout ready in pane worker-pane/);
 	assert.equal(result.details.adopted, true);
 	assert.equal(result.details.cwd, "/tmp");
+});
+
+test("RPC direction and thinking reach the canonical creation sequence", async () => {
+	const h = await harness();
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	const probe = await emitForReply<any>(h.events, CHANNELS.probe, "options-probe", { requestId: "options-probe", supportedProtocols: [1] });
+	const providerInstanceId = probe.ok ? probe.data.providerInstanceId : "";
+	const spawned = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, "options", {
+		requestId: "options", providerInstanceId, protocol: 1, name: "builder", direction: "left", model: "test/model", thinking: "high",
+	});
+	assert.equal(spawned.ok && spawned.data.paneId, "new-pane");
+	assert.equal(h.execCalls.some((args) => args[0] === "pane" && args[1] === "split" && args.includes("--direction") && args.includes("right")), true);
+	assert.equal(h.execCalls.some((args) => args[0] === "pane" && args[1] === "swap"), true);
+	const start = h.execCalls.find((args) => args[0] === "agent" && args[1] === "start");
+	assert.ok(start);
+	assert.equal(start.includes("test/model:high"), true);
 });

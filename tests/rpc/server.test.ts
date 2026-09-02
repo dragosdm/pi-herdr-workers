@@ -63,7 +63,7 @@ test("addressed spawn forwards bounded input once and returns worker facts", asy
     events,
     service: service({ spawn: async (input) => {
       calls++;
-      assert.deepEqual(input, { name: "scout", cwd: "/workspace", initialPrompt: "Investigate" });
+      assert.deepEqual(input, { name: "scout", direction: "left", cwd: "/workspace", thinking: "high", initialPrompt: "Investigate" });
       return { name: "agent-scout", paneId: "%2", cwd: "/workspace", model: "test/model", type: "explore", purpose: "Investigate", adopted: false };
     } }),
     getProviderState: () => ({ available: true }),
@@ -71,7 +71,7 @@ test("addressed spawn forwards bounded input once and returns worker facts", asy
   });
   let reply: RpcReply | undefined;
   events.on(replyChannel(CHANNELS.spawn, "spawn"), (payload) => { reply = payload as RpcReply; });
-  events.emit(CHANNELS.spawn, { requestId: "spawn", providerInstanceId: "instance", protocol: 1, name: "scout", cwd: "/workspace", initialPrompt: "Investigate", future: true });
+  events.emit(CHANNELS.spawn, { requestId: "spawn", providerInstanceId: "instance", protocol: 1, name: "scout", direction: "left", cwd: "/workspace", thinking: "high", initialPrompt: "Investigate", future: true });
   await flush();
   assert.equal(calls, 1);
   assert.deepEqual(reply, { requestId: "spawn", protocol: 1, ok: true, data: { name: "agent-scout", paneId: "%2", cwd: "/workspace", model: "test/model", type: "explore", purpose: "Investigate", adopted: false } });

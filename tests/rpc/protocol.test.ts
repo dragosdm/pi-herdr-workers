@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { Check } from "typebox/value";
 import {
-  CHANNELS, LIMITS, ProbeRequestSchema, ReplyEnvelopeSchema, SendRequestSchema,
+  CHANNELS, LIMITS, ProbeRequestSchema, ReplyEnvelopeSchema, SendRequestSchema, SpawnRequestSchema,
   failure, replyChannel, success,
 } from "../../rpc/protocol.js";
 
@@ -13,6 +13,10 @@ test("request schemas enforce identifiers, limits, and unique protocols", () => 
   assert.equal(Check(SendRequestSchema, {
     requestId: "r", providerInstanceId: "p", protocol: 1, target: "worker", message: "x".repeat(LIMITS.message + 1),
   }), false);
+  const spawnBase = { requestId: "r", providerInstanceId: "p", protocol: 1 };
+  assert.equal(Check(SpawnRequestSchema, { ...spawnBase, direction: "left", thinking: "xhigh" }), true);
+  assert.equal(Check(SpawnRequestSchema, { ...spawnBase, direction: "diagonal" }), false);
+  assert.equal(Check(SpawnRequestSchema, { ...spawnBase, thinking: "unlimited" }), false);
 });
 
 test("unknown request and reply fields are accepted", () => {

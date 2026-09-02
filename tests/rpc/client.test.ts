@@ -30,6 +30,20 @@ test("concurrent calls correlate replies and ignore duplicates", async () => {
   assert.equal(events.listenerCount(), 0);
 });
 
+test("spawn forwards direction and thinking in the addressed request", async () => {
+  const events = new FakeEventBus();
+  events.on(CHANNELS.spawn, (payload) => {
+    const request = payload as Record<string, unknown> & { requestId: string };
+    assert.equal(request.direction, "down");
+    assert.equal(request.thinking, "xhigh");
+    events.emit(replyChannel(CHANNELS.spawn, request.requestId), success(request.requestId, { name: "agent-test", paneId: "%1", cwd: "/tmp", adopted: false }));
+  });
+  const result = await createWorkerRpcClient({ events, createRequestId: () => "spawn-options" }).spawn(
+    { name: "test", direction: "down", thinking: "xhigh" }, provider,
+  );
+  assert.equal(result.name, "agent-test");
+});
+
 test("timeout, abort, server error, and emit failure clean up", async () => {
   const timeoutBus = new FakeEventBus();
   await assert.rejects(createWorkerRpcClient({ events: timeoutBus, createRequestId: () => "timeout" }).inspect(

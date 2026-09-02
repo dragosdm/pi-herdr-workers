@@ -50,6 +50,10 @@ export const LIMITS = {
   initialPrompt: 65_536,
   errorMessage: 1024,
 } as const;
+export const SPAWN_DIRECTIONS = ["right", "down", "left", "up"] as const;
+export const THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type SpawnDirection = (typeof SPAWN_DIRECTIONS)[number];
+export type ThinkingLevel = (typeof THINKING_LEVELS)[number];
 
 const IdSchema = Type.String({ minLength: 1, maxLength: LIMITS.id, pattern: "^[A-Za-z0-9._-]+$" });
 const ProtocolSchema = Type.Integer({ minimum: 1 });
@@ -70,7 +74,9 @@ const AddressedRequestSchema = {
 export const SpawnRequestSchema = Type.Object({
   ...AddressedRequestSchema,
   name: Type.Optional(bounded(LIMITS.workerName)),
+  direction: Type.Optional(Type.Union(SPAWN_DIRECTIONS.map((direction) => Type.Literal(direction)))),
   model: Type.Optional(bounded(LIMITS.model)),
+  thinking: Type.Optional(Type.Union(THINKING_LEVELS.map((thinking) => Type.Literal(thinking)))),
   type: Type.Optional(bounded(LIMITS.type)),
   purpose: Type.Optional(bounded(LIMITS.purpose)),
   cwd: Type.Optional(bounded(LIMITS.cwd)),
@@ -93,7 +99,7 @@ export type InspectRequest = Static<typeof InspectRequestSchema>;
 export type StopRequest = Static<typeof StopRequestSchema>;
 export type AddressedRequest = SpawnRequest | SendRequest | InspectRequest | StopRequest;
 
-export interface SpawnInput { name?: string; model?: string; type?: string; purpose?: string; cwd?: string; initialPrompt?: string }
+export interface SpawnInput { name?: string; direction?: SpawnDirection; model?: string; thinking?: ThinkingLevel; type?: string; purpose?: string; cwd?: string; initialPrompt?: string }
 export interface SendInput { target: string; message: string; mode?: "follow-up" | "steer"; priority?: boolean }
 export interface InspectInput { target: string }
 export interface WorkerReference { name: string; paneId: string; model?: string; cwd: string; type?: string; purpose?: string; adopted: boolean }
