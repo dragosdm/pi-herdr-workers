@@ -125,6 +125,27 @@ test("explicit domain failures cross the wire safely", async () => {
   assert.deepEqual(reply, { requestId: "inspect", protocol: 1, ok: false, error: { code: "NOT_TEAM_MEMBER", message: "Target is not a team member." } });
 });
 
+test("inspect returns only the service's sanitized team projection", async () => {
+  const events = new FakeEventBus();
+  let input: unknown;
+  registerWorkerRpcServer({
+    events,
+    service: service({ inspect: async (value) => {
+      input = value;
+      return { name: "worker", paneId: "%1", kind: "pi", status: "idle", cwd: "/tmp", type: "review", purpose: "Check RPC", model: "test/model", relationship: "worker", managedBySession: true };
+    } }),
+    getProviderState: () => ({ available: true }),
+    createInstanceId: () => "instance",
+  });
+  let reply: RpcReply | undefined;
+  events.on(replyChannel(CHANNELS.inspect, "inspect-safe"), (payload) => { reply = payload as RpcReply; });
+  events.emit(CHANNELS.inspect, { requestId: "inspect-safe", providerInstanceId: "instance", protocol: 1, target: "worker", future: "ignored" });
+  await flush();
+  assert.deepEqual(input, { target: "worker" });
+  assert.equal(reply?.ok, true);
+  assert.doesNotMatch(JSON.stringify(reply), /tabId|process|prompt|raw/);
+});
+
 test("dispose removes all five subscriptions idempotently", () => {
   const events = new FakeEventBus();
   const server = registerWorkerRpcServer({ events, service: service(), getProviderState: () => ({ available: true }) });

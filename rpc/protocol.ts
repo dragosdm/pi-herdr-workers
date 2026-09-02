@@ -104,18 +104,18 @@ export interface SendInput { target: string; message: string; mode?: "follow-up"
 export interface InspectInput { target: string }
 export interface WorkerReference { name: string; paneId: string; model?: string; cwd: string; type?: string; purpose?: string; adopted: boolean }
 export interface DeliveryReceipt { target: string; paneId: string; kind?: string; status?: string; transport: "inbox" | "herdr-prompt"; requestedMode: "follow-up" | "steer"; priorityApplied: boolean }
-export interface Inspection { name: string; paneId: string; kind?: string; status?: string; cwd?: string; relationship: "worker" | "orchestrator"; managedBySession: boolean }
-export interface ProbeData { protocol: 1; providerInstanceId: string; available: boolean; reason?: AvailabilityReason; capabilities: Capability[] }
+export interface Inspection { name: string; paneId: string; kind?: string; status?: string; cwd?: string; type?: string; purpose?: string; model?: string; relationship: "worker" | "orchestrator"; managedBySession: boolean }
+export interface ProbeData { protocol: 1; provider: "herdr"; providerInstanceId: string; available: boolean; reason?: AvailabilityReason; capabilities: Capability[]; constraints: { requiresHerdrPane: true; requiresInteractivePi: true } }
 
 export interface RpcError { code: RpcErrorCode; message: string }
 export type RpcReply<T = unknown> =
-  | { requestId: string; protocol: 1; ok: true; data: T }
-  | { requestId: string; protocol: 1; ok: false; error: RpcError };
+  | { requestId: string; protocol: 1; success: true; data: T }
+  | { requestId: string; protocol: 1; success: false; error: RpcError };
 
 const ErrorSchema = Type.Object({ code: Type.Union(ERROR_CODES.map((code) => Type.Literal(code))), message: bounded(LIMITS.errorMessage) });
 export const ReplyEnvelopeSchema = Type.Union([
-  Type.Object({ requestId: RequestIdSchema, protocol: ProtocolV1Schema, ok: Type.Literal(true), data: Type.Unknown() }),
-  Type.Object({ requestId: RequestIdSchema, protocol: ProtocolV1Schema, ok: Type.Literal(false), error: ErrorSchema }),
+  Type.Object({ requestId: RequestIdSchema, protocol: ProtocolV1Schema, success: Type.Literal(true), data: Type.Unknown() }),
+  Type.Object({ requestId: RequestIdSchema, protocol: ProtocolV1Schema, success: Type.Literal(false), error: ErrorSchema }),
 ]);
 
 export const REQUEST_SCHEMAS: Record<RequestChannel, TSchema> = {
@@ -137,10 +137,10 @@ export function replyChannel(channel: RequestChannel, requestId: string): string
   if (!Check(RequestIdSchema, requestId)) throw new TypeError("Invalid request ID.");
   return `${channel}:reply:${requestId}`;
 }
-export function success<T>(requestId: string, data: T): RpcReply<T> { return { requestId, protocol: 1, ok: true, data }; }
+export function success<T>(requestId: string, data: T): RpcReply<T> { return { requestId, protocol: 1, success: true, data }; }
 export function failure(requestId: string, code: RpcErrorCode, message: string): RpcReply<never> {
   const safeMessage = message.slice(0, LIMITS.errorMessage) || "Request failed.";
-  return { requestId, protocol: 1, ok: false, error: { code, message: safeMessage } };
+  return { requestId, protocol: 1, success: false, error: { code, message: safeMessage } };
 }
 
 export class WorkerRpcServiceError extends Error {

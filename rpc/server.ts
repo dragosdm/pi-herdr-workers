@@ -69,10 +69,12 @@ export function registerWorkerRpcServer(options: WorkerRpcServerOptions): Worker
       const state = options.getProviderState();
       emit(channel, requestId, success(requestId, {
         protocol,
+        provider: "herdr",
         providerInstanceId,
         available: state.available,
         ...(state.available ? {} : { reason: state.reason ?? "SESSION_NOT_READY" }),
         capabilities: [...CAPABILITIES],
+        constraints: { requiresHerdrPane: true, requiresInteractivePi: true },
       }));
       return;
     }
@@ -105,11 +107,16 @@ export function registerWorkerRpcServer(options: WorkerRpcServerOptions): Worker
           ...(input.initialPrompt === undefined ? {} : { initialPrompt: input.initialPrompt }),
         });
       } else if (channel === CHANNELS.send) {
-        const { requestId: _, providerInstanceId: __, protocol: ___, ...input } = request;
-        data = await options.service.send(input as unknown as SendInput);
+        const input = request as unknown as SendInput;
+        data = await options.service.send({
+          target: input.target,
+          message: input.message,
+          ...(input.mode === undefined ? {} : { mode: input.mode }),
+          ...(input.priority === undefined ? {} : { priority: input.priority }),
+        });
       } else {
-        const { requestId: _, providerInstanceId: __, protocol: ___, ...input } = request;
-        data = await options.service.inspect(input as unknown as InspectInput);
+        const input = request as unknown as InspectInput;
+        data = await options.service.inspect({ target: input.target });
       }
       emit(channel, requestId, success(requestId, data));
     } catch (error) {

@@ -199,9 +199,9 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		return { paneId: a.pane_id, tabId: a.tab_id ?? undefined, name: a.name ?? undefined, kind: a.agent ?? undefined, status: a.agent_status, cwd: a.cwd };
 	}
 
-	async function agentGet(target: string): Promise<AgentInfo | undefined> {
+	async function agentGet(target: string, signal?: AbortSignal): Promise<AgentInfo | undefined> {
 		try {
-			const j = await herdr(["agent", "get", target]);
+			const j = await herdr(["agent", "get", target], { signal });
 			return toAgentInfo(j?.result?.agent);
 		} catch {
 			return undefined;
@@ -779,8 +779,30 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			const priority = input.mode === undefined ? input.priority ?? false : input.mode === "steer";
 			return send(input.target, input.message, priority, signal);
 		},
-		async inspect(_input: InspectInput, _signal?: AbortSignal): Promise<Inspection> {
-			throw new Error("RPC inspect is not connected yet.");
+		async inspect(input: InspectInput, signal?: AbortSignal): Promise<Inspection> {
+			const target = input.target;
+			if (target === SELF_PANE || target === selfInfo?.name || target === selfInfo?.paneId) {
+				throw new WorkerRpcServiceError("NOT_TEAM_MEMBER", "Target is not a team member.");
+			}
+			const workerId = state.workers.find((id) => id === target || state.meta?.[id]?.paneId === target);
+			const relationship = workerId ? "worker" as const : state.orchestratedBy === target ? "orchestrator" as const : undefined;
+			if (!relationship) throw new WorkerRpcServiceError("NOT_TEAM_MEMBER", "Target is not a team member.");
+			signal?.throwIfAborted();
+			const live = await agentGet(target, signal);
+			if (!live) throw new WorkerRpcServiceError("NOT_FOUND", "Target agent was not found.");
+			const meta = workerId ? state.meta?.[workerId] : undefined;
+			return {
+				name: live.name ?? workerId ?? state.orchestratedBy ?? target,
+				paneId: live.paneId,
+				...(live.kind === undefined ? {} : { kind: live.kind }),
+				...(live.status === undefined ? {} : { status: live.status }),
+				...(live.cwd === undefined ? {} : { cwd: live.cwd }),
+				...(meta?.type === undefined ? {} : { type: meta.type }),
+				...(meta?.purpose === undefined ? {} : { purpose: meta.purpose }),
+				...(meta?.model === undefined ? {} : { model: meta.model }),
+				relationship,
+				managedBySession: relationship === "worker",
+			};
 		},
 	};
 	const rpcServer = registerWorkerRpcServer({ events: pi.events, service, getProviderState: providerState });
