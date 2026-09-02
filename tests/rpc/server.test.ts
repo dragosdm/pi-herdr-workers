@@ -22,8 +22,8 @@ test("probe negotiates, reports capabilities, and excludes stop", async () => {
   events.on(replyChannel(CHANNELS.probe, "probe"), (payload) => { reply = payload as RpcReply; });
   events.emit(CHANNELS.probe, { requestId: "probe", supportedProtocols: [2, 1], future: true });
   await flush();
-  assert.equal(reply?.ok, true);
-  if (reply?.ok) assert.deepEqual(reply.data, { protocol: 1, providerInstanceId: "instance", available: true, capabilities: ["spawn", "send", "steer", "inspect"] });
+  assert.equal(reply?.success, true);
+  if (reply?.success) assert.deepEqual(reply.data, { protocol: 1, provider: "herdr", providerInstanceId: "instance", available: true, capabilities: ["spawn", "send", "steer", "inspect"], constraints: { requiresHerdrPane: true, requiresInteractivePi: true } });
 });
 
 test("validation, routing, protocol, stop, and availability gates precede service", async () => {
@@ -40,7 +40,7 @@ test("validation, routing, protocol, stop, and availability gates precede servic
   events.emit(CHANNELS.spawn, { requestId: "unavailable", providerInstanceId: "instance", protocol: 1 });
   events.emit(CHANNELS.spawn, { providerInstanceId: "instance", protocol: 1 });
   await flush();
-  assert.deepEqual(replies.map((reply) => reply.ok ? "ok" : reply.error.code), ["INVALID_REQUEST", "UNSUPPORTED_PROTOCOL", "UNSUPPORTED_OPERATION", "PROVIDER_UNAVAILABLE"]);
+  assert.deepEqual(replies.map((reply) => reply.success ? "success" : reply.error.code), ["INVALID_REQUEST", "UNSUPPORTED_PROTOCOL", "UNSUPPORTED_OPERATION", "PROVIDER_UNAVAILABLE"]);
   assert.equal(calls, 0);
 });
 
@@ -53,7 +53,7 @@ test("service dispatches once, ignores unknown fields, and sanitizes failures", 
   events.emit(CHANNELS.send, { requestId: "send", providerInstanceId: "instance", protocol: 1, target: "worker", message: "body", priority: true, future: 1 });
   await flush();
   assert.equal(calls, 1);
-  assert.deepEqual(reply, { requestId: "send", protocol: 1, ok: false, error: { code: "INTERNAL_ERROR", message: "The worker operation failed." } });
+  assert.deepEqual(reply, { requestId: "send", protocol: 1, success: false, error: { code: "INTERNAL_ERROR", message: "The worker operation failed." } });
 });
 
 test("addressed spawn forwards bounded input once and returns worker facts", async () => {
@@ -74,7 +74,7 @@ test("addressed spawn forwards bounded input once and returns worker facts", asy
   events.emit(CHANNELS.spawn, { requestId: "spawn", providerInstanceId: "instance", protocol: 1, name: "scout", direction: "left", cwd: "/workspace", thinking: "high", initialPrompt: "Investigate", future: true });
   await flush();
   assert.equal(calls, 1);
-  assert.deepEqual(reply, { requestId: "spawn", protocol: 1, ok: true, data: { name: "agent-scout", paneId: "%2", cwd: "/workspace", model: "test/model", type: "explore", purpose: "Investigate", adopted: false } });
+  assert.deepEqual(reply, { requestId: "spawn", protocol: 1, success: true, data: { name: "agent-scout", paneId: "%2", cwd: "/workspace", model: "test/model", type: "explore", purpose: "Investigate", adopted: false } });
 });
 
 test("send validates before delegation and returns typed transport facts", async () => {
@@ -102,8 +102,8 @@ test("send validates before delegation and returns typed transport facts", async
     { target: "worker", message: "private steer body", mode: "steer" },
     { target: "worker", message: "private follow-up body", priority: false },
   ]);
-  assert.equal(replies[0].ok, false);
-  assert.deepEqual(replies.slice(1).map((reply) => reply.ok && reply.data), [
+  assert.equal(replies[0].success, false);
+  assert.deepEqual(replies.slice(1).map((reply) => reply.success && reply.data), [
     { target: "worker", paneId: "%1", kind: "pi", status: "idle", transport: "inbox", requestedMode: "steer", priorityApplied: true },
     { target: "worker", paneId: "%1", kind: "shell", transport: "herdr-prompt", requestedMode: "follow-up", priorityApplied: false },
   ]);
@@ -122,7 +122,7 @@ test("explicit domain failures cross the wire safely", async () => {
   events.on(replyChannel(CHANNELS.inspect, "inspect"), (payload) => { reply = payload as RpcReply; });
   events.emit(CHANNELS.inspect, { requestId: "inspect", providerInstanceId: "instance", protocol: 1, target: "other" });
   await flush();
-  assert.deepEqual(reply, { requestId: "inspect", protocol: 1, ok: false, error: { code: "NOT_TEAM_MEMBER", message: "Target is not a team member." } });
+  assert.deepEqual(reply, { requestId: "inspect", protocol: 1, success: false, error: { code: "NOT_TEAM_MEMBER", message: "Target is not a team member." } });
 });
 
 test("inspect returns only the service's sanitized team projection", async () => {
@@ -142,7 +142,7 @@ test("inspect returns only the service's sanitized team projection", async () =>
   events.emit(CHANNELS.inspect, { requestId: "inspect-safe", providerInstanceId: "instance", protocol: 1, target: "worker", future: "ignored" });
   await flush();
   assert.deepEqual(input, { target: "worker" });
-  assert.equal(reply?.ok, true);
+  assert.equal(reply?.success, true);
   assert.doesNotMatch(JSON.stringify(reply), /tabId|process|prompt|raw/);
 });
 

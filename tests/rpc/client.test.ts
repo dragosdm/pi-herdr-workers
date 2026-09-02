@@ -4,7 +4,7 @@ import { createWorkerRpcClient, RpcAbortError, RpcResponseError, RpcTimeoutError
 import { CHANNELS, replyChannel, success } from "../../rpc/protocol.js";
 import { FakeEventBus } from "../support/fake-event-bus.js";
 
-const provider = { protocol: 1 as const, providerInstanceId: "provider", available: true, capabilities: [] };
+const provider = { protocol: 1 as const, provider: "herdr" as const, providerInstanceId: "provider", available: true, capabilities: [], constraints: { requiresHerdrPane: true as const, requiresInteractivePi: true as const } };
 
 test("probe installs listener before emit and selects an available provider", async () => {
   const events = new FakeEventBus();
@@ -64,7 +64,7 @@ test("timeout, abort, server error, and emit failure clean up", async () => {
   errorBus.on(CHANNELS.stop, (payload) => {
     const request = payload as { requestId: string };
     errorBus.emit(replyChannel(CHANNELS.stop, request.requestId), {
-      requestId: request.requestId, protocol: 1, ok: false, error: { code: "UNSUPPORTED_OPERATION", message: "Stop is not supported." },
+      requestId: request.requestId, protocol: 1, success: false, error: { code: "UNSUPPORTED_OPERATION", message: "Stop is not supported." },
     });
   });
   await assert.rejects(createWorkerRpcClient({ events: errorBus, createRequestId: () => "stop" }).stop(undefined, provider), RpcResponseError);

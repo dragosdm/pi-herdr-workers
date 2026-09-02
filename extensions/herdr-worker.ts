@@ -784,15 +784,29 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			if (target === SELF_PANE || target === selfInfo?.name || target === selfInfo?.paneId) {
 				throw new WorkerRpcServiceError("NOT_TEAM_MEMBER", "Target is not a team member.");
 			}
-			const workerId = state.workers.find((id) => id === target || state.meta?.[id]?.paneId === target);
-			const relationship = workerId ? "worker" as const : state.orchestratedBy === target ? "orchestrator" as const : undefined;
-			if (!relationship) throw new WorkerRpcServiceError("NOT_TEAM_MEMBER", "Target is not a team member.");
-			signal?.throwIfAborted();
-			const live = await agentGet(target, signal);
-			if (!live) throw new WorkerRpcServiceError("NOT_FOUND", "Target agent was not found.");
-			const meta = workerId ? state.meta?.[workerId] : undefined;
+			const relationships = [
+				...state.workers.map((id) => ({ id, relationship: "worker" as const, meta: state.meta?.[id] })),
+				...(state.orchestratedBy ? [{ id: state.orchestratedBy, relationship: "orchestrator" as const, meta: undefined }] : []),
+			];
+			const direct = relationships.find(({ id, meta }) => id === target || meta?.paneId === target);
+			let match: (typeof relationships)[number] | undefined;
+			let live: AgentInfo | undefined;
+			for (const configured of direct ? [direct] : relationships) {
+				signal?.throwIfAborted();
+				const resolved = await agentGet(configured.id, signal);
+				if (resolved && (direct || resolved.name === target || resolved.paneId === target)) {
+					match = configured;
+					live = resolved;
+					break;
+				}
+			}
+			if (!match || !live) {
+				if (direct) throw new WorkerRpcServiceError("NOT_FOUND", "Target agent was not found.");
+				throw new WorkerRpcServiceError("NOT_TEAM_MEMBER", "Target is not a team member.");
+			}
+			const { relationship, meta } = match;
 			return {
-				name: live.name ?? workerId ?? state.orchestratedBy ?? target,
+				name: live.name ?? match.id,
 				paneId: live.paneId,
 				...(live.kind === undefined ? {} : { kind: live.kind }),
 				...(live.status === undefined ? {} : { status: live.status }),

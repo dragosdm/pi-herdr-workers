@@ -19,11 +19,11 @@ Every response is emitted on `<request-channel>:reply:<requestId>`. A caller mus
 Successful and failed replies have these shapes:
 
 ```json
-{ "requestId": "req-1", "protocol": 1, "ok": true, "data": {} }
+{ "requestId": "req-1", "protocol": 1, "success": true, "data": {} }
 ```
 
 ```json
-{ "requestId": "req-1", "protocol": 1, "ok": false, "error": { "code": "INVALID_REQUEST", "message": "Request is invalid." } }
+{ "requestId": "req-1", "protocol": 1, "success": false, "error": { "code": "INVALID_REQUEST", "message": "Request is invalid." } }
 ```
 
 ## Discovery and routing
@@ -40,12 +40,17 @@ A provider chooses the highest mutually supported version and replies with:
 {
   "requestId": "probe-1",
   "protocol": 1,
-  "ok": true,
+  "success": true,
   "data": {
     "protocol": 1,
+    "provider": "herdr",
     "providerInstanceId": "opaque-instance-id",
     "available": true,
-    "capabilities": ["spawn", "send", "steer", "inspect"]
+    "capabilities": ["spawn", "send", "steer", "inspect"],
+    "constraints": {
+      "requiresHerdrPane": true,
+      "requiresInteractivePi": true
+    }
   }
 }
 ```
@@ -132,7 +137,7 @@ Spawn may leave external side effects when a request times out or is aborted. Th
 }
 ```
 
-Inspect authorizes the selector against session-restored worker/orchestrator relationships before asking Herdr for live state. Unknown, self, and outside-team selectors return `NOT_TEAM_MEMBER` without probing an arbitrary agent. A configured peer absent from live Herdr state returns `NOT_FOUND`.
+Inspect accepts either the live name or pane ID of a configured worker or orchestrator. It resolves only session-restored relationship identifiers and compares the requested selector with those authorized live identities; it never asks Herdr to resolve an arbitrary requested selector. Unknown, self, and outside-team selectors return `NOT_TEAM_MEMBER`. A directly selected configured peer absent from live Herdr state returns `NOT_FOUND`.
 
 ```json
 {

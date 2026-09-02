@@ -29,7 +29,7 @@ test("unknown request and reply fields are accepted", () => {
 test("reply channels reject unsafe IDs and envelopes validate", () => {
   assert.equal(replyChannel(CHANNELS.spawn, "request_1"), "herdr-workers:rpc:spawn:reply:request_1");
   assert.throws(() => replyChannel(CHANNELS.spawn, "bad/id"), TypeError);
-  assert.equal(Check(ReplyEnvelopeSchema, success("r", { ok: true })), true);
+  assert.equal(Check(ReplyEnvelopeSchema, success("r", { value: true })), true);
   assert.equal(Check(ReplyEnvelopeSchema, failure("r", "NOT_FOUND", "Not found.")), true);
-  assert.equal(Check(ReplyEnvelopeSchema, { requestId: "r", protocol: 1, ok: false, error: { code: "SECRET", message: "x" } }), false);
+  assert.equal(Check(ReplyEnvelopeSchema, { requestId: "r", protocol: 1, success: false, error: { code: "SECRET", message: "x" } }), false);
 });

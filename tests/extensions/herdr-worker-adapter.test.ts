@@ -88,10 +88,10 @@ test("registers once, exposes live availability, and disposes on shutdown", asyn
 	assert.deepEqual([...h.tools.keys()].sort(), ["CreateAgentPanel", "SendToAgent"]);
 	assert.deepEqual([...h.commands.keys()].sort(), ["orchestrated-by", "team"]);
 	let probe = await emitForReply<any>(h.events, CHANNELS.probe, "before", { requestId: "before", supportedProtocols: [1] });
-	assert.equal(probe.ok && probe.data.reason, "SESSION_NOT_READY");
+	assert.equal(probe.success && probe.data.reason, "SESSION_NOT_READY");
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
 	probe = await emitForReply<any>(h.events, CHANNELS.probe, "after", { requestId: "after", supportedProtocols: [1] });
-	assert.equal(probe.ok && probe.data.available, true);
+	assert.equal(probe.success && probe.data.available, true);
 	await h.handlers.get("session_tree")![0]({}, h.ctx);
 	assert.equal(h.events.listenerCount(), 5);
 	await h.handlers.get("session_shutdown")![0]();
@@ -102,16 +102,16 @@ test("RPC spawn validates cwd before side effects, activates team mode, and retu
 	const h = await harness();
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
 	const probe = await emitForReply<any>(h.events, CHANNELS.probe, "probe", { requestId: "probe", supportedProtocols: [1] });
-	assert.equal(probe.ok, true);
-	const providerInstanceId = probe.ok ? probe.data.providerInstanceId : "";
+	assert.equal(probe.success, true);
+	const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
 	const callsBefore = h.execCalls.length;
 	const invalid = await emitForReply(h.events, CHANNELS.spawn, "invalid", { requestId: "invalid", providerInstanceId, protocol: 1, cwd: "relative" });
-	assert.equal(invalid.ok, false);
+	assert.equal(invalid.success, false);
 	assert.equal(h.execCalls.length, callsBefore);
 	assert.equal(h.entries.length, 0);
 
 	const spawned = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, "spawn", { requestId: "spawn", providerInstanceId, protocol: 1, name: "scout" });
-	assert.deepEqual(spawned.ok && spawned.data, { name: "agent-scout", paneId: "worker-pane", cwd: "/tmp", adopted: true });
+	assert.deepEqual(spawned.success && spawned.data, { name: "agent-scout", paneId: "worker-pane", cwd: "/tmp", adopted: true });
 	assert.equal(h.entries.some((entry) => entry.data.teamMode === true), true);
 	assert.equal(h.activeTools().includes("CreateAgentPanel"), true);
 });
@@ -135,9 +135,9 @@ test("SendToAgent and RPC send share delivery while preserving tool details and 
 	assert.deepEqual(tool.details, { target: "agent-scout", priority: true, message: "tool secret", status: tool.content[0].text });
 
 	const probe = await emitForReply<any>(h.events, CHANNELS.probe, "send-probe", { requestId: "send-probe", supportedProtocols: [1] });
-	const providerInstanceId = probe.ok ? probe.data.providerInstanceId : "";
+	const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
 	const reply = await emitForReply<DeliveryReceipt>(h.events, CHANNELS.send, "send", { requestId: "send", providerInstanceId, protocol: 1, target: "agent-scout", message: "rpc secret", mode: "steer" });
-	assert.deepEqual(reply.ok && reply.data, { target: "agent-scout", paneId: "worker-pane", kind: "pi", status: "idle", transport: "herdr-prompt", requestedMode: "steer", priorityApplied: false });
+	assert.deepEqual(reply.success && reply.data, { target: "agent-scout", paneId: "worker-pane", kind: "pi", status: "idle", transport: "herdr-prompt", requestedMode: "steer", priorityApplied: false });
 	assert.doesNotMatch(JSON.stringify(reply), /rpc secret/);
 	assert.equal(h.execCalls.filter((args) => args[0] === "agent" && args[1] === "prompt").length, 2);
 });
@@ -147,9 +147,9 @@ test("RPC inbox receipts report requested mode and actual priority without writi
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
 	await h.commands.get("team").handler("adopt agent-scout", h.ctx);
 	const probe = await emitForReply<any>(h.events, CHANNELS.probe, "inbox-probe", { requestId: "inbox-probe", supportedProtocols: [1] });
-	const providerInstanceId = probe.ok ? probe.data.providerInstanceId : "";
+	const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
 	const reply = await emitForReply<DeliveryReceipt>(h.events, CHANNELS.send, "inbox", { requestId: "inbox", providerInstanceId, protocol: 1, target: "agent-scout", message: "priority body", priority: true });
-	assert.deepEqual(reply.ok && reply.data, { target: "agent-scout", paneId: "worker-pane", kind: "pi", status: "idle", transport: "inbox", requestedMode: "steer", priorityApplied: true });
+	assert.deepEqual(reply.success && reply.data, { target: "agent-scout", paneId: "worker-pane", kind: "pi", status: "idle", transport: "inbox", requestedMode: "steer", priorityApplied: true });
 	const messages = h.writtenEnvelopes.filter(({ envelope }) => envelope.type === "message");
 	assert.equal(messages.length, 1);
 	assert.equal(messages[0].envelope.priority, true);
@@ -160,11 +160,11 @@ test("RPC direction and thinking reach the canonical creation sequence", async (
 	const h = await harness();
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
 	const probe = await emitForReply<any>(h.events, CHANNELS.probe, "options-probe", { requestId: "options-probe", supportedProtocols: [1] });
-	const providerInstanceId = probe.ok ? probe.data.providerInstanceId : "";
+	const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
 	const spawned = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, "options", {
 		requestId: "options", providerInstanceId, protocol: 1, name: "builder", direction: "left", model: "test/model", thinking: "high",
 	});
-	assert.equal(spawned.ok && spawned.data.paneId, "new-pane");
+	assert.equal(spawned.success && spawned.data.paneId, "new-pane");
 	assert.equal(h.execCalls.some((args) => args[0] === "pane" && args[1] === "split" && args.includes("--direction") && args.includes("right")), true);
 	assert.equal(h.execCalls.some((args) => args[0] === "pane" && args[1] === "swap"), true);
 	const start = h.execCalls.find((args) => args[0] === "agent" && args[1] === "start");
@@ -180,32 +180,38 @@ test("RPC inspect projects worker and orchestrator facts from authorized relatio
 	}) });
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
 	const probe = await emitForReply<any>(h.events, CHANNELS.probe, "inspect-probe", { requestId: "inspect-probe", supportedProtocols: [1] });
-	const providerInstanceId = probe.ok ? probe.data.providerInstanceId : "";
+	const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
 	const worker = await emitForReply<Inspection>(h.events, CHANNELS.inspect, "worker", { requestId: "worker", providerInstanceId, protocol: 1, target: "worker-pane" });
-	assert.deepEqual(worker.ok && worker.data, {
+	assert.deepEqual(worker.success && worker.data, {
 		name: "agent-scout", paneId: "worker-pane", kind: "pi", status: "idle", cwd: "/tmp",
 		type: "explore", purpose: "Map internals", model: "test/scout", relationship: "worker", managedBySession: true,
 	});
-	const orchestrator = await emitForReply<Inspection>(h.events, CHANNELS.inspect, "boss", { requestId: "boss", providerInstanceId, protocol: 1, target: "boss" });
-	assert.deepEqual(orchestrator.ok && orchestrator.data, {
+	const workerByName = await emitForReply<Inspection>(h.events, CHANNELS.inspect, "worker-name", { requestId: "worker-name", providerInstanceId, protocol: 1, target: "agent-scout" });
+	assert.deepEqual(workerByName.success && workerByName.data, worker.success && worker.data);
+	const orchestrator = await emitForReply<Inspection>(h.events, CHANNELS.inspect, "boss", { requestId: "boss", providerInstanceId, protocol: 1, target: "boss-pane" });
+	assert.deepEqual(orchestrator.success && orchestrator.data, {
 		name: "boss", paneId: "boss-pane", kind: "pi", status: "busy", cwd: "/workspace", relationship: "orchestrator", managedBySession: false,
 	});
-	assert.doesNotMatch(JSON.stringify([worker, orchestrator]), /tab-1|process|prompt/);
+	assert.deepEqual(h.agentGetTargets, ["self-pane", "agent-scout", "agent-scout", "agent-scout", "boss"]);
+	assert.equal(h.agentGetTargets.includes("worker-pane"), false);
+	assert.equal(h.agentGetTargets.includes("boss-pane"), false);
+	assert.doesNotMatch(JSON.stringify([worker, workerByName, orchestrator]), /tab-1|process|prompt/);
 });
 
-test("RPC inspect rejects self and outsiders before lookup and classifies stale peers", async () => {
+test("RPC inspect never probes requested unauthorized selectors and classifies stale peers", async () => {
 	const h = await harness({ branch: teamBranch({ workers: ["agent-scout"] }), missingAgents: ["agent-scout"] });
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
 	const probe = await emitForReply<any>(h.events, CHANNELS.probe, "auth-probe", { requestId: "auth-probe", supportedProtocols: [1] });
-	const providerInstanceId = probe.ok ? probe.data.providerInstanceId : "";
+	const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
 	for (const target of ["self-pane", "outside-agent"]) {
 		const reply = await emitForReply<Inspection>(h.events, CHANNELS.inspect, `inspect-${target}`, { requestId: `inspect-${target}`, providerInstanceId, protocol: 1, target });
-		assert.equal(reply.ok ? "ok" : reply.error.code, "NOT_TEAM_MEMBER");
+		assert.equal(reply.success ? "success" : reply.error.code, "NOT_TEAM_MEMBER");
 	}
-	assert.deepEqual(h.agentGetTargets, ["self-pane"]);
-	const stale = await emitForReply<Inspection>(h.events, CHANNELS.inspect, "stale", { requestId: "stale", providerInstanceId, protocol: 1, target: "agent-scout" });
-	assert.equal(stale.ok ? "ok" : stale.error.code, "NOT_FOUND");
 	assert.deepEqual(h.agentGetTargets, ["self-pane", "agent-scout"]);
+	assert.equal(h.agentGetTargets.includes("outside-agent"), false);
+	const stale = await emitForReply<Inspection>(h.events, CHANNELS.inspect, "stale", { requestId: "stale", providerInstanceId, protocol: 1, target: "agent-scout" });
+	assert.equal(stale.success ? "success" : stale.error.code, "NOT_FOUND");
+	assert.deepEqual(h.agentGetTargets, ["self-pane", "agent-scout", "agent-scout"]);
 });
 
 test("session tree replaces inspect authority without replacing the provider instance", async () => {
@@ -216,10 +222,10 @@ test("session tree replaces inspect authority without replacing the provider ins
 	branch[0].data.workers = [];
 	await h.handlers.get("session_tree")![0]({}, h.ctx);
 	const second = await emitForReply<any>(h.events, CHANNELS.probe, "same-generation", { requestId: "same-generation", supportedProtocols: [1] });
-	assert.equal(first.ok && second.ok && first.data.providerInstanceId, second.ok && second.data.providerInstanceId);
-	const providerInstanceId = second.ok ? second.data.providerInstanceId : "";
+	assert.equal(first.success && second.success && first.data.providerInstanceId, second.success && second.data.providerInstanceId);
+	const providerInstanceId = second.success ? second.data.providerInstanceId : "";
 	const denied = await emitForReply<Inspection>(h.events, CHANNELS.inspect, "after-tree", { requestId: "after-tree", providerInstanceId, protocol: 1, target: "agent-scout" });
-	assert.equal(denied.ok ? "ok" : denied.error.code, "NOT_TEAM_MEMBER");
+	assert.equal(denied.success ? "success" : denied.error.code, "NOT_TEAM_MEMBER");
 	assert.deepEqual(h.agentGetTargets, ["self-pane"]);
 });
 
@@ -227,12 +233,12 @@ test("reload replaces the provider instance and stale addressed requests are no-
 	const h = await harness();
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
 	const oldProbe = await emitForReply<any>(h.events, CHANNELS.probe, "old-provider", { requestId: "old-provider", supportedProtocols: [1] });
-	const oldInstanceId = oldProbe.ok ? oldProbe.data.providerInstanceId : "";
+	const oldInstanceId = oldProbe.success ? oldProbe.data.providerInstanceId : "";
 	await h.handlers.get("session_shutdown")![0]();
 	h.herdrWorker(h.pi, { disableInbox: true });
 	await h.handlers.get("session_start")![1]({ reason: "startup" }, h.ctx);
 	const newProbe = await emitForReply<any>(h.events, CHANNELS.probe, "new-provider", { requestId: "new-provider", supportedProtocols: [1] });
-	const newInstanceId = newProbe.ok ? newProbe.data.providerInstanceId : "";
+	const newInstanceId = newProbe.success ? newProbe.data.providerInstanceId : "";
 	assert.notEqual(newInstanceId, oldInstanceId);
 	let replied = false;
 	const unsubscribe = h.events.on(replyChannel(CHANNELS.inspect, "stale-provider"), () => { replied = true; });

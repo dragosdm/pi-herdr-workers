@@ -83,7 +83,7 @@ export class WorkerRpcClient {
       if (options.signal?.aborted) return onAbort();
       unsubscribe = this.events.on(replyChannel(CHANNELS.probe, requestId), (payload) => {
         if (!isReplyEnvelope(payload) || payload.requestId !== requestId) return;
-        if (!payload.ok) {
+        if (!payload.success) {
           if (payload.error.code !== "UNSUPPORTED_PROTOCOL") return;
           finish(() => reject(new RpcResponseError(payload.error.code, payload.error.message)));
           return;
@@ -133,7 +133,7 @@ export class WorkerRpcClient {
       if (signal?.aborted) return onAbort();
       unsubscribe = this.events.on(replyChannel(channel, request.requestId), (payload) => {
         if (!isReplyEnvelope(payload) || payload.requestId !== request.requestId) return;
-        finish(() => payload.ok ? resolve(payload.data as T) : reject(new RpcResponseError(payload.error.code, payload.error.message)));
+        finish(() => payload.success ? resolve(payload.data as T) : reject(new RpcResponseError(payload.error.code, payload.error.message)));
       });
       timer = setTimeout(() => finish(() => reject(new RpcTimeoutError())), timeoutMs);
       signal?.addEventListener("abort", onAbort, { once: true });
