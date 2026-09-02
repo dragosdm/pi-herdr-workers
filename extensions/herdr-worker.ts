@@ -25,6 +25,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
+import { registerWorkerRpcServer, type WorkerRpcService } from "../rpc/server.js";
+import type { InspectInput, Inspection, SendInput, DeliveryReceipt, SpawnInput, WorkerReference } from "../rpc/protocol.js";
 
 // ───────────────────────── herdr env ─────────────────────────
 
@@ -132,7 +134,9 @@ function frameMessage(env: Envelope): string {
 
 // ───────────────────────── extension ─────────────────────────
 
-export default function (pi: ExtensionAPI) {
+interface HerdrWorkerTestOptions { disableInbox?: boolean }
+
+export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions = {}) {
 	let state: State = { workers: [] };
 	let ctxRef: ExtensionContext | undefined;
 	let selfInfo: AgentInfo | undefined;
@@ -144,6 +148,13 @@ export default function (pi: ExtensionAPI) {
 	let createQueue = Promise.resolve();
 	const inFlightEnvelopes = new Set<string>();
 	const interactive = () => HERDR_ENV && !!SELF_PANE && ctxRef?.mode === "tui" && !stopped;
+	const providerState = () => {
+		if (stopped) return { available: false as const, reason: "SHUTTING_DOWN" as const };
+		if (!HERDR_ENV || !SELF_PANE) return { available: false as const, reason: "NOT_IN_HERDR" as const };
+		if (ctxRef && ctxRef.mode !== "tui") return { available: false as const, reason: "NOT_INTERACTIVE" as const };
+		if (!ctxRef) return { available: false as const, reason: "SESSION_NOT_READY" as const };
+		return { available: true as const };
+	};
 
 	pi.registerFlag("orchestrated-by", {
 		description: "Herdr worker: id (agent name or pane id) of the orchestrator controlling this pi",
@@ -294,7 +305,7 @@ export default function (pi: ExtensionAPI) {
 	// ── inbox (receiving) ──
 
 	function startListening() {
-		if (!interactive() || watcher || poller) return;
+		if (testOptions.disableInbox || !interactive() || watcher || poller) return;
 		const dir = inboxDir(SELF_PANE);
 		fs.mkdirSync(dir, { recursive: true });
 		fs.writeFileSync(listeningFile(SELF_PANE), JSON.stringify({ pid: process.pid, ts: Date.now(), id: selfId() }));
@@ -617,8 +628,18 @@ export default function (pi: ExtensionAPI) {
 		thinking?: string;
 		initialPrompt?: string;
 	}
+	interface CreateResult {
+		name: string;
+		paneId: string;
+		model?: string;
+		type?: string;
+		purpose?: string;
+		cwd: string;
+		how: string;
+		adopted: boolean;
+	}
 
-	async function createAgent(opts: CreateOpts, ctx: ExtensionContext): Promise<{ name: string; paneId: string; model?: string; how: string; adopted?: boolean }> {
+	async function createAgent(opts: CreateOpts, ctx: ExtensionContext, cwd: string): Promise<CreateResult> {
 		if (!HERDR_ENV || !SELF_PANE) throw new Error("Not running inside herdr.");
 		const dir: Direction = opts.direction ?? "right";
 		const type = opts.type?.trim().toLowerCase() || undefined;
@@ -643,14 +664,15 @@ export default function (pi: ExtensionAPI) {
 			if (existing && existing.paneId !== SELF_PANE && existing.tabId === SELF_TAB && !state.workers.includes(wanted)) {
 				await adopt(wanted);
 				if (opts.initialPrompt) await send(wanted, opts.initialPrompt, false);
-				return { name: wanted, paneId: existing.paneId, how: "re-adopted existing pane", adopted: true };
+				const meta = state.meta?.[wanted];
+				return { name: wanted, paneId: existing.paneId, model: meta?.model, type: meta?.type, purpose: meta?.purpose, cwd, how: "re-adopted existing pane", adopted: true };
 			}
 		}
 		const name = await uniqueName(requested);
 
 		// Create the pane: start a worker stack on the requested side, or extend the existing one.
 		const target = await pickSplit(dir);
-		const split = await herdr(["pane", "split", target.pane, "--direction", target.direction, "--cwd", ctx.cwd, "--no-focus"]);
+		const split = await herdr(["pane", "split", target.pane, "--direction", target.direction, "--cwd", cwd, "--no-focus"]);
 		const paneId: string | undefined = split?.result?.pane?.pane_id;
 		if (!paneId) throw new Error(`pane split returned no pane id: ${JSON.stringify(split)}`);
 		pi.appendEntry("herdr-worker.operation.v1", { name, paneId, phase: "pane-created", at: Date.now() });
@@ -680,8 +702,62 @@ export default function (pi: ExtensionAPI) {
 			for (let i = 0; i < 20 && !isListening(paneId); i++) await new Promise((r) => setTimeout(r, 500));
 			await send(name, opts.initialPrompt, false);
 		}
-		return { name, paneId, model, how: target.how };
+		return { name, paneId, model, type, purpose: opts.purpose?.trim() || undefined, cwd, how: target.how, adopted: false };
 	}
+
+	function validateSpawnCwd(value: string): string {
+		if (!path.isAbsolute(value)) throw new Error("Worker cwd must be an absolute accessible directory.");
+		let stat: fs.Stats;
+		try {
+			fs.accessSync(value, fs.constants.R_OK | fs.constants.X_OK);
+			stat = fs.statSync(value);
+		} catch {
+			throw new Error("Worker cwd must be an absolute accessible directory.");
+		}
+		if (!stat.isDirectory()) throw new Error("Worker cwd must be an absolute accessible directory.");
+		return value;
+	}
+
+	type SpawnOptions = SpawnInput & { direction?: Direction; thinking?: string };
+	async function spawnWorker(input: SpawnOptions, signal?: AbortSignal): Promise<CreateResult> {
+			const ctx = ctxRef;
+			if (!ctx) throw new Error("Session is not ready.");
+			const cwd = validateSpawnCwd(input.cwd ?? ctx.cwd);
+			signal?.throwIfAborted();
+			if (!state.orchestratedBy && !state.teamMode) {
+				state.teamMode = true;
+				persist();
+				updateUi();
+			}
+			const pending = createQueue.then(() => {
+				signal?.throwIfAborted();
+				return createAgent({ name: input.name, direction: input.direction, model: input.model, type: input.type, purpose: input.purpose, thinking: input.thinking, initialPrompt: input.initialPrompt }, ctx, cwd);
+			});
+			createQueue = pending.then(() => {}, () => {});
+			const result = await pending;
+			return result;
+	}
+	const service: WorkerRpcService = {
+		async spawn(input, signal) {
+			const result = await spawnWorker(input, signal);
+			return {
+				name: result.name,
+				paneId: result.paneId,
+				cwd: result.cwd,
+				adopted: result.adopted,
+				...(result.model === undefined ? {} : { model: result.model }),
+				...(result.type === undefined ? {} : { type: result.type }),
+				...(result.purpose === undefined ? {} : { purpose: result.purpose }),
+			};
+		},
+		async send(_input: SendInput, _signal?: AbortSignal): Promise<DeliveryReceipt> {
+			throw new Error("RPC send is not connected yet.");
+		},
+		async inspect(_input: InspectInput, _signal?: AbortSignal): Promise<Inspection> {
+			throw new Error("RPC inspect is not connected yet.");
+		},
+	};
+	const rpcServer = registerWorkerRpcServer({ events: pi.events, service, getProviderState: providerState });
 
 	async function release(name: string): Promise<string> {
 		if (!state.workers.includes(name)) throw new Error(`Not orchestrating "${name}". Workers: ${state.workers.join(", ") || "(none)"}`);
@@ -727,13 +803,11 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params, _signal, onUpdate, ctx) {
 			if (!isOrchestrator()) throw new Error("CreateAgentPanel is only available to an orchestrator (run /team here first).");
 			onUpdate?.({ content: [{ type: "text", text: "Splitting pane and starting worker…" }], details: {} });
-			const create = () => createAgent(
+			const create = () => spawnWorker(
 				{ name: params.name, direction: params.direction as Direction | undefined, type: params.type, purpose: params.purpose, model: params.model, thinking: params.thinking, initialPrompt: params.initial_prompt },
-				ctx,
+				_signal,
 			);
-			const pending = createQueue.then(() => { _signal?.throwIfAborted(); return create(); });
-			createQueue = pending.then(() => {}, () => {});
-			const r = await pending;
+			const r = await create();
 			const meta = state.meta?.[r.name];
 			const text = [
 				`Worker ${r.name} ready in pane ${r.paneId} (${r.how}).`,
@@ -943,6 +1017,7 @@ export default function (pi: ExtensionAPI) {
 		// Headless sessions must not remove the interactive pane's listener file.
 		const wasListening = !!watcher || !!poller;
 		stopped = true;
+		rpcServer.dispose();
 		lifetime.abort();
 		if (wasListening) stopListening();
 		if (ctxRef?.hasUI) ctxRef.ui.setStatus(STATUS_KEY, undefined);

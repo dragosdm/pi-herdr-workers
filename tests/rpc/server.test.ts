@@ -56,6 +56,27 @@ test("service dispatches once, ignores unknown fields, and sanitizes failures", 
   assert.deepEqual(reply, { requestId: "send", protocol: 1, ok: false, error: { code: "INTERNAL_ERROR", message: "The worker operation failed." } });
 });
 
+test("addressed spawn forwards bounded input once and returns worker facts", async () => {
+  const events = new FakeEventBus();
+  let calls = 0;
+  registerWorkerRpcServer({
+    events,
+    service: service({ spawn: async (input) => {
+      calls++;
+      assert.deepEqual(input, { name: "scout", cwd: "/workspace", initialPrompt: "Investigate" });
+      return { name: "agent-scout", paneId: "%2", cwd: "/workspace", model: "test/model", type: "explore", purpose: "Investigate", adopted: false };
+    } }),
+    getProviderState: () => ({ available: true }),
+    createInstanceId: () => "instance",
+  });
+  let reply: RpcReply | undefined;
+  events.on(replyChannel(CHANNELS.spawn, "spawn"), (payload) => { reply = payload as RpcReply; });
+  events.emit(CHANNELS.spawn, { requestId: "spawn", providerInstanceId: "instance", protocol: 1, name: "scout", cwd: "/workspace", initialPrompt: "Investigate", future: true });
+  await flush();
+  assert.equal(calls, 1);
+  assert.deepEqual(reply, { requestId: "spawn", protocol: 1, ok: true, data: { name: "agent-scout", paneId: "%2", cwd: "/workspace", model: "test/model", type: "explore", purpose: "Investigate", adopted: false } });
+});
+
 test("explicit domain failures cross the wire safely", async () => {
   const events = new FakeEventBus();
   registerWorkerRpcServer({

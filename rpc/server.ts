@@ -93,8 +93,15 @@ export function registerWorkerRpcServer(options: WorkerRpcServerOptions): Worker
     try {
       let data: unknown;
       if (channel === CHANNELS.spawn) {
-        const { requestId: _, providerInstanceId: __, protocol: ___, ...input } = request;
-        data = await options.service.spawn(input as SpawnInput);
+        const input = request as unknown as SpawnInput;
+        data = await options.service.spawn({
+          ...(input.name === undefined ? {} : { name: input.name }),
+          ...(input.model === undefined ? {} : { model: input.model }),
+          ...(input.type === undefined ? {} : { type: input.type }),
+          ...(input.purpose === undefined ? {} : { purpose: input.purpose }),
+          ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
+          ...(input.initialPrompt === undefined ? {} : { initialPrompt: input.initialPrompt }),
+        });
       } else if (channel === CHANNELS.send) {
         const { requestId: _, providerInstanceId: __, protocol: ___, ...input } = request;
         data = await options.service.send(input as unknown as SendInput);

@@ -1,6 +1,7 @@
 {
   "name": "pi-herdr-workers",
   "version": "0.2.0",
+  "type": "module",
   "description": "Pi + Herdr: /team, /loop, monitors, /split-handoff and /split-fork. No extra npm deps.",
   "license": "MIT",
   "repository": {
