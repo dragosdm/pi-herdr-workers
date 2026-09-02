@@ -1,2 +1,5 @@
 .pi/
 node_modules/
+
+# Riptide artifacts (cloud-synced)
+.humanlayer/tasks/
