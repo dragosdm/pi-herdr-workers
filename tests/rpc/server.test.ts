@@ -81,6 +81,45 @@ test("service dispatches once, ignores unknown fields, and sanitizes failures", 
   assert.deepEqual(reply, { requestId: "send", protocol: 1, success: false, error: { code: "INTERNAL_ERROR", message: "The worker operation failed." } });
 });
 
+test("malformed generated and service results become fixed internal errors", async () => {
+  const events = new FakeEventBus();
+  let providerStateCalls = 0;
+  registerWorkerRpcServer({
+    events,
+    service: service({
+      spawn: async () => ({ name: "worker", paneId: "%1", cwd: "/tmp", adopted: "private" } as never),
+      send: async () => ({ target: "worker", paneId: "%1", transport: "private", requestedMode: "steer", priorityApplied: true } as never),
+      inspect: async () => ({ name: "worker", paneId: "%1", relationship: "private", managedBySession: true } as never),
+    }),
+    getProviderState: () => providerStateCalls++ === 0
+      ? { available: false, reason: "PRIVATE_REASON" as never }
+      : { available: true },
+    createInstanceId: () => "instance",
+  });
+  const requests = [
+    { channel: CHANNELS.probe, id: "probe-result", payload: { requestId: "probe-result", supportedProtocols: [1] } },
+    { channel: CHANNELS.spawn, id: "spawn-result", payload: { requestId: "spawn-result", providerInstanceId: "instance", protocol: 1 } },
+    { channel: CHANNELS.send, id: "send-result", payload: { requestId: "send-result", providerInstanceId: "instance", protocol: 1, target: "worker", message: "hello" } },
+    { channel: CHANNELS.inspect, id: "inspect-result", payload: { requestId: "inspect-result", providerInstanceId: "instance", protocol: 1, target: "worker" } },
+  ] as const;
+  const replies: RpcReply[] = [];
+  for (const request of requests) {
+    events.on(replyChannel(request.channel, request.id), (payload) => { replies.push(payload as RpcReply); });
+    events.emit(request.channel, request.payload);
+  }
+  await flush();
+  assert.equal(replies.length, 4);
+  for (const reply of replies) {
+    assert.deepEqual(reply, {
+      requestId: reply.requestId,
+      protocol: 1,
+      success: false,
+      error: { code: "INTERNAL_ERROR", message: "The worker operation failed." },
+    });
+    assert.doesNotMatch(JSON.stringify(reply), /private/i);
+  }
+});
+
 test("addressed spawn forwards bounded input once and returns worker facts", async () => {
   const events = new FakeEventBus();
   let calls = 0;

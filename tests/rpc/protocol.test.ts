@@ -2,7 +2,8 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { Check } from "typebox/value";
 import {
-  CHANNELS, LIMITS, ProbeRequestSchema, ReplyEnvelopeSchema, SendRequestSchema, SpawnRequestSchema,
+  CHANNELS, DeliveryReceiptSchema, InspectionSchema, LIMITS, ProbeDataSchema, ProbeRequestSchema,
+  ReplyEnvelopeSchema, SendRequestSchema, SpawnRequestSchema, WorkerReferenceSchema,
   failure, isValidRequest, replyChannel, success,
 } from "../../rpc/protocol.js";
 
@@ -50,6 +51,51 @@ test("unknown request and reply fields are accepted", () => {
     requestId: "r", providerInstanceId: "p", protocol: 1, target: "worker", message: "hello", future: true,
   }), true);
   assert.equal(Check(ReplyEnvelopeSchema, { ...success("r", { value: 1 }), future: true }), true);
+});
+
+test("result schemas validate complete shapes and accept unknown fields", () => {
+  const results = [
+    {
+      schema: ProbeDataSchema,
+      valid: {
+        protocol: 1, provider: "herdr", providerInstanceId: "provider", available: false,
+        reason: "SESSION_NOT_READY", capabilities: ["spawn", "send", "steer", "inspect"],
+        constraints: { requiresHerdrPane: true, requiresInteractivePi: true, future: true }, future: true,
+      },
+      invalid: {
+        protocol: 1, provider: "other", providerInstanceId: "provider", available: true,
+        capabilities: [], constraints: { requiresHerdrPane: true, requiresInteractivePi: true },
+      },
+    },
+    {
+      schema: WorkerReferenceSchema,
+      valid: { name: "worker", paneId: "%1", cwd: "/tmp", adopted: false, future: true },
+      invalid: { name: "worker", paneId: "%1", cwd: "/tmp", adopted: "no" },
+    },
+    {
+      schema: DeliveryReceiptSchema,
+      valid: {
+        target: "worker", paneId: "%1", transport: "inbox", requestedMode: "steer",
+        priorityApplied: true, future: true,
+      },
+      invalid: {
+        target: "worker", paneId: "%1", transport: "socket", requestedMode: "steer",
+        priorityApplied: true,
+      },
+    },
+    {
+      schema: InspectionSchema,
+      valid: {
+        name: "worker", paneId: "%1", relationship: "worker", managedBySession: true, future: true,
+      },
+      invalid: { name: "worker", paneId: "%1", relationship: "peer", managedBySession: true },
+    },
+  ] as const;
+
+  for (const { schema, valid, invalid } of results) {
+    assert.equal(Check(schema, valid), true);
+    assert.equal(Check(schema, invalid), false);
+  }
 });
 
 test("reply channels reject unsafe IDs and envelopes validate", () => {

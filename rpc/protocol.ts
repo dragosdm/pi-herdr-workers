@@ -103,10 +103,63 @@ export type AddressedRequest = SpawnRequest | SendRequest | InspectRequest | Sto
 export interface SpawnInput { name?: string; direction?: SpawnDirection; model?: string; thinking?: ThinkingLevel; type?: string; purpose?: string; cwd?: string; initialPrompt?: string }
 export interface SendInput { target: string; message: string; mode?: "follow-up" | "steer"; priority?: boolean }
 export interface InspectInput { target: string }
-export interface WorkerReference { name: string; paneId: string; model?: string; cwd: string; type?: string; purpose?: string; adopted: boolean }
-export interface DeliveryReceipt { target: string; paneId: string; kind?: string; status?: string; transport: "inbox" | "herdr-prompt"; requestedMode: "follow-up" | "steer"; priorityApplied: boolean }
-export interface Inspection { name: string; paneId: string; kind?: string; status?: string; cwd?: string; type?: string; purpose?: string; model?: string; relationship: "worker" | "orchestrator"; managedBySession: boolean }
-export interface ProbeData { protocol: 1; provider: "herdr"; providerInstanceId: string; available: boolean; reason?: AvailabilityReason; capabilities: Capability[]; constraints: { requiresHerdrPane: true; requiresInteractivePi: true } }
+
+const CapabilitySchema = Type.Union(CAPABILITIES.map((capability) => Type.Literal(capability)));
+const AvailabilityReasonSchema = Type.Union(AVAILABILITY_REASONS.map((reason) => Type.Literal(reason)));
+export const ProbeDataSchema = Type.Object({
+  protocol: ProtocolV1Schema,
+  provider: Type.Literal("herdr"),
+  providerInstanceId: ProviderInstanceIdSchema,
+  available: Type.Boolean(),
+  reason: Type.Optional(AvailabilityReasonSchema),
+  capabilities: Type.Array(CapabilitySchema),
+  constraints: Type.Object({
+    requiresHerdrPane: Type.Literal(true),
+    requiresInteractivePi: Type.Literal(true),
+  }),
+});
+export const WorkerReferenceSchema = Type.Object({
+  name: bounded(LIMITS.workerName),
+  paneId: bounded(LIMITS.target),
+  model: Type.Optional(bounded(LIMITS.model)),
+  cwd: bounded(LIMITS.cwd),
+  type: Type.Optional(bounded(LIMITS.type)),
+  purpose: Type.Optional(bounded(LIMITS.purpose)),
+  adopted: Type.Boolean(),
+});
+export const DeliveryReceiptSchema = Type.Object({
+  target: bounded(LIMITS.target),
+  paneId: bounded(LIMITS.target),
+  kind: Type.Optional(bounded(LIMITS.type)),
+  status: Type.Optional(bounded(LIMITS.type)),
+  transport: Type.Union([Type.Literal("inbox"), Type.Literal("herdr-prompt")]),
+  requestedMode: Type.Union([Type.Literal("follow-up"), Type.Literal("steer")]),
+  priorityApplied: Type.Boolean(),
+});
+export const InspectionSchema = Type.Object({
+  name: bounded(LIMITS.target),
+  paneId: bounded(LIMITS.target),
+  kind: Type.Optional(bounded(LIMITS.type)),
+  status: Type.Optional(bounded(LIMITS.type)),
+  cwd: Type.Optional(bounded(LIMITS.cwd)),
+  type: Type.Optional(bounded(LIMITS.type)),
+  purpose: Type.Optional(bounded(LIMITS.purpose)),
+  model: Type.Optional(bounded(LIMITS.model)),
+  relationship: Type.Union([Type.Literal("worker"), Type.Literal("orchestrator")]),
+  managedBySession: Type.Boolean(),
+});
+
+export const RESULT_SCHEMAS = {
+  probe: ProbeDataSchema,
+  spawn: WorkerReferenceSchema,
+  send: DeliveryReceiptSchema,
+  inspect: InspectionSchema,
+} as const;
+
+export type ProbeData = Static<typeof ProbeDataSchema>;
+export type WorkerReference = Static<typeof WorkerReferenceSchema>;
+export type DeliveryReceipt = Static<typeof DeliveryReceiptSchema>;
+export type Inspection = Static<typeof InspectionSchema>;
 
 export interface RpcError { code: RpcErrorCode; message: string }
 export type RpcReply<T = unknown> =

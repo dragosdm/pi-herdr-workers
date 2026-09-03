@@ -179,6 +179,10 @@ The character limits are structural protocol-v1 constraints. Because UTF-8 uses 
 
 Unknown object fields are ignored for forward compatibility. Known fields retain their version-1 meaning and limits. New protocol versions should be added to probe negotiation rather than silently changing version-1 behavior.
 
+Successful probe, spawn, send, and inspect data is runtime validated against its operation-specific protocol-v1 shape. Providers validate service results before emitting them; malformed internal results become the fixed `INTERNAL_ERROR` response. The bundled client validates successful data independently before returning it. A malformed addressed success rejects with a client-only `RpcProtocolError` whose code is `INVALID_RESPONSE` and whose fixed message is `The worker provider returned an invalid response.` Provider payload details and schema diagnostics are not exposed.
+
+Probe is broadcast, so a malformed successful probe response does not prevent discovery of another valid provider. The client continues listening and prefers an available provider. When discovery times out, the first valid unavailable provider takes precedence, followed by `RpcProtocolError` if only malformed successes were observed, then the normal timeout error. Stop is failure-only; an unexpected successful stop response is rejected as invalid.
+
 Errors use only `INVALID_REQUEST`, `UNSUPPORTED_PROTOCOL`, `PROVIDER_UNAVAILABLE`, `NOT_FOUND`, `NOT_TEAM_MEMBER`, `UNSUPPORTED_OPERATION`, and `INTERNAL_ERROR`. Unknown service failures map to a fixed `INTERNAL_ERROR`; replies do not expose stacks, environment values, raw Herdr errors, prompts, or message bodies.
 
 The bundled client accepts a positive finite timeout up to 300 seconds and cleans up its reply listener on success, failure, timeout, abort, or synchronous emit failure. Aborting or timing out bounds the caller's wait, not necessarily external side effects already started by the provider.

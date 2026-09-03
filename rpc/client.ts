@@ -1,8 +1,10 @@
 import { randomUUID } from "node:crypto";
+import type { TSchema } from "typebox";
 import {
   CHANNELS,
   LIMITS,
   PROTOCOL_V1,
+  RESULT_SCHEMAS,
   type AddressedRequest,
   type InspectInput,
   type Inspection,
@@ -14,6 +16,7 @@ import {
   type SpawnInput,
   type WorkerReference,
   isReplyEnvelope,
+  isValid,
   replyChannel,
 } from "./protocol.js";
 
@@ -42,6 +45,13 @@ export class RpcAbortError extends Error {
 export class RpcResponseError extends Error {
   constructor(readonly code: string, message: string) { super(message); this.name = "RpcResponseError"; }
 }
+export class RpcProtocolError extends Error {
+  readonly code = "INVALID_RESPONSE";
+  constructor() {
+    super("The worker provider returned an invalid response.");
+    this.name = "RpcProtocolError";
+  }
+}
 
 function timeoutFor(operation: keyof typeof CHANNELS, requested?: number): number {
   if (requested === undefined) return DEFAULT_TIMEOUTS[operation];
@@ -66,6 +76,7 @@ export class WorkerRpcClient {
     return new Promise((resolve, reject) => {
       let settled = false;
       let fallback: ProbeData | undefined;
+      let malformedSuccess = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
       let unsubscribe = () => {};
       const cleanup = () => {
@@ -88,12 +99,18 @@ export class WorkerRpcClient {
           finish(() => reject(new RpcResponseError(payload.error.code, payload.error.message)));
           return;
         }
-        const data = payload.data as ProbeData;
-        if (data.protocol !== PROTOCOL_V1 || !data.providerInstanceId) return;
+        if (!isValid<ProbeData>(RESULT_SCHEMAS.probe, payload.data)) {
+          malformedSuccess = true;
+          return;
+        }
+        const data = payload.data;
         if (data.available) finish(() => resolve(data));
         else fallback ??= data;
       });
-      timer = setTimeout(() => finish(() => fallback ? resolve(fallback) : reject(new RpcTimeoutError())), timeoutMs);
+      timer = setTimeout(() => finish(() => {
+        if (fallback) resolve(fallback);
+        else reject(malformedSuccess ? new RpcProtocolError() : new RpcTimeoutError());
+      }), timeoutMs);
       options.signal?.addEventListener("abort", onAbort, { once: true });
       try {
         this.events.emit(CHANNELS.probe, { requestId, supportedProtocols: [PROTOCOL_V1] });
@@ -104,25 +121,25 @@ export class WorkerRpcClient {
   }
 
   async spawn(input: SpawnInput, provider: ProbeData, options?: CallOptions): Promise<WorkerReference> {
-    return this.operation("spawn", input, provider, options);
+    return this.operation("spawn", input, provider, RESULT_SCHEMAS.spawn, options);
   }
   async send(input: SendInput, provider: ProbeData, options?: CallOptions): Promise<DeliveryReceipt> {
-    return this.operation("send", input, provider, options);
+    return this.operation("send", input, provider, RESULT_SCHEMAS.send, options);
   }
   async inspect(input: InspectInput, provider: ProbeData, options?: CallOptions): Promise<Inspection> {
-    return this.operation("inspect", input, provider, options);
+    return this.operation("inspect", input, provider, RESULT_SCHEMAS.inspect, options);
   }
   async stop(target: string | undefined, provider: ProbeData, options?: CallOptions): Promise<never> {
-    return this.operation("stop", target ? { target } : {}, provider, options);
+    return this.operation("stop", target ? { target } : {}, provider, undefined, options);
   }
 
-  private operation<T>(operation: "spawn" | "send" | "inspect" | "stop", input: object, provider: ProbeData, options: CallOptions = {}): Promise<T> {
+  private operation<T>(operation: "spawn" | "send" | "inspect" | "stop", input: object, provider: ProbeData, resultSchema: TSchema | undefined, options: CallOptions = {}): Promise<T> {
     const requestId = this.createRequestId();
     const request = { ...input, requestId, providerInstanceId: provider.providerInstanceId, protocol: provider.protocol } as AddressedRequest;
-    return this.call(CHANNELS[operation], request, timeoutFor(operation, options.timeoutMs), options.signal);
+    return this.call(CHANNELS[operation], request, resultSchema, timeoutFor(operation, options.timeoutMs), options.signal);
   }
 
-  private call<T>(channel: RequestChannel, request: AddressedRequest, timeoutMs: number, signal?: AbortSignal): Promise<T> {
+  private call<T>(channel: RequestChannel, request: AddressedRequest, resultSchema: TSchema | undefined, timeoutMs: number, signal?: AbortSignal): Promise<T> {
     return new Promise((resolve, reject) => {
       let settled = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
@@ -133,7 +150,16 @@ export class WorkerRpcClient {
       if (signal?.aborted) return onAbort();
       unsubscribe = this.events.on(replyChannel(channel, request.requestId), (payload) => {
         if (!isReplyEnvelope(payload) || payload.requestId !== request.requestId) return;
-        finish(() => payload.success ? resolve(payload.data as T) : reject(new RpcResponseError(payload.error.code, payload.error.message)));
+        if (!payload.success) {
+          finish(() => reject(new RpcResponseError(payload.error.code, payload.error.message)));
+          return;
+        }
+        const data = payload.data;
+        if (resultSchema === undefined || !isValid<T>(resultSchema, data)) {
+          finish(() => reject(new RpcProtocolError()));
+          return;
+        }
+        finish(() => resolve(data));
       });
       timer = setTimeout(() => finish(() => reject(new RpcTimeoutError())), timeoutMs);
       signal?.addEventListener("abort", onAbort, { once: true });
