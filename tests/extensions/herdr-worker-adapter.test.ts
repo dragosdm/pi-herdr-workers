@@ -7,7 +7,7 @@ process.env.HERDR_ENV = "1";
 process.env.HERDR_PANE_ID = "self-pane";
 process.env.HERDR_TAB_ID = "tab-1";
 
-async function harness(options: { listening?: boolean; branch?: any[]; missingAgents?: string[] } = {}) {
+async function harness(options: { listening?: boolean; branch?: any[]; missingAgents?: string[]; contextCwd?: string; workerCwd?: string | null } = {}) {
 	const { default: herdrWorker } = await import("../../extensions/herdr-worker.js");
 	const events = new FakeEventBus();
 	const tools = new Map<string, any>();
@@ -44,7 +44,10 @@ async function harness(options: { listening?: boolean; branch?: any[]; missingAg
 				const agent = target === "self-pane"
 					? { pane_id: "self-pane", tab_id: "tab-1", name: "orchestrator", agent: "pi", cwd: "/tmp" }
 					: (target === "agent-scout" || target === "worker-pane") && !options.missingAgents?.includes(target)
-						? { pane_id: "worker-pane", tab_id: "tab-1", name: "agent-scout", agent: "pi", agent_status: "idle", cwd: "/tmp" }
+						? {
+							pane_id: "worker-pane", tab_id: "tab-1", name: "agent-scout", agent: "pi", agent_status: "idle",
+							...(options.workerCwd === null ? {} : { cwd: options.workerCwd ?? "/tmp" }),
+						}
 						: target === "boss" && !options.missingAgents?.includes(target)
 							? { pane_id: "boss-pane", tab_id: "tab-1", name: "boss", agent: "pi", agent_status: "busy", cwd: "/workspace" }
 						: undefined;
@@ -56,7 +59,7 @@ async function harness(options: { listening?: boolean; branch?: any[]; missingAg
 	};
 	const ctx: any = {
 		mode: "tui",
-		cwd: "/tmp",
+		cwd: options.contextCwd ?? "/tmp",
 		hasUI: false,
 		model: { provider: "test", id: "model" },
 		signal: new AbortController().signal,
@@ -117,13 +120,38 @@ test("RPC spawn validates cwd before side effects, activates team mode, and retu
 });
 
 test("CreateAgentPanel preserves parameter mapping through the shared spawn facade", async () => {
-	const h = await harness();
+	const h = await harness({ workerCwd: "/workspace/live" });
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
 	await h.commands.get("team").handler("list", h.ctx);
 	const result = await h.tools.get("CreateAgentPanel").execute("call", { name: "scout" }, h.ctx.signal, undefined, h.ctx);
 	assert.match(result.content[0].text, /Worker agent-scout ready in pane worker-pane/);
 	assert.equal(result.details.adopted, true);
-	assert.equal(result.details.cwd, "/tmp");
+	assert.equal(result.details.cwd, "/workspace/live");
+});
+
+test("RPC re-adoption prefers observed cwd over a different explicit request", async () => {
+	const h = await harness({ workerCwd: "/workspace/live" });
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	const probe = await emitForReply<any>(h.events, CHANNELS.probe, "cwd-probe", { requestId: "cwd-probe", supportedProtocols: [1] });
+	const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
+	const spawned = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, "cwd-observed", {
+		requestId: "cwd-observed", providerInstanceId, protocol: 1, name: "scout", cwd: "/",
+	});
+	assert.equal(spawned.success && spawned.data.cwd, "/workspace/live");
+});
+
+test("RPC re-adoption falls back to the validated contextual cwd when observation is absent or empty", async () => {
+	for (const [label, workerCwd] of [["missing", null], ["empty", "   "]] as const) {
+		const h = await harness({ contextCwd: "/tmp", workerCwd });
+		await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+		const probeId = `cwd-${label}-probe`;
+		const probe = await emitForReply<any>(h.events, CHANNELS.probe, probeId, { requestId: probeId, supportedProtocols: [1] });
+		const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
+		const spawned = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, `cwd-${label}`, {
+			requestId: `cwd-${label}`, providerInstanceId, protocol: 1, name: "scout",
+		});
+		assert.equal(spawned.success && spawned.data.cwd, "/tmp", label);
+	}
 });
 
 test("SendToAgent and RPC send share delivery while preserving tool details and sanitizing receipts", async () => {
@@ -162,10 +190,12 @@ test("RPC direction and thinking reach the canonical creation sequence", async (
 	const probe = await emitForReply<any>(h.events, CHANNELS.probe, "options-probe", { requestId: "options-probe", supportedProtocols: [1] });
 	const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
 	const spawned = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, "options", {
-		requestId: "options", providerInstanceId, protocol: 1, name: "builder", direction: "left", model: "test/model", thinking: "high",
+		requestId: "options", providerInstanceId, protocol: 1, name: "builder", direction: "left", cwd: "/", model: "test/model", thinking: "high",
 	});
 	assert.equal(spawned.success && spawned.data.paneId, "new-pane");
+	assert.equal(spawned.success && spawned.data.cwd, "/");
 	assert.equal(h.execCalls.some((args) => args[0] === "pane" && args[1] === "split" && args.includes("--direction") && args.includes("right")), true);
+	assert.equal(h.execCalls.some((args) => args[0] === "pane" && args[1] === "split" && args.includes("--cwd") && args.includes("/")), true);
 	assert.equal(h.execCalls.some((args) => args[0] === "pane" && args[1] === "swap"), true);
 	const start = h.execCalls.find((args) => args[0] === "agent" && args[1] === "start");
 	assert.ok(start);

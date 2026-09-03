@@ -1,10 +1,13 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { createWorkerRpcClient, RpcAbortError, RpcResponseError, RpcTimeoutError } from "../../rpc/client.js";
+import { createWorkerRpcClient, RpcAbortError, RpcProtocolError, RpcResponseError, RpcTimeoutError } from "../../rpc/client.js";
 import { CHANNELS, replyChannel, success } from "../../rpc/protocol.js";
 import { FakeEventBus } from "../support/fake-event-bus.js";
 
 const provider = { protocol: 1 as const, provider: "herdr" as const, providerInstanceId: "provider", available: true, capabilities: [], constraints: { requiresHerdrPane: true as const, requiresInteractivePi: true as const } };
+const workerReference = { name: "worker", paneId: "%1", cwd: "/tmp", adopted: false };
+const deliveryReceipt = { target: "worker", paneId: "%1", transport: "inbox" as const, requestedMode: "follow-up" as const, priorityApplied: false };
+const inspection = { name: "worker", paneId: "%1", relationship: "worker" as const, managedBySession: true };
 
 test("probe installs listener before emit and selects an available provider", async () => {
   const events = new FakeEventBus();
@@ -17,17 +20,153 @@ test("probe installs listener before emit and selects an available provider", as
   assert.equal(events.listenerCount(replyChannel(CHANNELS.probe, "probe-1")), 0);
 });
 
+test("probe skips malformed successes and selects a later valid provider", async () => {
+  const events = new FakeEventBus();
+  events.on(CHANNELS.probe, (payload) => {
+    const request = payload as { requestId: string };
+    const channel = replyChannel(CHANNELS.probe, request.requestId);
+    events.emit(channel, success(request.requestId, { ...provider, capabilities: ["private"] }));
+    events.emit(channel, success(request.requestId, provider));
+  });
+  const selected = await createWorkerRpcClient({ events, createRequestId: () => "probe-fallback" }).probe();
+  assert.equal(selected.providerInstanceId, "provider");
+  assert.equal(events.listenerCount(), 1);
+});
+
+test("probe timeout prefers a valid unavailable provider over malformed successes", async () => {
+  const events = new FakeEventBus();
+  const unavailable = { ...provider, available: false, reason: "SESSION_NOT_READY" as const };
+  events.on(CHANNELS.probe, (payload) => {
+    const request = payload as { requestId: string };
+    const channel = replyChannel(CHANNELS.probe, request.requestId);
+    events.emit(channel, success(request.requestId, { ...provider, constraints: {} }));
+    events.emit(channel, success(request.requestId, unavailable));
+  });
+  const selected = await createWorkerRpcClient({ events, createRequestId: () => "probe-unavailable" }).probe({ timeoutMs: 1 });
+  assert.equal(selected.available, false);
+  assert.equal(events.listenerCount(), 1);
+});
+
+test("malformed-only probe rejects with a fixed protocol error and cleans up", async () => {
+  const events = new FakeEventBus();
+  events.on(CHANNELS.probe, (payload) => {
+    const request = payload as { requestId: string };
+    const channel = replyChannel(CHANNELS.probe, request.requestId);
+    events.emit(channel, success(request.requestId, { secret: "provider details" }));
+    events.emit(channel, success(request.requestId, { secret: "duplicate details" }));
+  });
+  const call = createWorkerRpcClient({ events, createRequestId: () => "probe-malformed" }).probe({ timeoutMs: 1 });
+  await assert.rejects(call, (error: unknown) => {
+    assert.ok(error instanceof RpcProtocolError);
+    assert.equal(error.code, "INVALID_RESPONSE");
+    assert.equal(error.message, "The worker provider returned an invalid response.");
+    assert.doesNotMatch(error.message, /secret|details/);
+    return true;
+  });
+  assert.equal(events.listenerCount(), 1);
+});
+
+test("probe abort and synchronous emit failure take precedence after malformed success", async () => {
+  const abortBus = new FakeEventBus();
+  abortBus.on(CHANNELS.probe, (payload) => {
+    const request = payload as { requestId: string };
+    abortBus.emit(replyChannel(CHANNELS.probe, request.requestId), success(request.requestId, {}));
+  });
+  const controller = new AbortController();
+  const aborted = createWorkerRpcClient({ events: abortBus, createRequestId: () => "probe-abort" }).probe({ timeoutMs: 50, signal: controller.signal });
+  controller.abort();
+  await assert.rejects(aborted, RpcAbortError);
+
+  let replyListener: ((payload: unknown) => void) | undefined;
+  const throwBus = {
+    on: (_channel: string, listener: (payload: unknown) => void) => { replyListener = listener; return () => { replyListener = undefined; }; },
+    emit: (_channel: string, payload: unknown) => {
+      const request = payload as { requestId: string };
+      replyListener?.(success(request.requestId, {}));
+      throw new Error("emit failed after malformed response");
+    },
+  };
+  await assert.rejects(
+    createWorkerRpcClient({ events: throwBus, createRequestId: () => "probe-emit" }).probe(),
+    /emit failed after malformed response/,
+  );
+});
+
 test("concurrent calls correlate replies and ignore duplicates", async () => {
   const events = new FakeEventBus();
   const ids = ["one", "two"];
   const client = createWorkerRpcClient({ events, createRequestId: () => ids.shift()! });
   const first = client.inspect({ target: "a" }, provider);
   const second = client.inspect({ target: "b" }, provider);
-  events.emit(replyChannel(CHANNELS.inspect, "two"), success("two", { name: "b" }));
-  events.emit(replyChannel(CHANNELS.inspect, "two"), success("two", { name: "wrong" }));
-  events.emit(replyChannel(CHANNELS.inspect, "one"), success("one", { name: "a" }));
-  assert.deepEqual(await Promise.all([first, second]), [{ name: "a" }, { name: "b" }]);
+  events.emit(replyChannel(CHANNELS.inspect, "two"), success("two", { ...inspection, name: "b" }));
+  events.emit(replyChannel(CHANNELS.inspect, "two"), success("two", { ...inspection, name: "wrong" }));
+  events.emit(replyChannel(CHANNELS.inspect, "one"), success("one", { ...inspection, name: "a" }));
+  assert.deepEqual(await Promise.all([first, second]), [{ ...inspection, name: "a" }, { ...inspection, name: "b" }]);
   assert.equal(events.listenerCount(), 0);
+});
+
+test("addressed operations validate every successful result shape", async () => {
+  const validCases = [
+    { operation: "spawn", result: workerReference },
+    { operation: "send", result: deliveryReceipt },
+    { operation: "inspect", result: inspection },
+  ] as const;
+  for (const testCase of validCases) {
+    const events = new FakeEventBus();
+    events.on(CHANNELS[testCase.operation], (payload) => {
+      const request = payload as { requestId: string };
+      events.emit(replyChannel(CHANNELS[testCase.operation], request.requestId), success(request.requestId, { ...testCase.result, future: true }));
+    });
+    const client = createWorkerRpcClient({ events, createRequestId: () => `valid-${testCase.operation}` });
+    const result = testCase.operation === "spawn"
+      ? await client.spawn({}, provider)
+      : testCase.operation === "send"
+        ? await client.send({ target: "worker", message: "hello" }, provider)
+        : await client.inspect({ target: "worker" }, provider);
+    assert.equal(result.paneId, "%1");
+  }
+});
+
+test("malformed addressed successes reject without exposing provider data and clean up", async () => {
+  const malformedCases = [
+    { operation: "spawn", result: { ...workerReference, adopted: "secret-spawn" } },
+    { operation: "send", result: { ...deliveryReceipt, transport: "secret-send" } },
+    { operation: "inspect", result: { ...inspection, relationship: "secret-inspect" } },
+  ] as const;
+  for (const testCase of malformedCases) {
+    const events = new FakeEventBus();
+    events.on(CHANNELS[testCase.operation], (payload) => {
+      const request = payload as { requestId: string };
+      events.emit(replyChannel(CHANNELS[testCase.operation], request.requestId), success(request.requestId, testCase.result));
+    });
+    const client = createWorkerRpcClient({ events, createRequestId: () => `invalid-${testCase.operation}` });
+    const call = testCase.operation === "spawn"
+      ? client.spawn({}, provider)
+      : testCase.operation === "send"
+        ? client.send({ target: "worker", message: "hello" }, provider)
+        : client.inspect({ target: "worker" }, provider);
+    await assert.rejects(call, (error: unknown) => {
+      assert.ok(error instanceof RpcProtocolError);
+      assert.equal(error.code, "INVALID_RESPONSE");
+      assert.equal(error.message, "The worker provider returned an invalid response.");
+      assert.doesNotMatch(error.message, /secret|adopted|transport|relationship/);
+      return true;
+    });
+    assert.equal(events.listenerCount(), 1);
+  }
+});
+
+test("stop rejects an unexpected success as an invalid response", async () => {
+  const events = new FakeEventBus();
+  events.on(CHANNELS.stop, (payload) => {
+    const request = payload as { requestId: string };
+    events.emit(replyChannel(CHANNELS.stop, request.requestId), success(request.requestId, { secret: true }));
+  });
+  await assert.rejects(
+    createWorkerRpcClient({ events, createRequestId: () => "stop-success" }).stop(undefined, provider),
+    RpcProtocolError,
+  );
+  assert.equal(events.listenerCount(), 1);
 });
 
 test("spawn forwards direction and thinking in the addressed request", async () => {

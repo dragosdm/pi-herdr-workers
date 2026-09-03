@@ -690,7 +690,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 				await adopt(wanted);
 				if (opts.initialPrompt) await send(wanted, opts.initialPrompt, false);
 				const meta = state.meta?.[wanted];
-				return { name: wanted, paneId: existing.paneId, model: meta?.model, type: meta?.type, purpose: meta?.purpose, cwd, how: "re-adopted existing pane", adopted: true };
+				return { name: wanted, paneId: existing.paneId, model: meta?.model, type: meta?.type, purpose: meta?.purpose, cwd: existing.cwd?.trim() ? existing.cwd : cwd, how: "re-adopted existing pane", adopted: true };
 			}
 		}
 		const name = await uniqueName(requested);

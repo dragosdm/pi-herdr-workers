@@ -4,11 +4,12 @@ import {
   CAPABILITIES,
   CHANNELS,
   PROTOCOL_V1,
-  REQUEST_SCHEMAS,
+  RESULT_SCHEMAS,
   failure,
   success,
   extractUsableRequestId,
   isValid,
+  isValidRequest,
   replyChannel,
   type AvailabilityReason,
   type InspectInput,
@@ -55,7 +56,7 @@ export function registerWorkerRpcServer(options: WorkerRpcServerOptions): Worker
   const handle = async (channel: RequestChannel, payload: unknown) => {
     const requestId = extractUsableRequestId(payload);
     if (!requestId) return;
-    if (!isValid(REQUEST_SCHEMAS[channel], payload)) {
+    if (!isValidRequest(channel, payload)) {
       emit(channel, requestId, failure(requestId, "INVALID_REQUEST", FIXED_MESSAGES.INVALID_REQUEST));
       return;
     }
@@ -67,7 +68,7 @@ export function registerWorkerRpcServer(options: WorkerRpcServerOptions): Worker
         return;
       }
       const state = options.getProviderState();
-      emit(channel, requestId, success(requestId, {
+      const data = {
         protocol,
         provider: "herdr",
         providerInstanceId,
@@ -75,7 +76,10 @@ export function registerWorkerRpcServer(options: WorkerRpcServerOptions): Worker
         ...(state.available ? {} : { reason: state.reason ?? "SESSION_NOT_READY" }),
         capabilities: [...CAPABILITIES],
         constraints: { requiresHerdrPane: true, requiresInteractivePi: true },
-      }));
+      };
+      emit(channel, requestId, isValid(RESULT_SCHEMAS.probe, data)
+        ? success(requestId, data)
+        : failure(requestId, "INTERNAL_ERROR", FIXED_MESSAGES.INTERNAL_ERROR));
       return;
     }
     const request = payload as Record<string, unknown> & { providerInstanceId: string; protocol: number };
@@ -118,7 +122,14 @@ export function registerWorkerRpcServer(options: WorkerRpcServerOptions): Worker
         const input = request as unknown as InspectInput;
         data = await options.service.inspect({ target: input.target });
       }
-      emit(channel, requestId, success(requestId, data));
+      const resultSchema = channel === CHANNELS.spawn
+        ? RESULT_SCHEMAS.spawn
+        : channel === CHANNELS.send
+          ? RESULT_SCHEMAS.send
+          : RESULT_SCHEMAS.inspect;
+      emit(channel, requestId, isValid(resultSchema, data)
+        ? success(requestId, data)
+        : failure(requestId, "INTERNAL_ERROR", FIXED_MESSAGES.INTERNAL_ERROR));
     } catch (error) {
       if (error instanceof WorkerRpcServiceError) {
         emit(channel, requestId, failure(requestId, error.code, error.message));

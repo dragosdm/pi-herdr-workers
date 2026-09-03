@@ -95,6 +95,8 @@ Every operation-specific field is optional. Direction is `right`, `down`, `left`
 }
 ```
 
+For a newly created worker, `cwd` is the validated requested directory, or the active Pi context directory when the request omits it, passed to pane creation. When spawn re-adopts an existing same-tab worker, `cwd` is that worker's non-empty live value reported by Herdr. If Herdr does not report a usable CWD, the response falls back to the same validated requested or contextual directory.
+
 Spawn may leave external side effects when a request times out or is aborted. The protocol does not roll back panes and does not make retries idempotent; inspect ambiguous outcomes before retrying.
 
 ### Send
@@ -172,10 +174,16 @@ All payloads are runtime validated before dispatch. IDs (`requestId` and `provid
 | `model`, `type` | 1-128 characters each |
 | `purpose` | 1-1,024 characters |
 | `cwd` | 1-4,096 characters |
-| `message`, `initialPrompt` | 1-65,536 characters each |
+| `message`, `initialPrompt` | 1-65,536 characters and at most 65,536 UTF-8 bytes each |
 | error `message` | 1-1,024 characters |
 
+The character limits are structural protocol-v1 constraints. Because UTF-8 uses one to four bytes per character, `message` and `initialPrompt` also have an explicit 65,536-byte UTF-8 ceiling. Requests must satisfy both limits before provider routing, availability checks, or service dispatch.
+
 Unknown object fields are ignored for forward compatibility. Known fields retain their version-1 meaning and limits. New protocol versions should be added to probe negotiation rather than silently changing version-1 behavior.
+
+Successful probe, spawn, send, and inspect data is runtime validated against its operation-specific protocol-v1 shape. Providers validate service results before emitting them; malformed internal results become the fixed `INTERNAL_ERROR` response. The bundled client validates successful data independently before returning it. A malformed addressed success rejects with a client-only `RpcProtocolError` whose code is `INVALID_RESPONSE` and whose fixed message is `The worker provider returned an invalid response.` Provider payload details and schema diagnostics are not exposed.
+
+Probe is broadcast, so a malformed successful probe response does not prevent discovery of another valid provider. The client continues listening and prefers an available provider. When discovery times out, the first valid unavailable provider takes precedence, followed by `RpcProtocolError` if only malformed successes were observed, then the normal timeout error. Stop is failure-only; an unexpected successful stop response is rejected as invalid.
 
 Errors use only `INVALID_REQUEST`, `UNSUPPORTED_PROTOCOL`, `PROVIDER_UNAVAILABLE`, `NOT_FOUND`, `NOT_TEAM_MEMBER`, `UNSUPPORTED_OPERATION`, and `INTERNAL_ERROR`. Unknown service failures map to a fixed `INTERNAL_ERROR`; replies do not expose stacks, environment values, raw Herdr errors, prompts, or message bodies.
 
