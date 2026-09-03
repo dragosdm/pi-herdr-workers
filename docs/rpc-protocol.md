@@ -95,6 +95,8 @@ Every operation-specific field is optional. Direction is `right`, `down`, `left`
 }
 ```
 
+For a newly created worker, `cwd` is the validated requested directory, or the active Pi context directory when the request omits it, passed to pane creation. When spawn re-adopts an existing same-tab worker, `cwd` is that worker's non-empty live value reported by Herdr. If Herdr does not report a usable CWD, the response falls back to the same validated requested or contextual directory.
+
 Spawn may leave external side effects when a request times out or is aborted. The protocol does not roll back panes and does not make retries idempotent; inspect ambiguous outcomes before retrying.
 
 ### Send
