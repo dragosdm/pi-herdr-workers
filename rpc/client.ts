@@ -76,6 +76,7 @@ export class WorkerRpcClient {
     return new Promise((resolve, reject) => {
       let settled = false;
       let fallback: ProbeData | undefined;
+      let unsupportedProtocol: RpcResponseError | undefined;
       let malformedSuccess = false;
       let timer: ReturnType<typeof setTimeout> | undefined;
       let unsubscribe = () => {};
@@ -96,7 +97,7 @@ export class WorkerRpcClient {
         if (!isReplyEnvelope(payload) || payload.requestId !== requestId) return;
         if (!payload.success) {
           if (payload.error.code !== "UNSUPPORTED_PROTOCOL") return;
-          finish(() => reject(new RpcResponseError(payload.error.code, payload.error.message)));
+          unsupportedProtocol ??= new RpcResponseError(payload.error.code, payload.error.message);
           return;
         }
         if (!isValid<ProbeData>(RESULT_SCHEMAS.probe, payload.data)) {
@@ -109,6 +110,7 @@ export class WorkerRpcClient {
       });
       timer = setTimeout(() => finish(() => {
         if (fallback) resolve(fallback);
+        else if (unsupportedProtocol) reject(unsupportedProtocol);
         else reject(malformedSuccess ? new RpcProtocolError() : new RpcTimeoutError());
       }), timeoutMs);
       options.signal?.addEventListener("abort", onAbort, { once: true });
