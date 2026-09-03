@@ -4,11 +4,10 @@ import {
   CAPABILITIES,
   CHANNELS,
   PROTOCOL_V1,
-  REQUEST_SCHEMAS,
   failure,
   success,
   extractUsableRequestId,
-  isValid,
+  isValidRequest,
   replyChannel,
   type AvailabilityReason,
   type InspectInput,
@@ -55,7 +54,7 @@ export function registerWorkerRpcServer(options: WorkerRpcServerOptions): Worker
   const handle = async (channel: RequestChannel, payload: unknown) => {
     const requestId = extractUsableRequestId(payload);
     if (!requestId) return;
-    if (!isValid(REQUEST_SCHEMAS[channel], payload)) {
+    if (!isValidRequest(channel, payload)) {
       emit(channel, requestId, failure(requestId, "INVALID_REQUEST", FIXED_MESSAGES.INVALID_REQUEST));
       return;
     }

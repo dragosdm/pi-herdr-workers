@@ -1,3 +1,4 @@
+import { Buffer } from "node:buffer";
 import { Type, type Static, type TSchema } from "typebox";
 import { Check } from "typebox/value";
 
@@ -127,6 +128,20 @@ export const REQUEST_SCHEMAS: Record<RequestChannel, TSchema> = {
 };
 
 export function isValid<T>(schema: TSchema, value: unknown): value is T { return Check(schema, value); }
+function withinUtf8Limit(value: string, limit: number): boolean {
+  return Buffer.byteLength(value, "utf8") <= limit;
+}
+export function isValidRequest(channel: RequestChannel, value: unknown): boolean {
+  if (!isValid(REQUEST_SCHEMAS[channel], value)) return false;
+  if (channel === CHANNELS.send) {
+    return withinUtf8Limit((value as SendRequest).message, LIMITS.message);
+  }
+  if (channel === CHANNELS.spawn) {
+    const { initialPrompt } = value as SpawnRequest;
+    return initialPrompt === undefined || withinUtf8Limit(initialPrompt, LIMITS.initialPrompt);
+  }
+  return true;
+}
 export function isReplyEnvelope(value: unknown): value is RpcReply { return Check(ReplyEnvelopeSchema, value); }
 export function extractUsableRequestId(value: unknown): string | undefined {
   if (typeof value !== "object" || value === null) return undefined;

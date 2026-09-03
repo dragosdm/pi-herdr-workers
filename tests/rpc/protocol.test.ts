@@ -3,8 +3,10 @@ import test from "node:test";
 import { Check } from "typebox/value";
 import {
   CHANNELS, LIMITS, ProbeRequestSchema, ReplyEnvelopeSchema, SendRequestSchema, SpawnRequestSchema,
-  failure, replyChannel, success,
+  failure, isValidRequest, replyChannel, success,
 } from "../../rpc/protocol.js";
+
+const addressed = { requestId: "r", providerInstanceId: "p", protocol: 1 };
 
 test("request schemas enforce identifiers, limits, and unique protocols", () => {
   assert.equal(Check(ProbeRequestSchema, { requestId: "safe-1", supportedProtocols: [1] }), true);
@@ -17,6 +19,30 @@ test("request schemas enforce identifiers, limits, and unique protocols", () => 
   assert.equal(Check(SpawnRequestSchema, { ...spawnBase, direction: "left", thinking: "xhigh" }), true);
   assert.equal(Check(SpawnRequestSchema, { ...spawnBase, direction: "diagonal" }), false);
   assert.equal(Check(SpawnRequestSchema, { ...spawnBase, thinking: "unlimited" }), false);
+});
+
+test("message and initialPrompt enforce UTF-8 byte budgets", () => {
+  const cases = [
+    { channel: CHANNELS.send, field: "message", base: { ...addressed, target: "worker" } },
+    { channel: CHANNELS.spawn, field: "initialPrompt", base: addressed },
+  ] as const;
+  const asciiAtLimit = "a".repeat(LIMITS.message);
+  const asciiOverLimit = `${asciiAtLimit}a`;
+  const multibyteBelowLimit = "é".repeat((LIMITS.message / 2) - 1);
+  const multibyteAtLimit = "é".repeat(LIMITS.message / 2);
+  const multibyteOverLimit = `${multibyteAtLimit}é`;
+  const fourByteCrossing = `${"a".repeat(LIMITS.message - 3)}😀`;
+
+  for (const { channel, field, base } of cases) {
+    const limit = field === "message" ? LIMITS.message : LIMITS.initialPrompt;
+    assert.equal(limit, LIMITS.message);
+    assert.equal(isValidRequest(channel, { ...base, [field]: asciiAtLimit }), true, `${field}: exact ASCII limit`);
+    assert.equal(isValidRequest(channel, { ...base, [field]: asciiOverLimit }), false, `${field}: one ASCII byte over`);
+    assert.equal(isValidRequest(channel, { ...base, [field]: multibyteBelowLimit }), true, `${field}: multibyte below limit`);
+    assert.equal(isValidRequest(channel, { ...base, [field]: multibyteAtLimit }), true, `${field}: exact multibyte limit`);
+    assert.equal(isValidRequest(channel, { ...base, [field]: multibyteOverLimit }), false, `${field}: multibyte over limit`);
+    assert.equal(isValidRequest(channel, { ...base, [field]: fourByteCrossing }), false, `${field}: four-byte character crosses limit`);
+  }
 });
 
 test("unknown request and reply fields are accepted", () => {

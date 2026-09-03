@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { CHANNELS, WorkerRpcServiceError, replyChannel, type RpcReply } from "../../rpc/protocol.js";
+import { CHANNELS, LIMITS, WorkerRpcServiceError, replyChannel, type RpcReply } from "../../rpc/protocol.js";
 import { registerWorkerRpcServer, type WorkerRpcService } from "../../rpc/server.js";
 import { FakeEventBus } from "../support/fake-event-bus.js";
 
@@ -42,6 +42,31 @@ test("validation, routing, protocol, stop, and availability gates precede servic
   await flush();
   assert.deepEqual(replies.map((reply) => reply.success ? "success" : reply.error.code), ["INVALID_REQUEST", "UNSUPPORTED_PROTOCOL", "UNSUPPORTED_OPERATION", "PROVIDER_UNAVAILABLE"]);
   assert.equal(calls, 0);
+});
+
+test("oversized UTF-8 fields are rejected before service dispatch", async () => {
+  const events = new FakeEventBus();
+  let spawnCalls = 0;
+  let sendCalls = 0;
+  registerWorkerRpcServer({
+    events,
+    service: service({
+      spawn: async () => { spawnCalls++; return { name: "worker", paneId: "%1", cwd: "/tmp", adopted: false }; },
+      send: async () => { sendCalls++; return { target: "worker", paneId: "%1", transport: "inbox", requestedMode: "follow-up", priorityApplied: false }; },
+    }),
+    getProviderState: () => ({ available: true }),
+    createInstanceId: () => "instance",
+  });
+  const replies: RpcReply[] = [];
+  events.on(replyChannel(CHANNELS.spawn, "large-prompt"), (payload) => { replies.push(payload as RpcReply); });
+  events.on(replyChannel(CHANNELS.send, "large-message"), (payload) => { replies.push(payload as RpcReply); });
+  const oversized = "é".repeat((LIMITS.message / 2) + 1);
+  events.emit(CHANNELS.spawn, { requestId: "large-prompt", providerInstanceId: "instance", protocol: 1, initialPrompt: oversized });
+  events.emit(CHANNELS.send, { requestId: "large-message", providerInstanceId: "instance", protocol: 1, target: "worker", message: oversized });
+  await flush();
+  assert.equal(spawnCalls, 0);
+  assert.equal(sendCalls, 0);
+  assert.deepEqual(replies.map((reply) => reply.success ? "success" : reply.error.code), ["INVALID_REQUEST", "INVALID_REQUEST"]);
 });
 
 test("service dispatches once, ignores unknown fields, and sanitizes failures", async () => {

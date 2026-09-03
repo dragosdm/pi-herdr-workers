@@ -172,8 +172,10 @@ All payloads are runtime validated before dispatch. IDs (`requestId` and `provid
 | `model`, `type` | 1-128 characters each |
 | `purpose` | 1-1,024 characters |
 | `cwd` | 1-4,096 characters |
-| `message`, `initialPrompt` | 1-65,536 characters each |
+| `message`, `initialPrompt` | 1-65,536 characters and at most 65,536 UTF-8 bytes each |
 | error `message` | 1-1,024 characters |
+
+The character limits are structural protocol-v1 constraints. Because UTF-8 uses one to four bytes per character, `message` and `initialPrompt` also have an explicit 65,536-byte UTF-8 ceiling. Requests must satisfy both limits before provider routing, availability checks, or service dispatch.
 
 Unknown object fields are ignored for forward compatibility. Known fields retain their version-1 meaning and limits. New protocol versions should be added to probe negotiation rather than silently changing version-1 behavior.
 
