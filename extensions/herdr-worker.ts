@@ -25,6 +25,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
+import { registerWorkerRpcServer, type WorkerRpcService } from "../rpc/server.js";
+import { WorkerRpcServiceError, type InspectInput, type Inspection, type SendInput, type DeliveryReceipt, type SpawnInput } from "../rpc/protocol.js";
 
 // ───────────────────────── herdr env ─────────────────────────
 
@@ -132,7 +134,13 @@ function frameMessage(env: Envelope): string {
 
 // ───────────────────────── extension ─────────────────────────
 
-export default function (pi: ExtensionAPI) {
+interface HerdrWorkerTestOptions {
+	disableInbox?: boolean;
+	isListening?: (paneId: string) => boolean;
+	writeEnvelope?: (paneId: string, envelope: Envelope) => void;
+}
+
+export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions = {}) {
 	let state: State = { workers: [] };
 	let ctxRef: ExtensionContext | undefined;
 	let selfInfo: AgentInfo | undefined;
@@ -144,6 +152,13 @@ export default function (pi: ExtensionAPI) {
 	let createQueue = Promise.resolve();
 	const inFlightEnvelopes = new Set<string>();
 	const interactive = () => HERDR_ENV && !!SELF_PANE && ctxRef?.mode === "tui" && !stopped;
+	const providerState = () => {
+		if (stopped) return { available: false as const, reason: "SHUTTING_DOWN" as const };
+		if (!HERDR_ENV || !SELF_PANE) return { available: false as const, reason: "NOT_IN_HERDR" as const };
+		if (ctxRef && ctxRef.mode !== "tui") return { available: false as const, reason: "NOT_INTERACTIVE" as const };
+		if (!ctxRef) return { available: false as const, reason: "SESSION_NOT_READY" as const };
+		return { available: true as const };
+	};
 
 	pi.registerFlag("orchestrated-by", {
 		description: "Herdr worker: id (agent name or pane id) of the orchestrator controlling this pi",
@@ -184,9 +199,9 @@ export default function (pi: ExtensionAPI) {
 		return { paneId: a.pane_id, tabId: a.tab_id ?? undefined, name: a.name ?? undefined, kind: a.agent ?? undefined, status: a.agent_status, cwd: a.cwd };
 	}
 
-	async function agentGet(target: string): Promise<AgentInfo | undefined> {
+	async function agentGet(target: string, signal?: AbortSignal): Promise<AgentInfo | undefined> {
 		try {
-			const j = await herdr(["agent", "get", target]);
+			const j = await herdr(["agent", "get", target], { signal });
 			return toAgentInfo(j?.result?.agent);
 		} catch {
 			return undefined;
@@ -294,7 +309,7 @@ export default function (pi: ExtensionAPI) {
 	// ── inbox (receiving) ──
 
 	function startListening() {
-		if (!interactive() || watcher || poller) return;
+		if (testOptions.disableInbox || !interactive() || watcher || poller) return;
 		const dir = inboxDir(SELF_PANE);
 		fs.mkdirSync(dir, { recursive: true });
 		fs.writeFileSync(listeningFile(SELF_PANE), JSON.stringify({ pid: process.pid, ts: Date.now(), id: selfId() }));
@@ -409,6 +424,7 @@ export default function (pi: ExtensionAPI) {
 	// ── sending ──
 
 	function isListening(paneId: string): boolean {
+		if (testOptions.isListening) return testOptions.isListening(paneId);
 		try {
 			const j = JSON.parse(fs.readFileSync(listeningFile(paneId), "utf8"));
 			if (typeof j.pid !== "number") return false;
@@ -420,6 +436,10 @@ export default function (pi: ExtensionAPI) {
 	}
 
 	function writeEnvelope(paneId: string, env: Envelope) {
+		if (testOptions.writeEnvelope) {
+			testOptions.writeEnvelope(paneId, env);
+			return;
+		}
 		const dir = inboxDir(paneId);
 		fs.mkdirSync(dir, { recursive: true });
 		const name = `${String(env.ts).padStart(15, "0")}-${Math.random().toString(36).slice(2, 8)}.json`;
@@ -440,19 +460,23 @@ export default function (pi: ExtensionAPI) {
 		};
 	}
 
-	async function send(targetId: string, message: string, priority: boolean, signal?: AbortSignal): Promise<string> {
+	class SendServiceError extends WorkerRpcServiceError {
+		constructor(code: "NOT_FOUND" | "NOT_TEAM_MEMBER", message: string, readonly toolMessage: string) {
+			super(code, message);
+		}
+	}
+
+	async function send(targetId: string, message: string, priority: boolean, signal?: AbortSignal): Promise<DeliveryReceipt> {
 		if (!HERDR_ENV) throw new Error("Not running inside herdr (HERDR_ENV != 1); SendToAgent is unavailable.");
 		const target = await agentGet(targetId);
 		if (!target) {
 			const known = (await agentList()).map((a) => a.name ?? a.paneId);
-			throw new Error(`No live herdr agent "${targetId}". Known agents: ${known.join(", ") || "(none)"}${state.workers.length ? `. Your workers: ${state.workers.join(", ")}` : ""}${state.orchestratedBy ? `. Your orchestrator: ${state.orchestratedBy}` : ""}`);
+			throw new SendServiceError("NOT_FOUND", "Target agent was not found.", `No live herdr agent "${targetId}". Known agents: ${known.join(", ") || "(none)"}${state.workers.length ? `. Your workers: ${state.workers.join(", ")}` : ""}${state.orchestratedBy ? `. Your orchestrator: ${state.orchestratedBy}` : ""}`);
 		}
-		if (target.paneId === SELF_PANE) throw new Error("Refusing to send a message to yourself.");
+		if (target.paneId === SELF_PANE) throw new SendServiceError("NOT_TEAM_MEMBER", "Target is not a team member.", "Refusing to send a message to yourself.");
 		const peer = state.workers.includes(targetId) || state.workers.includes(target.name ?? "") || state.workers.includes(target.paneId) || [state.orchestratedBy].includes(targetId) || [state.orchestratedBy].includes(target.name ?? "") || [state.orchestratedBy].includes(target.paneId);
 		if (!peer) {
-			throw new Error(
-				`"${targetId}" is not in your team (it would drop the message anyway). Workers: ${state.workers.join(", ") || "(none)"}; orchestrator: ${state.orchestratedBy ?? "(none)"}. Use /team add or /team adopt first.`,
-			);
+			throw new SendServiceError("NOT_TEAM_MEMBER", "Target is not a team member.", `"${targetId}" is not in your team (it would drop the message anyway). Workers: ${state.workers.join(", ") || "(none)"}; orchestrator: ${state.orchestratedBy ?? "(none)"}. Use /team add or /team adopt first.`);
 		}
 
 		const env = await makeEnvelope(targetId, target, message, priority);
@@ -460,12 +484,17 @@ export default function (pi: ExtensionAPI) {
 
 		if (target.kind === "pi" && isListening(target.paneId)) {
 			writeEnvelope(target.paneId, env);
-			return `Delivered to ${label} (pane ${target.paneId}, ${target.status ?? "unknown"}) via inbox as ${priority ? "steer (priority)" : "follow-up"}. Replies arrive on a later turn.`;
+			return { target: label, paneId: target.paneId, ...(target.kind === undefined ? {} : { kind: target.kind }), ...(target.status === undefined ? {} : { status: target.status }), transport: "inbox", requestedMode: priority ? "steer" : "follow-up", priorityApplied: priority };
 		}
 
 		// Fallback: type it into the agent's pane. No steer/follow-up control here.
 		await herdr(["agent", "prompt", target.paneId, frameMessage(env)], { timeout: 20000, signal });
-		return `Typed into ${label} (pane ${target.paneId}, ${target.kind ?? "agent"}, no inbox listener) via \`herdr agent prompt\`. Priority flag not applicable there.`;
+		return { target: label, paneId: target.paneId, ...(target.kind === undefined ? {} : { kind: target.kind }), ...(target.status === undefined ? {} : { status: target.status }), transport: "herdr-prompt", requestedMode: priority ? "steer" : "follow-up", priorityApplied: false };
+	}
+
+	function sendReceiptText(receipt: DeliveryReceipt): string {
+		if (receipt.transport === "inbox") return `Delivered to ${receipt.target} (pane ${receipt.paneId}, ${receipt.status ?? "unknown"}) via inbox as ${receipt.requestedMode === "steer" ? "steer (priority)" : "follow-up"}. Replies arrive on a later turn.`;
+		return `Typed into ${receipt.target} (pane ${receipt.paneId}, ${receipt.kind ?? "agent"}, no inbox listener) via \`herdr agent prompt\`. Priority flag not applicable there.`;
 	}
 
 	async function sendControl(targetId: string, action: NonNullable<Envelope["action"]>): Promise<boolean> {
@@ -496,7 +525,14 @@ export default function (pi: ExtensionAPI) {
 			priority: Type.Optional(Type.Boolean({ description: "true = steer (interrupt recipient's current turn). false/omitted = follow-up after its current work.", default: false })),
 		}),
 		async execute(_id, params, signal) {
-			const text = await send(params.target_id, params.message, params.priority ?? false, signal);
+			let receipt: DeliveryReceipt;
+			try {
+				receipt = await service.send({ target: params.target_id, message: params.message, priority: params.priority ?? false }, signal);
+			} catch (error) {
+				if (error instanceof SendServiceError) throw new Error(error.toolMessage);
+				throw error;
+			}
+			const text = sendReceiptText(receipt);
 			return { content: [{ type: "text", text }], details: { target: params.target_id, priority: params.priority ?? false, message: params.message, status: text } };
 		},
 		// Inline UX: the interesting part is the message itself, not that one was sent.
@@ -617,8 +653,18 @@ export default function (pi: ExtensionAPI) {
 		thinking?: string;
 		initialPrompt?: string;
 	}
+	interface CreateResult {
+		name: string;
+		paneId: string;
+		model?: string;
+		type?: string;
+		purpose?: string;
+		cwd: string;
+		how: string;
+		adopted: boolean;
+	}
 
-	async function createAgent(opts: CreateOpts, ctx: ExtensionContext): Promise<{ name: string; paneId: string; model?: string; how: string; adopted?: boolean }> {
+	async function createAgent(opts: CreateOpts, ctx: ExtensionContext, cwd: string): Promise<CreateResult> {
 		if (!HERDR_ENV || !SELF_PANE) throw new Error("Not running inside herdr.");
 		const dir: Direction = opts.direction ?? "right";
 		const type = opts.type?.trim().toLowerCase() || undefined;
@@ -643,14 +689,15 @@ export default function (pi: ExtensionAPI) {
 			if (existing && existing.paneId !== SELF_PANE && existing.tabId === SELF_TAB && !state.workers.includes(wanted)) {
 				await adopt(wanted);
 				if (opts.initialPrompt) await send(wanted, opts.initialPrompt, false);
-				return { name: wanted, paneId: existing.paneId, how: "re-adopted existing pane", adopted: true };
+				const meta = state.meta?.[wanted];
+				return { name: wanted, paneId: existing.paneId, model: meta?.model, type: meta?.type, purpose: meta?.purpose, cwd: existing.cwd?.trim() ? existing.cwd : cwd, how: "re-adopted existing pane", adopted: true };
 			}
 		}
 		const name = await uniqueName(requested);
 
 		// Create the pane: start a worker stack on the requested side, or extend the existing one.
 		const target = await pickSplit(dir);
-		const split = await herdr(["pane", "split", target.pane, "--direction", target.direction, "--cwd", ctx.cwd, "--no-focus"]);
+		const split = await herdr(["pane", "split", target.pane, "--direction", target.direction, "--cwd", cwd, "--no-focus"]);
 		const paneId: string | undefined = split?.result?.pane?.pane_id;
 		if (!paneId) throw new Error(`pane split returned no pane id: ${JSON.stringify(split)}`);
 		pi.appendEntry("herdr-worker.operation.v1", { name, paneId, phase: "pane-created", at: Date.now() });
@@ -680,8 +727,99 @@ export default function (pi: ExtensionAPI) {
 			for (let i = 0; i < 20 && !isListening(paneId); i++) await new Promise((r) => setTimeout(r, 500));
 			await send(name, opts.initialPrompt, false);
 		}
-		return { name, paneId, model, how: target.how };
+		return { name, paneId, model, type, purpose: opts.purpose?.trim() || undefined, cwd, how: target.how, adopted: false };
 	}
+
+	function validateSpawnCwd(value: string): string {
+		if (!path.isAbsolute(value)) throw new Error("Worker cwd must be an absolute accessible directory.");
+		let stat: fs.Stats;
+		try {
+			fs.accessSync(value, fs.constants.R_OK | fs.constants.X_OK);
+			stat = fs.statSync(value);
+		} catch {
+			throw new Error("Worker cwd must be an absolute accessible directory.");
+		}
+		if (!stat.isDirectory()) throw new Error("Worker cwd must be an absolute accessible directory.");
+		return value;
+	}
+
+	type SpawnOptions = SpawnInput;
+	async function spawnWorker(input: SpawnOptions, signal?: AbortSignal): Promise<CreateResult> {
+			const ctx = ctxRef;
+			if (!ctx) throw new Error("Session is not ready.");
+			const cwd = validateSpawnCwd(input.cwd ?? ctx.cwd);
+			signal?.throwIfAborted();
+			if (!state.orchestratedBy && !state.teamMode) {
+				state.teamMode = true;
+				persist();
+				updateUi();
+			}
+			const pending = createQueue.then(() => {
+				signal?.throwIfAborted();
+				return createAgent({ name: input.name, direction: input.direction, model: input.model, type: input.type, purpose: input.purpose, thinking: input.thinking, initialPrompt: input.initialPrompt }, ctx, cwd);
+			});
+			createQueue = pending.then(() => {}, () => {});
+			const result = await pending;
+			return result;
+	}
+	const service: WorkerRpcService = {
+		async spawn(input, signal) {
+			const result = await spawnWorker(input, signal);
+			return {
+				name: result.name,
+				paneId: result.paneId,
+				cwd: result.cwd,
+				adopted: result.adopted,
+				...(result.model === undefined ? {} : { model: result.model }),
+				...(result.type === undefined ? {} : { type: result.type }),
+				...(result.purpose === undefined ? {} : { purpose: result.purpose }),
+			};
+		},
+		async send(input: SendInput, signal?: AbortSignal): Promise<DeliveryReceipt> {
+			const priority = input.mode === undefined ? input.priority ?? false : input.mode === "steer";
+			return send(input.target, input.message, priority, signal);
+		},
+		async inspect(input: InspectInput, signal?: AbortSignal): Promise<Inspection> {
+			const target = input.target;
+			if (target === SELF_PANE || target === selfInfo?.name || target === selfInfo?.paneId) {
+				throw new WorkerRpcServiceError("NOT_TEAM_MEMBER", "Target is not a team member.");
+			}
+			const relationships = [
+				...state.workers.map((id) => ({ id, relationship: "worker" as const, meta: state.meta?.[id] })),
+				...(state.orchestratedBy ? [{ id: state.orchestratedBy, relationship: "orchestrator" as const, meta: undefined }] : []),
+			];
+			const direct = relationships.find(({ id, meta }) => id === target || meta?.paneId === target);
+			let match: (typeof relationships)[number] | undefined;
+			let live: AgentInfo | undefined;
+			for (const configured of direct ? [direct] : relationships) {
+				signal?.throwIfAborted();
+				const resolved = await agentGet(configured.id, signal);
+				if (resolved && (direct || resolved.name === target || resolved.paneId === target)) {
+					match = configured;
+					live = resolved;
+					break;
+				}
+			}
+			if (!match || !live) {
+				if (direct) throw new WorkerRpcServiceError("NOT_FOUND", "Target agent was not found.");
+				throw new WorkerRpcServiceError("NOT_TEAM_MEMBER", "Target is not a team member.");
+			}
+			const { relationship, meta } = match;
+			return {
+				name: live.name ?? match.id,
+				paneId: live.paneId,
+				...(live.kind === undefined ? {} : { kind: live.kind }),
+				...(live.status === undefined ? {} : { status: live.status }),
+				...(live.cwd === undefined ? {} : { cwd: live.cwd }),
+				...(meta?.type === undefined ? {} : { type: meta.type }),
+				...(meta?.purpose === undefined ? {} : { purpose: meta.purpose }),
+				...(meta?.model === undefined ? {} : { model: meta.model }),
+				relationship,
+				managedBySession: relationship === "worker",
+			};
+		},
+	};
+	const rpcServer = registerWorkerRpcServer({ events: pi.events, service, getProviderState: providerState });
 
 	async function release(name: string): Promise<string> {
 		if (!state.workers.includes(name)) throw new Error(`Not orchestrating "${name}". Workers: ${state.workers.join(", ") || "(none)"}`);
@@ -727,13 +865,11 @@ export default function (pi: ExtensionAPI) {
 		async execute(_id, params, _signal, onUpdate, ctx) {
 			if (!isOrchestrator()) throw new Error("CreateAgentPanel is only available to an orchestrator (run /team here first).");
 			onUpdate?.({ content: [{ type: "text", text: "Splitting pane and starting worker…" }], details: {} });
-			const create = () => createAgent(
+			const create = () => spawnWorker(
 				{ name: params.name, direction: params.direction as Direction | undefined, type: params.type, purpose: params.purpose, model: params.model, thinking: params.thinking, initialPrompt: params.initial_prompt },
-				ctx,
+				_signal,
 			);
-			const pending = createQueue.then(() => { _signal?.throwIfAborted(); return create(); });
-			createQueue = pending.then(() => {}, () => {});
-			const r = await pending;
+			const r = await create();
 			const meta = state.meta?.[r.name];
 			const text = [
 				`Worker ${r.name} ready in pane ${r.paneId} (${r.how}).`,
@@ -943,6 +1079,7 @@ export default function (pi: ExtensionAPI) {
 		// Headless sessions must not remove the interactive pane's listener file.
 		const wasListening = !!watcher || !!poller;
 		stopped = true;
+		rpcServer.dispose();
 		lifetime.abort();
 		if (wasListening) stopListening();
 		if (ctxRef?.hasUI) ctxRef.ui.setStatus(STATUS_KEY, undefined);

@@ -50,6 +50,12 @@ Workers are named `agent-<name>` (or `agent-<type>` / `agent-N`). First worker o
 
 `priority: true` steers; otherwise follow-up. Transport is a per-pane inbox under `$XDG_RUNTIME_DIR/pi-herdr-worker/`. Pi receives a durable, model-visible custom message attributed to the sending agent, not a fabricated user message. Non-Pi targets fall back to `herdr agent prompt`.
 
+### Inter-extension RPC
+
+Extensions loaded in the same Pi process can probe `herdr-workers:rpc:probe` and call the worker provider directly, without a model turn. Probe first, negotiate protocol 1, select one available provider instance, and use its request-specific reply channels. The fixed capabilities are `spawn`, `send`, `steer`, and team-scoped `inspect`; existing `/team`, `CreateAgentPanel`, and `SendToAgent` behavior is unchanged.
+
+The event bus is process-local, requests are not durable, and callers should use bounded waits and fall back when no provider is available. The registered stop channel is reserved: stop is not advertised and returns `UNSUPPORTED_OPERATION`; it does not release a worker, close a pane, or send Ctrl-C. See `docs/rpc-protocol.md` for the import-free JSON contract, limits, routing, errors, and raw `pi.events` usage.
+
 ---
 
 ## `/split-handoff` and `/split-fork`
