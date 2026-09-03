@@ -2,12 +2,19 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import { Check } from "typebox/value";
 import {
-  CHANNELS, DeliveryReceiptSchema, InspectionSchema, LIMITS, ProbeDataSchema, ProbeRequestSchema,
-  ReplyEnvelopeSchema, SendRequestSchema, SpawnRequestSchema, WorkerReferenceSchema,
+  AVAILABILITY_REASONS, CAPABILITIES, CHANNELS, DeliveryReceiptSchema, InspectionSchema, LIMITS,
+  ProbeDataSchema, ProbeRequestSchema, ReplyEnvelopeSchema, SendRequestSchema, SpawnRequestSchema, WorkerReferenceSchema,
   failure, isValidRequest, replyChannel, success,
 } from "../../rpc/protocol.js";
 
 const addressed = { requestId: "r", providerInstanceId: "p", protocol: 1 };
+const probeData = {
+  protocol: 1,
+  provider: "herdr",
+  providerInstanceId: "provider",
+  capabilities: [...CAPABILITIES],
+  constraints: { requiresHerdrPane: true, requiresInteractivePi: true },
+};
 
 test("request schemas enforce identifiers, limits, and unique protocols", () => {
   assert.equal(Check(ProbeRequestSchema, { requestId: "safe-1", supportedProtocols: [1] }), true);
@@ -53,20 +60,53 @@ test("unknown request and reply fields are accepted", () => {
   assert.equal(Check(ReplyEnvelopeSchema, { ...success("r", { value: 1 }), future: true }), true);
 });
 
+test("probe availability requires a reason only when unavailable", () => {
+  assert.equal(Check(ProbeDataSchema, { ...probeData, available: true }), true);
+  assert.equal(Check(ProbeDataSchema, { ...probeData, available: true, reason: undefined }), true);
+
+  for (const reason of AVAILABILITY_REASONS) {
+    assert.equal(Check(ProbeDataSchema, { ...probeData, available: true, reason }), false, `available with ${reason}`);
+    assert.equal(Check(ProbeDataSchema, { ...probeData, available: false, reason }), true, `unavailable with ${reason}`);
+  }
+
+  assert.equal(Check(ProbeDataSchema, { ...probeData, available: true, reason: "FUTURE_REASON" }), false);
+  assert.equal(Check(ProbeDataSchema, { ...probeData, available: false }), false);
+  assert.equal(Check(ProbeDataSchema, { ...probeData, available: false, reason: "FUTURE_REASON" }), false);
+});
+
+test("probe capabilities allow unique subsets within the protocol vocabulary", () => {
+  for (const capabilities of [[], ["spawn"], ["spawn", "send"], [...CAPABILITIES]]) {
+    assert.equal(Check(ProbeDataSchema, { ...probeData, available: true, capabilities }), true);
+  }
+
+  assert.equal(Check(ProbeDataSchema, { ...probeData, available: true, capabilities: ["spawn", "spawn"] }), false);
+  assert.equal(Check(ProbeDataSchema, { ...probeData, available: true, capabilities: ["private"] }), false);
+  assert.equal(Check(ProbeDataSchema, {
+    ...probeData,
+    available: true,
+    capabilities: [...CAPABILITIES, CAPABILITIES[0]],
+  }), false);
+});
+
+test("probe data accepts future fields without weakening known fields", () => {
+  assert.equal(Check(ProbeDataSchema, {
+    ...probeData,
+    available: true,
+    constraints: { ...probeData.constraints, futureConstraint: true },
+    futureRoot: true,
+  }), true);
+  assert.equal(Check(ProbeDataSchema, {
+    ...probeData,
+    available: false,
+    reason: "SESSION_NOT_READY",
+    constraints: { ...probeData.constraints, futureConstraint: true },
+    futureRoot: true,
+  }), true);
+  assert.equal(Check(ProbeDataSchema, { ...probeData, provider: "other", available: true }), false);
+});
+
 test("result schemas validate complete shapes and accept unknown fields", () => {
   const results = [
-    {
-      schema: ProbeDataSchema,
-      valid: {
-        protocol: 1, provider: "herdr", providerInstanceId: "provider", available: false,
-        reason: "SESSION_NOT_READY", capabilities: ["spawn", "send", "steer", "inspect"],
-        constraints: { requiresHerdrPane: true, requiresInteractivePi: true, future: true }, future: true,
-      },
-      invalid: {
-        protocol: 1, provider: "other", providerInstanceId: "provider", available: true,
-        capabilities: [], constraints: { requiresHerdrPane: true, requiresInteractivePi: true },
-      },
-    },
     {
       schema: WorkerReferenceSchema,
       valid: { name: "worker", paneId: "%1", cwd: "/tmp", adopted: false, future: true },

@@ -4,7 +4,7 @@ import { createWorkerRpcClient, RpcAbortError, RpcProtocolError, RpcResponseErro
 import { CHANNELS, replyChannel, success } from "../../rpc/protocol.js";
 import { FakeEventBus } from "../support/fake-event-bus.js";
 
-const provider = { protocol: 1 as const, provider: "herdr" as const, providerInstanceId: "provider", available: true, capabilities: [], constraints: { requiresHerdrPane: true as const, requiresInteractivePi: true as const } };
+const provider = { protocol: 1 as const, provider: "herdr" as const, providerInstanceId: "provider", available: true as const, capabilities: [], constraints: { requiresHerdrPane: true as const, requiresInteractivePi: true as const } };
 const workerReference = { name: "worker", paneId: "%1", cwd: "/tmp", adopted: false };
 const deliveryReceipt = { target: "worker", paneId: "%1", transport: "inbox" as const, requestedMode: "follow-up" as const, priorityApplied: false };
 const inspection = { name: "worker", paneId: "%1", relationship: "worker" as const, managedBySession: true };

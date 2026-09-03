@@ -55,7 +55,9 @@ A provider chooses the highest mutually supported version and replies with:
 }
 ```
 
-An unavailable provider still replies successfully to probe and includes one reason: `SESSION_NOT_READY`, `NOT_INTERACTIVE`, `NOT_IN_HERDR`, or `SHUTTING_DOWN`. The reason precedence is shutdown, Herdr environment, interactive mode, then session readiness. Callers should fall back when no provider is available.
+Availability and reason form one discriminated result. When `available` is `true`, `reason` is omitted; the runtime validator also accepts an explicitly present JavaScript `undefined`, which JSON serialization omits. When `available` is `false`, exactly one recognized reason is required: `SESSION_NOT_READY`, `NOT_INTERACTIVE`, `NOT_IN_HERDR`, or `SHUTTING_DOWN`. The reason precedence is shutdown, Herdr environment, interactive mode, then session readiness. Callers should fall back when no provider is available.
+
+`capabilities` advertises any unique subset of the protocol-1 values `spawn`, `send`, `steer`, and `inspect`. The list may be empty and contains at most four entries; unknown and duplicate values are invalid. Stop remains reserved and is never advertised.
 
 There may briefly be multiple providers on the shared bus. Select one available probe reply and copy its exact `providerInstanceId` and negotiated `protocol` into every addressed request. Providers silently ignore requests addressed to another instance. Reload creates a new instance ID; requests carrying the old ID are therefore no-ops.
 
@@ -169,6 +171,7 @@ All payloads are runtime validated before dispatch. IDs (`requestId` and `provid
 | Field | Limit |
 |---|---:|
 | `supportedProtocols` | 1-8 unique positive integers |
+| probe `capabilities` | 0-4 unique protocol-1 capability names |
 | worker `name` | 1-32 characters; domain naming rules also apply |
 | `target` | 1-128 characters |
 | `model`, `type` | 1-128 characters each |

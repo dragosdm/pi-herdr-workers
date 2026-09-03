@@ -106,18 +106,31 @@ export interface InspectInput { target: string }
 
 const CapabilitySchema = Type.Union(CAPABILITIES.map((capability) => Type.Literal(capability)));
 const AvailabilityReasonSchema = Type.Union(AVAILABILITY_REASONS.map((reason) => Type.Literal(reason)));
-export const ProbeDataSchema = Type.Object({
+const ProbeDataProperties = {
   protocol: ProtocolV1Schema,
   provider: Type.Literal("herdr"),
   providerInstanceId: ProviderInstanceIdSchema,
-  available: Type.Boolean(),
-  reason: Type.Optional(AvailabilityReasonSchema),
-  capabilities: Type.Array(CapabilitySchema),
+  capabilities: Type.Array(CapabilitySchema, {
+    maxItems: CAPABILITIES.length,
+    uniqueItems: true,
+  }),
   constraints: Type.Object({
     requiresHerdrPane: Type.Literal(true),
     requiresInteractivePi: Type.Literal(true),
   }),
-});
+};
+export const ProbeDataSchema = Type.Union([
+  Type.Object({
+    ...ProbeDataProperties,
+    available: Type.Literal(true),
+    reason: Type.Optional(Type.Never()),
+  }),
+  Type.Object({
+    ...ProbeDataProperties,
+    available: Type.Literal(false),
+    reason: AvailabilityReasonSchema,
+  }),
+]);
 export const WorkerReferenceSchema = Type.Object({
   name: bounded(LIMITS.workerName),
   paneId: bounded(LIMITS.target),
