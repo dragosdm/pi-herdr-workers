@@ -1,7 +1,7 @@
 import assert from "node:assert/strict";
 import test from "node:test";
 import { createWorkerRpcClient, RpcAbortError, RpcProtocolError, RpcResponseError, RpcTimeoutError } from "../../rpc/client.js";
-import { CHANNELS, replyChannel, success } from "../../rpc/protocol.js";
+import { CHANNELS, failure, replyChannel, success } from "../../rpc/protocol.js";
 import { FakeEventBus } from "../support/fake-event-bus.js";
 
 const provider = { protocol: 1 as const, provider: "herdr" as const, providerInstanceId: "provider", available: true as const, capabilities: [], constraints: { requiresHerdrPane: true as const, requiresInteractivePi: true as const } };
@@ -18,6 +18,143 @@ test("probe installs listener before emit and selects an available provider", as
   const selected = await createWorkerRpcClient({ events, createRequestId: () => "probe-1" }).probe();
   assert.equal(selected.providerInstanceId, "provider");
   assert.equal(events.listenerCount(replyChannel(CHANNELS.probe, "probe-1")), 0);
+});
+
+test("probe selects a compatible provider after an earlier unsupported responder", async () => {
+  const events = new FakeEventBus();
+  events.on(CHANNELS.probe, (payload) => {
+    const request = payload as { requestId: string };
+    events.emit(
+      replyChannel(CHANNELS.probe, request.requestId),
+      failure(request.requestId, "UNSUPPORTED_PROTOCOL", "Responder only supports a newer protocol."),
+    );
+  });
+  events.on(CHANNELS.probe, (payload) => {
+    const request = payload as { requestId: string };
+    events.emit(replyChannel(CHANNELS.probe, request.requestId), success(request.requestId, provider));
+  });
+
+  const selected = await createWorkerRpcClient({ events, createRequestId: () => "probe-compatible" }).probe();
+
+  assert.equal(selected.providerInstanceId, "provider");
+  assert.equal(events.listenerCount(replyChannel(CHANNELS.probe, "probe-compatible")), 0);
+});
+
+test("probe timeout prefers a compatible unavailable provider over unsupported protocol", async () => {
+  const events = new FakeEventBus();
+  const unavailable = { ...provider, providerInstanceId: "unavailable", available: false as const, reason: "NOT_INTERACTIVE" as const };
+  events.on(CHANNELS.probe, (payload) => {
+    const request = payload as { requestId: string };
+    events.emit(
+      replyChannel(CHANNELS.probe, request.requestId),
+      failure(request.requestId, "UNSUPPORTED_PROTOCOL", "Protocol mismatch."),
+    );
+  });
+  events.on(CHANNELS.probe, (payload) => {
+    const request = payload as { requestId: string };
+    events.emit(replyChannel(CHANNELS.probe, request.requestId), success(request.requestId, unavailable));
+  });
+
+  const selected = await createWorkerRpcClient({ events, createRequestId: () => "probe-unavailable-protocol" }).probe({ timeoutMs: 1 });
+
+  assert.equal(selected.providerInstanceId, "unavailable");
+  assert.equal(selected.available, false);
+  assert.equal(events.listenerCount(replyChannel(CHANNELS.probe, "probe-unavailable-protocol")), 0);
+});
+
+test("probe timeout prefers the first unsupported protocol error over malformed successes", async () => {
+  const events = new FakeEventBus();
+  events.on(CHANNELS.probe, (payload) => {
+    const request = payload as { requestId: string };
+    const channel = replyChannel(CHANNELS.probe, request.requestId);
+    events.emit(channel, failure(request.requestId, "UNSUPPORTED_PROTOCOL", "First protocol mismatch."));
+    events.emit(channel, success(request.requestId, { ...provider, constraints: {} }));
+    events.emit(channel, failure(request.requestId, "UNSUPPORTED_PROTOCOL", "Second protocol mismatch."));
+  });
+
+  const call = createWorkerRpcClient({ events, createRequestId: () => "probe-protocol-malformed" }).probe({ timeoutMs: 1 });
+
+  await assert.rejects(call, (error: unknown) => {
+    assert.ok(error instanceof RpcResponseError);
+    assert.equal(error.code, "UNSUPPORTED_PROTOCOL");
+    assert.equal(error.message, "First protocol mismatch.");
+    return true;
+  });
+  assert.equal(events.listenerCount(replyChannel(CHANNELS.probe, "probe-protocol-malformed")), 0);
+});
+
+test("unsupported-only probe waits until timeout before rejecting and cleans up", async () => {
+  const events = new FakeEventBus();
+  events.on(CHANNELS.probe, (payload) => {
+    const request = payload as { requestId: string };
+    events.emit(
+      replyChannel(CHANNELS.probe, request.requestId),
+      failure(request.requestId, "UNSUPPORTED_PROTOCOL", "No mutually supported protocol."),
+    );
+  });
+  const call = createWorkerRpcClient({ events, createRequestId: () => "probe-protocol-only" }).probe({ timeoutMs: 5 });
+  let completed = false;
+  void call.then(() => { completed = true; }, () => { completed = true; });
+
+  await Promise.resolve();
+  assert.equal(completed, false);
+  await assert.rejects(call, (error: unknown) => {
+    assert.ok(error instanceof RpcResponseError);
+    assert.equal(error.code, "UNSUPPORTED_PROTOCOL");
+    assert.equal(error.message, "No mutually supported protocol.");
+    return true;
+  });
+  assert.equal(events.listenerCount(replyChannel(CHANNELS.probe, "probe-protocol-only")), 0);
+});
+
+test("probe abort and synchronous emit failure take precedence after unsupported protocol", async () => {
+  const abortBus = new FakeEventBus();
+  abortBus.on(CHANNELS.probe, (payload) => {
+    const request = payload as { requestId: string };
+    abortBus.emit(
+      replyChannel(CHANNELS.probe, request.requestId),
+      failure(request.requestId, "UNSUPPORTED_PROTOCOL", "Protocol mismatch."),
+    );
+  });
+  const controller = new AbortController();
+  const aborted = createWorkerRpcClient({ events: abortBus, createRequestId: () => "probe-protocol-abort" }).probe({ timeoutMs: 50, signal: controller.signal });
+  controller.abort();
+  await assert.rejects(aborted, RpcAbortError);
+  assert.equal(abortBus.listenerCount(replyChannel(CHANNELS.probe, "probe-protocol-abort")), 0);
+
+  let replyListener: ((payload: unknown) => void) | undefined;
+  const throwBus = {
+    on: (_channel: string, listener: (payload: unknown) => void) => { replyListener = listener; return () => { replyListener = undefined; }; },
+    emit: (_channel: string, payload: unknown) => {
+      const request = payload as { requestId: string };
+      replyListener?.(failure(request.requestId, "UNSUPPORTED_PROTOCOL", "Protocol mismatch."));
+      throw new Error("emit failed after unsupported response");
+    },
+  };
+  await assert.rejects(
+    createWorkerRpcClient({ events: throwBus, createRequestId: () => "probe-protocol-emit" }).probe(),
+    /emit failed after unsupported response/,
+  );
+  assert.equal(replyListener, undefined);
+});
+
+test("probe keeps an immediately selected provider despite later responder activity", async () => {
+  const events = new FakeEventBus();
+  events.on(CHANNELS.probe, (payload) => {
+    const request = payload as { requestId: string };
+    events.emit(replyChannel(CHANNELS.probe, request.requestId), success(request.requestId, provider));
+  });
+  events.on(CHANNELS.probe, (payload) => {
+    const request = payload as { requestId: string };
+    const channel = replyChannel(CHANNELS.probe, request.requestId);
+    events.emit(channel, failure(request.requestId, "UNSUPPORTED_PROTOCOL", "Late protocol mismatch."));
+    events.emit(channel, success(request.requestId, {}));
+  });
+
+  const selected = await createWorkerRpcClient({ events, createRequestId: () => "probe-selected-first" }).probe();
+
+  assert.equal(selected, provider);
+  assert.equal(events.listenerCount(replyChannel(CHANNELS.probe, "probe-selected-first")), 0);
 });
 
 test("probe skips malformed successes and selects a later valid provider", async () => {

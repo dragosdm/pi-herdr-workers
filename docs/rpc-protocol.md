@@ -61,6 +61,8 @@ Availability and reason form one discriminated result. When `available` is `true
 
 There may briefly be multiple providers on the shared bus. Select one available probe reply and copy its exact `providerInstanceId` and negotiated `protocol` into every addressed request. Providers silently ignore requests addressed to another instance. Reload creates a new instance ID; requests carrying the old ID are therefore no-ops.
 
+The bundled client treats probe as broadcast aggregation. The first valid available provider resolves discovery immediately, including when an earlier responder returned `UNSUPPORTED_PROTOCOL`. If no available provider responds before the deadline, timeout settlement returns the first valid unavailable provider, otherwise rejects with the first validated `UNSUPPORTED_PROTOCOL` error, otherwise rejects with `RpcProtocolError` when a malformed success was observed, and otherwise rejects with the ordinary timeout error. Other correlated failure codes are ignored during probe. Abort and synchronous event-bus failures remain terminal while discovery is pending.
+
 ## Operations
 
 All addressed requests include `requestId`, `providerInstanceId`, and `protocol: 1`.
@@ -186,7 +188,7 @@ Unknown object fields are ignored for forward compatibility. Known fields retain
 
 Successful probe, spawn, send, and inspect data is runtime validated against its operation-specific protocol-v1 shape. Providers validate service results before emitting them; malformed internal results become the fixed `INTERNAL_ERROR` response. The bundled client validates successful data independently before returning it. A malformed addressed success rejects with a client-only `RpcProtocolError` whose code is `INVALID_RESPONSE` and whose fixed message is `The worker provider returned an invalid response.` Provider payload details and schema diagnostics are not exposed.
 
-Probe is broadcast, so a malformed successful probe response does not prevent discovery of another valid provider. The client continues listening and prefers an available provider. When discovery times out, the first valid unavailable provider takes precedence, followed by `RpcProtocolError` if only malformed successes were observed, then the normal timeout error. Stop is failure-only; an unexpected successful stop response is rejected as invalid.
+Probe successes that fail operation-specific validation and validated `UNSUPPORTED_PROTOCOL` failures are deferred so another broadcast responder can still supply an available provider. The complete aggregation precedence is documented under Discovery and routing. Stop is failure-only; an unexpected successful stop response is rejected as invalid.
 
 Errors use only `INVALID_REQUEST`, `UNSUPPORTED_PROTOCOL`, `PROVIDER_UNAVAILABLE`, `NOT_FOUND`, `NOT_TEAM_MEMBER`, `UNSUPPORTED_OPERATION`, and `INTERNAL_ERROR`. Unknown service failures map to a fixed `INTERNAL_ERROR`; replies do not expose stacks, environment values, raw Herdr errors, prompts, or message bodies.
 
