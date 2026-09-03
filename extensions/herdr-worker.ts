@@ -26,6 +26,8 @@ import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-a
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
+import { createLifecycleAcceptor, type LifecycleAcceptor } from "../lifecycle/acceptor.js";
+import { LIFECYCLE_PROTOCOL_V1 } from "../lifecycle/protocol.js";
 import { registerWorkerRpcServer, type WorkerRpcService } from "../rpc/server.js";
 import { WorkerRpcServiceError, type InspectInput, type Inspection, type SendInput, type DeliveryReceipt, type SpawnInput, type SpawnProvenance } from "../rpc/protocol.js";
 
@@ -157,6 +159,8 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	let stopped = false;
 	const lifetime = new AbortController();
 	let createQueue = Promise.resolve();
+	let lifecycleAcceptor: LifecycleAcceptor | undefined;
+	let providerLifecycleSequence = 0;
 	const inFlightEnvelopes = new Set<string>();
 	const interactive = () => HERDR_ENV && !!SELF_PANE && ctxRef?.mode === "tui" && !stopped;
 	const providerState = () => {
@@ -684,6 +688,37 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		adopted: boolean;
 	}
 
+	function bindLifecycleRun(opts: CreateOpts, name: string, paneId: string): boolean {
+		return lifecycleAcceptor?.bindRun({
+			runId: opts.runId,
+			...(opts.correlationId === undefined ? {} : { correlationId: opts.correlationId }),
+			worker: { name, paneId },
+			...(opts.provenance?.requestId === undefined ? {} : { requestId: opts.provenance.requestId }),
+			providerInstanceId: opts.provenance?.providerInstanceId ?? rpcServer.providerInstanceId,
+		}) ?? false;
+	}
+
+	function observeProviderStarted(opts: CreateOpts, name: string, paneId: string): void {
+		try {
+			if (!bindLifecycleRun(opts, name, paneId)) return;
+			lifecycleAcceptor?.accept({
+				protocol: LIFECYCLE_PROTOCOL_V1,
+				eventId: randomUUID(),
+				runId: opts.runId,
+				sourceInstanceId: opts.provenance?.providerInstanceId ?? rpcServer.providerInstanceId,
+				sourceSequence: ++providerLifecycleSequence,
+				status: "started",
+				worker: { name, paneId },
+				observedAt: Date.now(),
+				source: "provider",
+				...(opts.correlationId === undefined ? {} : { correlationId: opts.correlationId }),
+				evidence: { kind: "agent_start_returned", readiness: "unconfirmed" },
+			});
+		} catch {
+			// Lifecycle persistence and publication must not change worker creation outcomes.
+		}
+	}
+
 	async function createAgent(opts: CreateOpts, ctx: ExtensionContext, cwd: string): Promise<CreateResult> {
 		if (!HERDR_ENV || !SELF_PANE) throw new Error("Not running inside herdr.");
 		const dir: Direction = opts.direction ?? "right";
@@ -717,6 +752,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 					providerInstanceId: opts.provenance?.providerInstanceId,
 				} };
 				persist();
+				bindLifecycleRun(opts, wanted, existing.paneId);
 				await sendControl(wanted, "bind-run", { runId: opts.runId, ...(opts.correlationId === undefined ? {} : { correlationId: opts.correlationId }) });
 				if (opts.initialPrompt) await send(wanted, opts.initialPrompt, false, undefined, opts.runId);
 				const meta = state.meta?.[wanted];
@@ -761,6 +797,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		} };
 		persist();
 		updateUi();
+		observeProviderStarted(opts, name, paneId);
 
 		if (opts.initialPrompt?.trim()) {
 			// Wait for the worker's extension to come up and register its inbox, then hand over the brief.
@@ -1080,6 +1117,12 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	pi.on("session_start", async (event, ctx) => {
 		ctxRef = ctx;
 		restore(ctx);
+		lifecycleAcceptor = createLifecycleAcceptor({
+			sessionId: ctx.sessionManager.getSessionId(),
+			getEntries: () => ctx.sessionManager.getEntries(),
+			appendEntry: (customType, data) => pi.appendEntry(customType, data),
+			emit: (channel, payload) => pi.events.emit(channel, payload),
+		});
 		if (!interactive()) {
 			state = { workers: [] };
 			syncTool(); // no herdr -> no team -> no tool
@@ -1128,6 +1171,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		lifetime.abort();
 		if (wasListening) stopListening();
 		if (ctxRef?.hasUI) ctxRef.ui.setStatus(STATUS_KEY, undefined);
+		lifecycleAcceptor = undefined;
 		ctxRef = undefined;
 	});
 }

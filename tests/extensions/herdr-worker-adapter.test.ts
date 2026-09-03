@@ -1,19 +1,23 @@
 import assert from "node:assert/strict";
 import test from "node:test";
+import { LIFECYCLE_JOURNAL_ENTRY } from "../../lifecycle/acceptor.js";
+import { LIFECYCLE_CHANNELS, type AcceptedLifecycleEvent } from "../../lifecycle/protocol.js";
 import { CHANNELS, replyChannel, type DeliveryReceipt, type Inspection, type RpcReply, type WorkerReference } from "../../rpc/protocol.js";
-import { FakeEventBus } from "../support/fake-event-bus.js";
+import { FakeIsolatedEventBus } from "../support/fake-isolated-event-bus.js";
 
 process.env.HERDR_ENV = "1";
 process.env.HERDR_PANE_ID = "self-pane";
 process.env.HERDR_TAB_ID = "tab-1";
 
-async function harness(options: { listening?: boolean; branch?: any[]; missingAgents?: string[]; contextCwd?: string; workerCwd?: string | null } = {}) {
+async function harness(options: { listening?: boolean; branch?: any[]; sessionEntries?: any[]; missingAgents?: string[]; contextCwd?: string; workerCwd?: string | null } = {}) {
 	const { default: herdrWorker } = await import("../../extensions/herdr-worker.js");
-	const events = new FakeEventBus();
+	const timeline: string[] = [];
+	const events = new FakeIsolatedEventBus((channel) => timeline.push(`emit:${channel}`));
 	const tools = new Map<string, any>();
 	const commands = new Map<string, any>();
 	const handlers = new Map<string, Array<(...args: any[]) => any>>();
 	const entries: Array<{ type: string; data: any }> = [];
+	const sessionEntries = options.sessionEntries ?? [];
 	const execCalls: string[][] = [];
 	const writtenEnvelopes: Array<{ paneId: string; envelope: any }> = [];
 	const agentGetTargets: string[] = [];
@@ -31,7 +35,11 @@ async function harness(options: { listening?: boolean; branch?: any[]; missingAg
 		},
 		getActiveTools() { return activeTools; },
 		setActiveTools(value: string[]) { activeTools = value; },
-		appendEntry(type: string, data: any) { entries.push({ type, data }); },
+		appendEntry(type: string, data: any) {
+			entries.push({ type, data });
+			sessionEntries.push({ type: "custom", customType: type, data });
+			timeline.push(`append:${type}`);
+		},
 		sendMessage() {},
 		sendUserMessage() {},
 		async exec(_command: string, args: string[]) {
@@ -63,15 +71,15 @@ async function harness(options: { listening?: boolean; branch?: any[]; missingAg
 		hasUI: false,
 		model: { provider: "test", id: "model" },
 		signal: new AbortController().signal,
-		sessionManager: { getSessionId: () => "session", getBranch: () => options.branch ?? [], getEntries: () => [] },
+		sessionManager: { getSessionId: () => "session", getBranch: () => options.branch ?? [], getEntries: () => sessionEntries },
 		ui: { setStatus() {}, notify() {} },
 		isIdle: () => true,
 	};
 	herdrWorker(pi, { disableInbox: true, isListening: () => options.listening ?? false, writeEnvelope: (paneId, envelope) => writtenEnvelopes.push({ paneId, envelope }) });
-	return { events, tools, commands, handlers, entries, execCalls, agentGetTargets, writtenEnvelopes, ctx, pi, herdrWorker, activeTools: () => activeTools };
+	return { events, tools, commands, handlers, entries, sessionEntries, timeline, execCalls, agentGetTargets, writtenEnvelopes, ctx, pi, herdrWorker, activeTools: () => activeTools };
 }
 
-async function emitForReply<T>(events: FakeEventBus, channel: typeof CHANNELS.spawn | typeof CHANNELS.probe | typeof CHANNELS.send | typeof CHANNELS.inspect, requestId: string, payload: unknown): Promise<RpcReply<T>> {
+async function emitForReply<T>(events: FakeIsolatedEventBus, channel: typeof CHANNELS.spawn | typeof CHANNELS.probe | typeof CHANNELS.send | typeof CHANNELS.inspect, requestId: string, payload: unknown): Promise<RpcReply<T>> {
 	return await new Promise((resolve) => {
 		const unsubscribe = events.on(replyChannel(channel, requestId), (reply) => {
 			unsubscribe();
@@ -247,6 +255,75 @@ test("new workers receive RPC correlation with the generated run identity", asyn
 	assert.equal(team?.data.meta["agent-builder"].runId, spawned.data.runId);
 	assert.equal(team?.data.meta["agent-builder"].requestId, "correlation");
 	assert.equal(team?.data.meta["agent-builder"].providerInstanceId, providerInstanceId);
+});
+
+test("new worker start is journaled before canonical and projected publication", async () => {
+	const h = await harness();
+	const delivered: AcceptedLifecycleEvent[] = [];
+	h.events.on(LIFECYCLE_CHANNELS.lifecycle, () => { throw new Error("subscriber failed"); });
+	h.events.on(LIFECYCLE_CHANNELS.lifecycle, (payload) => delivered.push(payload as AcceptedLifecycleEvent));
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	const probe = await emitForReply<any>(h.events, CHANNELS.probe, "lifecycle-probe", { requestId: "lifecycle-probe", supportedProtocols: [1] });
+	const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
+	const spawned = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, "lifecycle-spawn", {
+		requestId: "lifecycle-spawn", providerInstanceId, protocol: 1, correlationId: "dispatch-lifecycle", name: "builder",
+	});
+	assert.equal(spawned.success, true);
+	if (!spawned.success) return;
+
+	const lifecycleEntries = h.entries.filter((entry) => entry.type === LIFECYCLE_JOURNAL_ENTRY);
+	assert.equal(lifecycleEntries.length, 1);
+	const event = lifecycleEntries[0].data.event as AcceptedLifecycleEvent;
+	assert.equal(event.runId, spawned.data.runId);
+	assert.equal(event.correlationId, "dispatch-lifecycle");
+	assert.deepEqual(event.worker, { name: "agent-builder", paneId: "new-pane" });
+	assert.equal(event.sourceInstanceId, providerInstanceId);
+	assert.equal(event.acceptedSequence, 1);
+	assert.deepEqual(event.evidence, { kind: "agent_start_returned", readiness: "unconfirmed" });
+	assert.equal(delivered.length, 1);
+	assert.equal(delivered[0], event);
+
+	const canonicalEmission = h.events.emissions.find((item) => item.channel === LIFECYCLE_CHANNELS.lifecycle);
+	const projectedEmission = h.events.emissions.find((item) => item.channel === LIFECYCLE_CHANNELS.started);
+	assert.equal(canonicalEmission?.payload, event);
+	assert.equal(projectedEmission?.payload, event);
+	const lifecycleAppend = h.timeline.indexOf(`append:${LIFECYCLE_JOURNAL_ENTRY}`);
+	const canonical = h.timeline.indexOf(`emit:${LIFECYCLE_CHANNELS.lifecycle}`);
+	const projected = h.timeline.indexOf(`emit:${LIFECYCLE_CHANNELS.started}`);
+	assert.ok(lifecycleAppend > h.timeline.findIndex((item) => item === "append:herdr-worker"));
+	assert.ok(canonical > lifecycleAppend);
+	assert.ok(projected > canonical);
+});
+
+test("re-adoption binds a run without claiming a provider-observed start", async () => {
+	const h = await harness({ listening: true });
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	const probe = await emitForReply<any>(h.events, CHANNELS.probe, "adopt-lifecycle-probe", { requestId: "adopt-lifecycle-probe", supportedProtocols: [1] });
+	const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
+	const spawned = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, "adopt-lifecycle", {
+		requestId: "adopt-lifecycle", providerInstanceId, protocol: 1, name: "scout",
+	});
+	assert.equal(spawned.success && spawned.data.adopted, true);
+	assert.equal(h.entries.some((entry) => entry.type === LIFECYCLE_JOURNAL_ENTRY), false);
+	assert.equal(h.events.emissions.some((item) => item.channel === LIFECYCLE_CHANNELS.started), false);
+});
+
+test("extension reload restores lifecycle history without replaying publication", async () => {
+	const h = await harness();
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	const probe = await emitForReply<any>(h.events, CHANNELS.probe, "restore-probe", { requestId: "restore-probe", supportedProtocols: [1] });
+	const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
+	const spawned = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, "restore-spawn", {
+		requestId: "restore-spawn", providerInstanceId, protocol: 1, name: "builder",
+	});
+	assert.equal(spawned.success, true);
+	const before = h.events.emissions.filter((item) => item.channel === LIFECYCLE_CHANNELS.lifecycle).length;
+	assert.equal(before, 1);
+	await h.handlers.get("session_shutdown")![0]();
+	h.herdrWorker(h.pi, { disableInbox: true });
+	await h.handlers.get("session_start")![1]({ reason: "startup" }, h.ctx);
+	assert.equal(h.events.emissions.filter((item) => item.channel === LIFECYCLE_CHANNELS.lifecycle).length, before);
+	assert.equal(h.sessionEntries.filter((entry) => entry.customType === LIFECYCLE_JOURNAL_ENTRY).length, 1);
 });
 
 test("RPC inspect projects worker and orchestrator facts from authorized relationships", async () => {
