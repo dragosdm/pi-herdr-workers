@@ -38,6 +38,12 @@ export const LifecycleRunIdSchema = SafeIdSchema;
 export const LifecycleSourceInstanceIdSchema = SafeIdSchema;
 export const LifecycleCorrelationIdSchema = SafeIdSchema;
 
+export const WorkerRunBindingSchema = Type.Object({
+	protocol: Type.Literal(LIFECYCLE_PROTOCOL_V1),
+	runId: LifecycleRunIdSchema,
+	correlationId: Type.Optional(LifecycleCorrelationIdSchema),
+});
+
 export const ProviderStartedEvidenceSchema = Type.Object({
 	kind: Type.Literal("agent_start_returned"),
 	readiness: Type.Literal("unconfirmed"),
@@ -95,6 +101,59 @@ export const WorkerLifecycleEvidenceSchema = Type.Union([
 ]);
 
 export type WorkerLifecycleEvidence = Static<typeof WorkerLifecycleEvidenceSchema>;
+
+export const WorkerRunReportSchema = Type.Union([
+	Type.Object({
+		protocol: Type.Literal(LIFECYCLE_PROTOCOL_V1),
+		eventId: LifecycleEventIdSchema,
+		runId: LifecycleRunIdSchema,
+		sourceInstanceId: LifecycleSourceInstanceIdSchema,
+		sourceSequence: Type.Integer({ minimum: 1 }),
+		observedAt: Type.Integer({ minimum: 0 }),
+		status: Type.Literal("started"),
+		evidence: WorkerReadyEvidenceSchema,
+	}),
+	Type.Object({
+		protocol: Type.Literal(LIFECYCLE_PROTOCOL_V1),
+		eventId: LifecycleEventIdSchema,
+		runId: LifecycleRunIdSchema,
+		sourceInstanceId: LifecycleSourceInstanceIdSchema,
+		sourceSequence: Type.Integer({ minimum: 1 }),
+		observedAt: Type.Integer({ minimum: 0 }),
+		status: Type.Literal("message"),
+		evidence: WorkerMessageEvidenceSchema,
+	}),
+	Type.Object({
+		protocol: Type.Literal(LIFECYCLE_PROTOCOL_V1),
+		eventId: LifecycleEventIdSchema,
+		runId: LifecycleRunIdSchema,
+		sourceInstanceId: LifecycleSourceInstanceIdSchema,
+		sourceSequence: Type.Integer({ minimum: 1 }),
+		observedAt: Type.Integer({ minimum: 0 }),
+		status: Type.Literal("completed"),
+		evidence: WorkerCompletedEvidenceSchema,
+	}),
+	Type.Object({
+		protocol: Type.Literal(LIFECYCLE_PROTOCOL_V1),
+		eventId: LifecycleEventIdSchema,
+		runId: LifecycleRunIdSchema,
+		sourceInstanceId: LifecycleSourceInstanceIdSchema,
+		sourceSequence: Type.Integer({ minimum: 1 }),
+		observedAt: Type.Integer({ minimum: 0 }),
+		status: Type.Literal("failed"),
+		evidence: WorkerFailedEvidenceSchema,
+	}),
+]);
+
+export const WorkerRunReportInputSchema = Type.Union([
+	Type.Object({ status: Type.Literal("message"), message: bounded(LIFECYCLE_LIMITS.message) }),
+	Type.Object({ status: Type.Literal("completed"), result: Type.Optional(bounded(LIFECYCLE_LIMITS.result)) }),
+	Type.Object({ status: Type.Literal("failed"), error: bounded(LIFECYCLE_LIMITS.error) }),
+]);
+
+export type WorkerRunBinding = Static<typeof WorkerRunBindingSchema>;
+export type WorkerRunReport = Static<typeof WorkerRunReportSchema>;
+export type WorkerRunReportInput = Static<typeof WorkerRunReportInputSchema>;
 
 const WorkerIdentitySchema = Type.Object({
 	name: bounded(LIFECYCLE_LIMITS.workerName),
@@ -159,6 +218,24 @@ export function isLifecycleCandidate(value: unknown): value is LifecycleCandidat
 
 export function isAcceptedLifecycleEvent(value: unknown): value is AcceptedLifecycleEvent {
 	return checkLifecycle(AcceptedLifecycleEventSchema, value);
+}
+
+export function isWorkerRunBinding(value: unknown): value is WorkerRunBinding {
+	return Check(WorkerRunBindingSchema, value);
+}
+
+export function isWorkerRunReport(value: unknown): value is WorkerRunReport {
+	return checkLifecycle(WorkerRunReportSchema, value);
+}
+
+export function isWorkerRunReportInput(value: unknown): value is WorkerRunReportInput {
+	if (!Check(WorkerRunReportInputSchema, value)) return false;
+	const input = value as WorkerRunReportInput;
+	switch (input.status) {
+		case "message": return withinUtf8Limit(input.message, LIFECYCLE_LIMITS.message);
+		case "completed": return input.result === undefined || withinUtf8Limit(input.result, LIFECYCLE_LIMITS.result);
+		case "failed": return withinUtf8Limit(input.error, LIFECYCLE_LIMITS.error);
+	}
 }
 
 export function lifecycleChannel(status: LifecycleStatus): (typeof LIFECYCLE_CHANNELS)[LifecycleStatus] {

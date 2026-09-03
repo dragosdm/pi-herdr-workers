@@ -8,9 +8,15 @@ import {
 	LIFECYCLE_SOURCES,
 	LIFECYCLE_STATUSES,
 	LifecycleCandidateSchema,
+	WorkerRunBindingSchema,
+	WorkerRunReportInputSchema,
+	WorkerRunReportSchema,
 	WorkerLifecycleEvidenceSchema,
 	isAcceptedLifecycleEvent,
 	isLifecycleCandidate,
+	isWorkerRunBinding,
+	isWorkerRunReport,
+	isWorkerRunReportInput,
 	lifecycleChannel,
 } from "../../lifecycle/protocol.js";
 
@@ -97,4 +103,56 @@ test("accepted events require a positive parent-assigned sequence", () => {
 	assert.equal(Check(AcceptedLifecycleEventSchema, candidate), false);
 	assert.equal(isAcceptedLifecycleEvent({ ...candidate, acceptedSequence: 1 }), true);
 	assert.equal(isAcceptedLifecycleEvent({ ...candidate, acceptedSequence: 0 }), false);
+});
+
+test("validates structured run bindings and worker-owned reports", () => {
+	const binding = { protocol: 1, runId: "run-1", correlationId: "dispatch-1" };
+	assert.equal(Check(WorkerRunBindingSchema, binding), true);
+	assert.equal(isWorkerRunBinding(binding), true);
+	assert.equal(isWorkerRunBinding({ ...binding, runId: "unsafe/run" }), false);
+
+	const reports = [
+		{ status: "started", evidence: { kind: "worker_ready", readiness: "confirmed" } },
+		{ status: "message", evidence: { kind: "worker_message", message: "Working" } },
+		{ status: "completed", evidence: { kind: "worker_completed", result: "Done" } },
+		{ status: "failed", evidence: { kind: "worker_failed", error: "Blocked" } },
+	] as const;
+	for (const report of reports) {
+		const value = {
+			protocol: 1,
+			eventId: `event-${report.status}`,
+			runId: "run-1",
+			sourceInstanceId: "worker-source-1",
+			sourceSequence: 1,
+			observedAt: 1_786_000_000_000,
+			...report,
+		};
+		assert.equal(Check(WorkerRunReportSchema, value), true, report.status);
+		assert.equal(isWorkerRunReport(value), true, report.status);
+	}
+	assert.equal(isWorkerRunReport({
+		protocol: 1,
+		eventId: "event-bad",
+		runId: "run-1",
+		sourceInstanceId: "worker-source-1",
+		sourceSequence: 1,
+		observedAt: 1,
+		status: "completed",
+		evidence: { kind: "worker_message", message: "Done" },
+	}), false);
+});
+
+test("validates only model-owned report fields with bounded content", () => {
+	const inputs = [
+		{ status: "message", message: "Working" },
+		{ status: "completed" },
+		{ status: "completed", result: "Done" },
+		{ status: "failed", error: "Blocked" },
+	] as const;
+	for (const input of inputs) {
+		assert.equal(Check(WorkerRunReportInputSchema, input), true);
+		assert.equal(isWorkerRunReportInput(input), true);
+	}
+	assert.equal(isWorkerRunReportInput({ status: "message" }), false);
+	assert.equal(isWorkerRunReportInput({ status: "failed", error: "😀".repeat(LIFECYCLE_LIMITS.error) }), false);
 });

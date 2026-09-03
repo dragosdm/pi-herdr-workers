@@ -9,7 +9,17 @@ process.env.HERDR_ENV = "1";
 process.env.HERDR_PANE_ID = "self-pane";
 process.env.HERDR_TAB_ID = "tab-1";
 
-async function harness(options: { listening?: boolean; branch?: any[]; sessionEntries?: any[]; missingAgents?: string[]; contextCwd?: string; workerCwd?: string | null } = {}) {
+async function harness(options: {
+	listening?: boolean;
+	branch?: any[];
+	sessionEntries?: any[];
+	missingAgents?: string[];
+	contextCwd?: string;
+	workerCwd?: string | null;
+	flags?: Record<string, unknown>;
+	selfName?: string;
+	agents?: any[];
+} = {}) {
 	const { default: herdrWorker } = await import("../../extensions/herdr-worker.js");
 	const timeline: string[] = [];
 	const events = new FakeIsolatedEventBus((channel) => timeline.push(`emit:${channel}`));
@@ -20,12 +30,14 @@ async function harness(options: { listening?: boolean; branch?: any[]; sessionEn
 	const sessionEntries = options.sessionEntries ?? [];
 	const execCalls: string[][] = [];
 	const writtenEnvelopes: Array<{ paneId: string; envelope: any }> = [];
+	const sentMessages: Array<{ message: any; options: any }> = [];
 	const agentGetTargets: string[] = [];
+	let inboxHandler: ((envelope: unknown, envelopeId: string) => Promise<void>) | undefined;
 	let activeTools: string[] = [];
 	const pi: any = {
 		events,
 		registerFlag() {},
-		getFlag() { return undefined; },
+		getFlag(name: string) { return options.flags?.[name]; },
 		registerTool(tool: any) { tools.set(tool.name, tool); },
 		registerCommand(name: string, command: any) { commands.set(name, command); },
 		on(name: string, handler: (...args: any[]) => any) {
@@ -40,7 +52,7 @@ async function harness(options: { listening?: boolean; branch?: any[]; sessionEn
 			sessionEntries.push({ type: "custom", customType: type, data });
 			timeline.push(`append:${type}`);
 		},
-		sendMessage() {},
+		sendMessage(message: any, messageOptions: any) { sentMessages.push({ message, options: messageOptions }); },
 		sendUserMessage() {},
 		async exec(_command: string, args: string[]) {
 			execCalls.push(args);
@@ -50,7 +62,7 @@ async function harness(options: { listening?: boolean; branch?: any[]; sessionEn
 				const target = args[2];
 				agentGetTargets.push(target);
 				const agent = target === "self-pane"
-					? { pane_id: "self-pane", tab_id: "tab-1", name: "orchestrator", agent: "pi", cwd: "/tmp" }
+					? { pane_id: "self-pane", tab_id: "tab-1", name: options.selfName ?? "orchestrator", agent: "pi", cwd: "/tmp" }
 					: (target === "agent-scout" || target === "worker-pane") && !options.missingAgents?.includes(target)
 						? {
 							pane_id: "worker-pane", tab_id: "tab-1", name: "agent-scout", agent: "pi", agent_status: "idle",
@@ -61,7 +73,7 @@ async function harness(options: { listening?: boolean; branch?: any[]; sessionEn
 						: undefined;
 				return { code: agent ? 0 : 1, stdout: agent ? JSON.stringify({ result: { agent } }) : "", stderr: agent ? "" : "missing" };
 			}
-			if (args[0] === "agent" && args[1] === "list") return { code: 0, stdout: JSON.stringify({ result: { agents: [] } }), stderr: "" };
+			if (args[0] === "agent" && args[1] === "list") return { code: 0, stdout: JSON.stringify({ result: { agents: options.agents ?? [] } }), stderr: "" };
 			return { code: 0, stdout: JSON.stringify({ result: {} }), stderr: "" };
 		},
 	};
@@ -75,8 +87,17 @@ async function harness(options: { listening?: boolean; branch?: any[]; sessionEn
 		ui: { setStatus() {}, notify() {} },
 		isIdle: () => true,
 	};
-	herdrWorker(pi, { disableInbox: true, isListening: () => options.listening ?? false, writeEnvelope: (paneId, envelope) => writtenEnvelopes.push({ paneId, envelope }) });
-	return { events, tools, commands, handlers, entries, sessionEntries, timeline, execCalls, agentGetTargets, writtenEnvelopes, ctx, pi, herdrWorker, activeTools: () => activeTools };
+	herdrWorker(pi, {
+		disableInbox: true,
+		isListening: () => options.listening ?? false,
+		writeEnvelope: (paneId, envelope) => writtenEnvelopes.push({ paneId, envelope }),
+		onInboxHandler: (handler) => { inboxHandler = handler; },
+	});
+	return {
+		events, tools, commands, handlers, entries, sessionEntries, timeline, execCalls, agentGetTargets,
+		writtenEnvelopes, sentMessages, ctx, pi, herdrWorker, activeTools: () => activeTools,
+		deliverInbox: (envelope: unknown, envelopeId: string) => inboxHandler!(envelope, envelopeId),
+	};
 }
 
 async function emitForReply<T>(events: FakeIsolatedEventBus, channel: typeof CHANNELS.spawn | typeof CHANNELS.probe | typeof CHANNELS.send | typeof CHANNELS.inspect, requestId: string, payload: unknown): Promise<RpcReply<T>> {
@@ -93,10 +114,24 @@ function teamBranch(data: any): any[] {
 	return [{ type: "custom", customType: "herdr-worker", data: { version: 1, sessionId: "session", workers: [], ...data } }];
 }
 
+function workerReport(runId: string, overrides: Record<string, unknown> = {}) {
+	return {
+		protocol: 1,
+		eventId: "worker-event-1",
+		runId,
+		sourceInstanceId: "worker-source-1",
+		sourceSequence: 1,
+		observedAt: 1_786_000_000_000,
+		status: "completed",
+		evidence: { kind: "worker_completed", result: "Done" },
+		...overrides,
+	};
+}
+
 test("registers once, exposes live availability, and disposes on shutdown", async () => {
 	const h = await harness();
 	assert.equal(h.events.listenerCount(), 5);
-	assert.deepEqual([...h.tools.keys()].sort(), ["CreateAgentPanel", "SendToAgent"]);
+	assert.deepEqual([...h.tools.keys()].sort(), ["CreateAgentPanel", "ReportWorkerRun", "SendToAgent"]);
 	assert.deepEqual([...h.commands.keys()].sort(), ["orchestrated-by", "team"]);
 	let probe = await emitForReply<any>(h.events, CHANNELS.probe, "before", { requestId: "before", supportedProtocols: [1] });
 	assert.equal(probe.success && probe.data.reason, "SESSION_NOT_READY");
@@ -157,9 +192,135 @@ test("re-adoption sends the run binding before its assignment prompt", async () 
 	const promptIndex = h.writtenEnvelopes.findIndex(({ envelope }) => envelope.type === "message" && envelope.message === "Map the code");
 	assert.ok(bindingIndex >= 0);
 	assert.ok(promptIndex > bindingIndex);
-	assert.equal(h.writtenEnvelopes[bindingIndex].envelope.runId, spawned.data.runId);
-	assert.equal(h.writtenEnvelopes[bindingIndex].envelope.correlationId, "dispatch-1");
+	assert.equal(h.writtenEnvelopes[bindingIndex].envelope.binding.runId, spawned.data.runId);
+	assert.equal(h.writtenEnvelopes[bindingIndex].envelope.binding.correlationId, "dispatch-1");
 	assert.equal(h.writtenEnvelopes[promptIndex].envelope.runId, spawned.data.runId);
+});
+
+test("new workers bind startup flags, report readiness, and gate ReportWorkerRun", async () => {
+	const h = await harness({
+		listening: true,
+		selfName: "agent-child",
+		flags: { "orchestrated-by": "boss", "worker-run-id": "run-child", "worker-correlation-id": "dispatch-child" },
+	});
+	assert.equal(h.activeTools().includes("ReportWorkerRun"), false);
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	assert.equal(h.activeTools().includes("ReportWorkerRun"), true);
+	const ready = h.writtenEnvelopes[0];
+	assert.equal(ready.paneId, "boss-pane");
+	assert.equal(ready.envelope.type, "lifecycle");
+	assert.equal(ready.envelope.report.runId, "run-child");
+	assert.equal(ready.envelope.report.sourceSequence, 1);
+	assert.deepEqual(ready.envelope.report.evidence, { kind: "worker_ready", readiness: "confirmed" });
+
+	const messageResult = await h.tools.get("ReportWorkerRun").execute("report-1", { status: "message", message: "Still working" });
+	const completedResult = await h.tools.get("ReportWorkerRun").execute("report-2", { status: "completed", result: "Implemented" });
+	assert.equal(messageResult.details.runId, "run-child");
+	assert.equal(completedResult.details.status, "completed");
+	const reports = h.writtenEnvelopes.map(({ envelope }) => envelope.report).filter(Boolean);
+	assert.deepEqual(reports.map((report) => report.sourceSequence), [1, 2, 3]);
+	assert.deepEqual(reports[1].evidence, { kind: "worker_message", message: "Still working" });
+	assert.deepEqual(reports[2].evidence, { kind: "worker_completed", result: "Implemented" });
+	assert.equal(h.entries.some((entry) => entry.data.activeRun?.sourceSequence === 3), true);
+});
+
+test("re-adopted workers apply a trusted run binding before reporting ready", async () => {
+	const h = await harness({
+		listening: true,
+		selfName: "agent-child",
+		flags: { "orchestrated-by": "boss" },
+		agents: [{ pane_id: "boss-pane", tab_id: "tab-1", name: "boss", agent: "pi" }],
+	});
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	assert.equal(h.activeTools().includes("ReportWorkerRun"), false);
+	await h.deliverInbox({
+		type: "control",
+		from: { id: "boss", paneId: "boss-pane", name: "boss", role: "orchestrator" },
+		action: "bind-run",
+		binding: { protocol: 1, runId: "run-adopted", correlationId: "dispatch-adopted" },
+		ts: Date.now(),
+	}, "bind-run.json");
+	await new Promise((resolve) => setImmediate(resolve));
+	assert.equal(h.activeTools().includes("ReportWorkerRun"), true);
+	assert.equal(h.writtenEnvelopes.length, 1);
+	assert.equal(h.writtenEnvelopes[0].envelope.report.status, "started");
+	assert.equal(h.writtenEnvelopes[0].envelope.report.runId, "run-adopted");
+});
+
+test("parent accepts trusted lifecycle reports only after custom-message persistence", async () => {
+	const runId = "run-parent";
+	const h = await harness({
+		branch: teamBranch({ workers: ["agent-scout"], meta: { "agent-scout": { paneId: "worker-pane", runId, correlationId: "dispatch-parent" } } }),
+		agents: [{ pane_id: "worker-pane", tab_id: "tab-1", name: "agent-scout", agent: "pi" }],
+	});
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	const envelope = {
+		type: "lifecycle",
+		from: { id: "agent-scout", paneId: "worker-pane", name: "agent-scout", role: "worker" },
+		report: workerReport(runId),
+		ts: Date.now(),
+	};
+	await h.deliverInbox(envelope, "report-1.json");
+	assert.equal(h.sentMessages.length, 1);
+	assert.equal(h.sentMessages[0].message.customType, "herdr-worker.lifecycle-report");
+	assert.equal(h.entries.some((entry) => entry.type === LIFECYCLE_JOURNAL_ENTRY), false);
+	assert.equal(h.events.emissions.some(({ channel }) => channel === LIFECYCLE_CHANNELS.completed), false);
+
+	h.sessionEntries.push({ type: "custom_message", ...h.sentMessages[0].message });
+	h.handlers.get("context")![0]({}, h.ctx);
+	const journal = h.entries.filter((entry) => entry.type === LIFECYCLE_JOURNAL_ENTRY);
+	assert.equal(journal.length, 1);
+	assert.equal(journal[0].data.event.runId, runId);
+	assert.equal(journal[0].data.event.correlationId, "dispatch-parent");
+	assert.deepEqual(journal[0].data.event.worker, { name: "agent-scout", paneId: "worker-pane" });
+	assert.equal(h.events.emissions.some(({ channel }) => channel === LIFECYCLE_CHANNELS.completed), true);
+
+	await h.deliverInbox(envelope, "report-duplicate.json");
+	h.sessionEntries.push({ type: "custom_message", ...h.sentMessages[1].message });
+	h.handlers.get("agent_settled")![0]({}, h.ctx);
+	assert.equal(h.entries.filter((entry) => entry.type === LIFECYCLE_JOURNAL_ENTRY).length, 1);
+});
+
+test("parent rejects untrusted and pane-mismatched lifecycle senders", async () => {
+	const runId = "run-trusted";
+	const h = await harness({
+		branch: teamBranch({ workers: ["agent-scout"], meta: { "agent-scout": { paneId: "worker-pane", runId } } }),
+		agents: [{ pane_id: "worker-pane", tab_id: "tab-1", name: "agent-scout", agent: "pi" }],
+	});
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	for (const [id, paneId] of [["stranger", "outside-pane"], ["agent-scout", "stale-pane"]]) {
+		await h.deliverInbox({
+			type: "lifecycle",
+			from: { id, paneId, role: "worker" },
+			report: workerReport(runId),
+			ts: Date.now(),
+		}, `${id}.json`);
+	}
+	assert.equal(h.sentMessages.length, 0);
+	assert.equal(h.entries.some((entry) => entry.type === LIFECYCLE_JOURNAL_ENTRY), false);
+});
+
+test("reload accepts a persisted trusted report that was not yet journaled", async () => {
+	const runId = "run-reload-report";
+	const report = workerReport(runId, { status: "failed", evidence: { kind: "worker_failed", error: "Blocked" } });
+	const sessionEntries = [{
+		type: "custom_message",
+		customType: "herdr-worker.lifecycle-report",
+		details: {
+			envelopeId: "persisted-report.json",
+			from: { id: "agent-scout", paneId: "worker-pane", name: "agent-scout", role: "worker" },
+			report,
+		},
+	}];
+	const h = await harness({
+		branch: teamBranch({ workers: ["agent-scout"], meta: { "agent-scout": { paneId: "worker-pane", runId } } }),
+		sessionEntries,
+	});
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	const lifecycle = h.entries.filter((entry) => entry.type === LIFECYCLE_JOURNAL_ENTRY);
+	assert.equal(lifecycle.length, 1);
+	assert.equal(lifecycle[0].data.event.status, "failed");
+	assert.equal(h.events.emissions.some(({ channel }) => channel === LIFECYCLE_CHANNELS.failed), true);
 });
 
 test("RPC re-adoption prefers observed cwd over a different explicit request", async () => {

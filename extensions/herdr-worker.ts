@@ -27,7 +27,16 @@ import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { createLifecycleAcceptor, type LifecycleAcceptor } from "../lifecycle/acceptor.js";
-import { LIFECYCLE_PROTOCOL_V1 } from "../lifecycle/protocol.js";
+import {
+	LIFECYCLE_PROTOCOL_V1,
+	WorkerRunReportInputSchema,
+	isWorkerRunBinding,
+	isWorkerRunReport,
+	isWorkerRunReportInput,
+	type WorkerRunBinding,
+	type WorkerRunReport,
+	type WorkerRunReportInput,
+} from "../lifecycle/protocol.js";
 import { registerWorkerRpcServer, type WorkerRpcService } from "../rpc/server.js";
 import { WorkerRpcServiceError, type InspectInput, type Inspection, type SendInput, type DeliveryReceipt, type SpawnInput, type SpawnProvenance } from "../rpc/protocol.js";
 
@@ -40,6 +49,9 @@ const STATUS_KEY = "herdr-worker";
 const META_SOURCE = "pi-herdr-worker";
 const TOOL_NAME = "SendToAgent";
 const CREATE_TOOL = "CreateAgentPanel";
+const REPORT_TOOL = "ReportWorkerRun";
+const MESSAGE_CUSTOM_TYPE = "herdr-worker.message";
+const LIFECYCLE_REPORT_CUSTOM_TYPE = "herdr-worker.lifecycle-report";
 const NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
 const RESERVED = new Set(["add", "list", "release", "from", "status", "help", "adopt", "right", "down", "left", "up"]);
 type Direction = "right" | "down" | "left" | "up";
@@ -86,6 +98,7 @@ interface State {
 	meta?: Record<string, WorkerMeta>;
 	orchestratedBy?: string; // herdr agent name or pane id
 	role?: { type?: string; purpose?: string }; // what our orchestrator said we are for
+	activeRun?: WorkerRunBinding & { sourceInstanceId: string; sourceSequence: number };
 }
 
 /** Agent types with a preferred model. Anything else defaults to the orchestrator's model. */
@@ -110,25 +123,42 @@ interface AgentInfo {
 	cwd?: string;
 }
 
-interface Envelope {
-	type: "message" | "control";
-	from: { id: string; paneId: string; name?: string; role: "orchestrator" | "worker" | "agent" };
+interface Sender {
+	id: string;
+	paneId: string;
+	name?: string;
+	role: "orchestrator" | "worker" | "agent";
+}
+interface MessageEnvelope {
+	type: "message";
+	from: Sender;
 	message: string;
 	priority: boolean;
 	ts: number;
 	runId?: string;
-	correlationId?: string;
-	// control
-	action?: "orchestrated-by" | "released" | "bind-run";
 }
+interface ControlEnvelope {
+	type: "control";
+	from: Sender;
+	action: "orchestrated-by" | "released" | "bind-run";
+	binding?: WorkerRunBinding;
+	ts: number;
+}
+interface LifecycleEnvelope {
+	type: "lifecycle";
+	from: Sender;
+	report: WorkerRunReport;
+	ts: number;
+}
+type Envelope = MessageEnvelope | ControlEnvelope | LifecycleEnvelope;
 
 // ───────────────────────── message framing ─────────────────────────
 
-function roleLabel(role: Envelope["from"]["role"]): string {
+function roleLabel(role: Sender["role"]): string {
 	return role === "orchestrator" ? "Orchestrator" : role === "worker" ? "Worker" : "Agent";
 }
 
-function frameMessage(env: Envelope): string {
+function frameMessage(env: MessageEnvelope): string {
 	const label = roleLabel(env.from.role);
 	const who = env.from.name ? `${label} "${env.from.name}" in pane ${env.from.paneId}` : `${label} in pane ${env.from.paneId}`;
 	return [
@@ -147,6 +177,7 @@ interface HerdrWorkerTestOptions {
 	disableInbox?: boolean;
 	isListening?: (paneId: string) => boolean;
 	writeEnvelope?: (paneId: string, envelope: Envelope) => void;
+	onInboxHandler?: (deliverEnvelope: (envelope: unknown, envelopeId: string) => Promise<void>) => void;
 }
 
 export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions = {}) {
@@ -245,7 +276,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		return selfInfo?.name || selfInfo?.paneId || SELF_PANE || "unknown";
 	}
 
-	function myRoleToward(targetId: string, target?: AgentInfo): Envelope["from"]["role"] {
+	function myRoleToward(targetId: string, target?: AgentInfo): Sender["role"] {
 		const ids = [targetId, target?.name, target?.paneId].filter(Boolean) as string[];
 		if (ids.some((id) => state.workers.includes(id))) return "orchestrator";
 		if (state.orchestratedBy && ids.includes(state.orchestratedBy)) return "worker";
@@ -269,6 +300,13 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		// A clone must not acquire the source session's live team authority.
 		if (found?.sessionId && found.sessionId !== ctx.sessionManager.getSessionId()) found = undefined;
 		state = found && Array.isArray(found.workers) ? structuredClone(found) : { workers: [] };
+		if (state.activeRun && (!isWorkerRunBinding(state.activeRun)
+			|| typeof state.activeRun.sourceInstanceId !== "string"
+			|| !/^[A-Za-z0-9._-]{1,128}$/.test(state.activeRun.sourceInstanceId)
+			|| !Number.isInteger(state.activeRun.sourceSequence)
+			|| state.activeRun.sourceSequence < 0)) {
+			state.activeRun = undefined;
+		}
 	}
 
 	function statusText(): string | undefined {
@@ -296,6 +334,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		const want = new Map<string, boolean>([
 			[TOOL_NAME, inTeam()],
 			[CREATE_TOOL, isOrchestrator()],
+			[REPORT_TOOL, interactive() && !!state.orchestratedBy && !!state.activeRun],
 		]);
 		let next = active.filter((t) => want.get(t) !== false);
 		for (const [tool, on] of want) if (on && !next.includes(tool)) next = [...next, tool];
@@ -365,8 +404,15 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 				if (stopped) return;
 				if (inFlightEnvelopes.has(f)) continue;
 				const full = path.join(dir, f);
-				const acknowledged = ctxRef?.sessionManager.getEntries().some((e) => e.type === "custom_message" && e.customType === "herdr-worker.message" && (e.details as { envelopeId?: string })?.envelopeId === f);
-				if (acknowledged) { fs.rmSync(full, { force: true }); continue; }
+				const acknowledgedEntry = ctxRef?.sessionManager.getEntries().find((e) => e.type === "custom_message"
+					&& (e.customType === MESSAGE_CUSTOM_TYPE || e.customType === LIFECYCLE_REPORT_CUSTOM_TYPE)
+					&& (e.details as { envelopeId?: string })?.envelopeId === f);
+				if (acknowledgedEntry) {
+					if ((acknowledgedEntry as { customType?: unknown }).customType !== LIFECYCLE_REPORT_CUSTOM_TYPE || acceptPersistedLifecycleReport(acknowledgedEntry)) {
+						fs.rmSync(full, { force: true });
+					}
+					continue;
+				}
 				let env: Envelope | undefined;
 				try {
 					env = JSON.parse(fs.readFileSync(full, "utf8"));
@@ -399,29 +445,63 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		return out;
 	}
 
-	async function deliver(env: Envelope, envelopeId: string) {
+	function acceptPersistedLifecycleReport(value: unknown): boolean {
+		const entry = value as { customType?: unknown; details?: unknown } | undefined;
+		if (entry?.customType !== LIFECYCLE_REPORT_CUSTOM_TYPE || !lifecycleAcceptor) return false;
+		const details = entry.details as { from?: Sender; report?: unknown } | undefined;
+		if (!details?.from || typeof details.from.paneId !== "string" || !isWorkerRunReport(details.report)) return true;
+		const report = details.report;
+		const record = lifecycleAcceptor.getRun(report.runId);
+		if (!record) return false;
+		if (record.worker.paneId !== details.from.paneId) return true;
+		try {
+			lifecycleAcceptor.accept({
+				...report,
+				worker: { ...record.worker },
+				source: "worker",
+				...(record.correlationId === undefined ? {} : { correlationId: record.correlationId }),
+			});
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	async function deliver(env: unknown, envelopeId: string) {
 		const ctx = ctxRef;
-		if (!env.from || typeof env.from.id !== "string" || typeof env.message !== "string") return;
+		if (!env || typeof env !== "object") return;
+		const envelope = env as Partial<Envelope> & { from?: Partial<Sender> };
+		if (!envelope.from || typeof envelope.from.id !== "string" || typeof envelope.from.paneId !== "string") return;
 		const peers = await knownPeerPanes();
 		if (stopped) return;
-		const known = env.from?.paneId ? peers.get(env.from.paneId) : undefined;
+		const known = peers.get(envelope.from.paneId);
 
-		if (env.type === "control") {
-			if (env.action === "orchestrated-by") {
+		if (envelope.type === "control") {
+			if (envelope.action === "orchestrated-by") {
 				// Adoption handshake: only while we have no orchestrator (or it is the current one re-asserting).
 				if (state.orchestratedBy && !known) {
-					ctx?.hasUI && ctx.ui.notify(`Ignored adoption request from ${env.from.id} (pane ${env.from.paneId}); already orchestrated by ${state.orchestratedBy}.`, "warning");
+					ctx?.hasUI && ctx.ui.notify(`Ignored adoption request from ${envelope.from.id} (pane ${envelope.from.paneId}); already orchestrated by ${state.orchestratedBy}.`, "warning");
 					return;
 				}
-				state.orchestratedBy = env.from.id;
+				if (state.orchestratedBy !== envelope.from.id) state.activeRun = undefined;
+				state.orchestratedBy = envelope.from.id;
 				persist();
 				updateUi();
-				ctx?.hasUI && ctx.ui.notify(`Now orchestrated by ${env.from.id}`, "info");
-			} else if (env.action === "released" && known && state.orchestratedBy === env.from.id) {
+				ctx?.hasUI && ctx.ui.notify(`Now orchestrated by ${envelope.from.id}`, "info");
+			} else if (envelope.action === "released" && known && state.orchestratedBy === envelope.from.id) {
 				state.orchestratedBy = undefined;
+				state.activeRun = undefined;
 				persist();
 				updateUi();
-				ctx?.hasUI && ctx.ui.notify(`Released by orchestrator ${env.from.id}`, "info");
+				ctx?.hasUI && ctx.ui.notify(`Released by orchestrator ${envelope.from.id}`, "info");
+			} else if (envelope.action === "bind-run"
+				&& (!state.orchestratedBy || (known && state.orchestratedBy === envelope.from.id))
+				&& isWorkerRunBinding(envelope.binding)) {
+				state.orchestratedBy ??= envelope.from.id;
+				state.activeRun = { ...envelope.binding, sourceInstanceId: randomUUID(), sourceSequence: 0 };
+				persist();
+				updateUi();
+				void reportWorkerReady().catch(() => {});
 			}
 			return;
 		}
@@ -429,16 +509,32 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		if (!known) {
 			ctx?.hasUI &&
 				ctx.ui.notify(
-					`Dropped message from unknown agent ${env.from?.id ?? "?"} (pane ${env.from?.paneId ?? "?"}). Only your orchestrator and workers may message you; use /team adopt or /orchestrated-by to allow it.`,
+					`Dropped message from unknown agent ${envelope.from.id} (pane ${envelope.from.paneId}). Only your orchestrator and workers may message you; use /team adopt or /orchestrated-by to allow it.`,
 					"warning",
 				);
 			return;
 		}
+		if (envelope.type === "lifecycle") {
+			if (!isWorkerRunReport(envelope.report)) return;
+			const record = lifecycleAcceptor?.getRun(envelope.report.runId);
+			if (!record || record.worker.paneId !== envelope.from.paneId) return;
+			inFlightEnvelopes.add(envelopeId);
+			pi.sendMessage({
+				customType: LIFECYCLE_REPORT_CUSTOM_TYPE,
+				content: `Worker ${record.worker.name} reported ${envelope.report.status} for run ${envelope.report.runId}.`,
+				display: true,
+				details: { envelopeId, from: envelope.from, report: envelope.report },
+			}, { triggerTurn: true, deliverAs: "followUp" });
+			return;
+		}
+		if (envelope.type !== "message" || typeof envelope.message !== "string" || typeof envelope.priority !== "boolean") return;
+		const messageEnvelope = envelope as MessageEnvelope;
 		inFlightEnvelopes.add(envelopeId);
 		// The mailbox is the outbox until pi actually persists this custom message.
-		pi.sendMessage({ customType: "herdr-worker.message", content: frameMessage(env), display: true,
-			details: { envelopeId, from: env.from } }, { triggerTurn: true, deliverAs: env.priority ? "steer" : "followUp" });
+		pi.sendMessage({ customType: MESSAGE_CUSTOM_TYPE, content: frameMessage(messageEnvelope), display: true,
+			details: { envelopeId, from: messageEnvelope.from } }, { triggerTurn: true, deliverAs: messageEnvelope.priority ? "steer" : "followUp" });
 	}
+	testOptions.onInboxHandler?.(deliver);
 
 	// ── sending ──
 
@@ -467,15 +563,24 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		fs.renameSync(tmp, path.join(dir, name));
 	}
 
-	async function makeEnvelope(targetId: string, target: AgentInfo | undefined, message: string, priority: boolean, extra: Partial<Envelope> = {}): Promise<Envelope> {
+	async function makeSender(targetId: string, target: AgentInfo | undefined): Promise<Sender> {
 		if (!selfInfo) await refreshSelf();
 		return {
+			id: selfId(),
+			paneId: SELF_PANE,
+			...(selfInfo?.name === undefined ? {} : { name: selfInfo.name }),
+			role: myRoleToward(targetId, target),
+		};
+	}
+
+	async function makeMessageEnvelope(targetId: string, target: AgentInfo | undefined, message: string, priority: boolean, runId?: string): Promise<MessageEnvelope> {
+		return {
 			type: "message",
-			from: { id: selfId(), paneId: SELF_PANE, name: selfInfo?.name, role: myRoleToward(targetId, target) },
+			from: await makeSender(targetId, target),
 			message,
 			priority,
 			ts: Date.now(),
-			...extra,
+			...(runId === undefined ? {} : { runId }),
 		};
 	}
 
@@ -498,7 +603,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			throw new SendServiceError("NOT_TEAM_MEMBER", "Target is not a team member.", `"${targetId}" is not in your team (it would drop the message anyway). Workers: ${state.workers.join(", ") || "(none)"}; orchestrator: ${state.orchestratedBy ?? "(none)"}. Use /team add or /team adopt first.`);
 		}
 
-		const env = await makeEnvelope(targetId, target, message, priority, runId === undefined ? {} : { runId });
+		const env = await makeMessageEnvelope(targetId, target, message, priority, runId);
 		const label = target.name ?? target.paneId;
 
 		if (target.kind === "pi" && isListening(target.paneId)) {
@@ -516,12 +621,77 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		return `Typed into ${receipt.target} (pane ${receipt.paneId}, ${receipt.kind ?? "agent"}, no inbox listener) via \`herdr agent prompt\`. Priority flag not applicable there.`;
 	}
 
-	async function sendControl(targetId: string, action: NonNullable<Envelope["action"]>, binding: { runId: string; correlationId?: string } | undefined = undefined): Promise<boolean> {
+	async function sendControl(targetId: string, action: ControlEnvelope["action"], binding: { runId: string; correlationId?: string } | undefined = undefined): Promise<boolean> {
 		const target = await agentGet(targetId);
 		if (!target || !isListening(target.paneId)) return false;
-		const env = await makeEnvelope(targetId, target, "", false, { type: "control", action, ...binding });
+		const env: ControlEnvelope = {
+			type: "control",
+			from: await makeSender(targetId, target),
+			action,
+			...(binding === undefined ? {} : { binding: { protocol: LIFECYCLE_PROTOCOL_V1, ...binding } }),
+			ts: Date.now(),
+		};
 		writeEnvelope(target.paneId, env);
 		return true;
+	}
+
+	async function sendWorkerReport(input: WorkerRunReportInput): Promise<WorkerRunReport> {
+		if (!isWorkerRunReportInput(input)) throw new Error("Invalid worker lifecycle report.");
+		const activeRun = state.activeRun;
+		if (!activeRun || !state.orchestratedBy) throw new Error("No active worker run is bound.");
+		const target = await agentGet(state.orchestratedBy);
+		if (!target || !isListening(target.paneId)) throw new Error("The orchestrator is not listening for worker lifecycle reports.");
+		const sourceSequence = activeRun.sourceSequence + 1;
+		const evidence = input.status === "message"
+			? { kind: "worker_message" as const, message: input.message }
+			: input.status === "completed"
+				? { kind: "worker_completed" as const, ...(input.result === undefined ? {} : { result: input.result }) }
+				: { kind: "worker_failed" as const, error: input.error };
+		const report = {
+			protocol: LIFECYCLE_PROTOCOL_V1,
+			eventId: randomUUID(),
+			runId: activeRun.runId,
+			sourceInstanceId: activeRun.sourceInstanceId,
+			sourceSequence,
+			observedAt: Date.now(),
+			status: input.status,
+			evidence,
+		} as WorkerRunReport;
+		state.activeRun = { ...activeRun, sourceSequence };
+		persist();
+		writeEnvelope(target.paneId, {
+			type: "lifecycle",
+			from: await makeSender(state.orchestratedBy, target),
+			report,
+			ts: Date.now(),
+		});
+		return report;
+	}
+
+	async function reportWorkerReady(): Promise<void> {
+		const activeRun = state.activeRun;
+		if (!activeRun || !state.orchestratedBy) return;
+		const target = await agentGet(state.orchestratedBy);
+		if (!target || !isListening(target.paneId)) return;
+		const sourceSequence = activeRun.sourceSequence + 1;
+		const report: WorkerRunReport = {
+			protocol: LIFECYCLE_PROTOCOL_V1,
+			eventId: randomUUID(),
+			runId: activeRun.runId,
+			sourceInstanceId: activeRun.sourceInstanceId,
+			sourceSequence,
+			observedAt: Date.now(),
+			status: "started",
+			evidence: { kind: "worker_ready", readiness: "confirmed" },
+		};
+		state.activeRun = { ...activeRun, sourceSequence };
+		persist();
+		writeEnvelope(target.paneId, {
+			type: "lifecycle",
+			from: await makeSender(state.orchestratedBy, target),
+			report,
+			ts: Date.now(),
+		});
 	}
 
 	// ── tool ──
@@ -576,6 +746,24 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			if (lines.length > shown.length) out += "\n" + theme.fg("dim", `│ … ${lines.length - shown.length} more lines`);
 			if (d.status) out += "\n" + theme.fg("dim", d.status);
 			return new Text(out, 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: REPORT_TOOL,
+		label: "Report Worker Run",
+		description: "Report an authoritative message, successful completion, or failure for the worker's currently bound assignment. Identity and ordering are supplied by the extension.",
+		promptSnippet: "Report progress or the explicit outcome of the current worker assignment",
+		promptGuidelines: [
+			"Use ReportWorkerRun for assignment-aware updates and final outcomes; do not claim completion until the assigned work is actually complete.",
+		],
+		parameters: WorkerRunReportInputSchema,
+		async execute(_id, params) {
+			const report = await sendWorkerReport(params);
+			const text = report.status === "message"
+				? "Worker message reported to the orchestrator."
+				: `Worker run reported ${report.status} to the orchestrator.`;
+			return { content: [{ type: "text", text }], details: { runId: report.runId, eventId: report.eventId, status: report.status } };
 		},
 	});
 
@@ -915,6 +1103,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 
 	async function setOrchestrator(id: string): Promise<string> {
 		if (!id) throw new Error("Usage: /orchestrated-by <agent name or pane id>");
+		if (state.orchestratedBy !== id) state.activeRun = undefined;
 		state.orchestratedBy = id;
 		persist();
 		updateUi();
@@ -1123,6 +1312,17 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			appendEntry: (customType, data) => pi.appendEntry(customType, data),
 			emit: (channel, payload) => pi.events.emit(channel, payload),
 		});
+		for (const name of state.workers) {
+			const meta = state.meta?.[name];
+			if (!meta?.runId || !meta.paneId) continue;
+			lifecycleAcceptor.bindRun({
+				runId: meta.runId,
+				...(meta.correlationId === undefined ? {} : { correlationId: meta.correlationId }),
+				worker: { name, paneId: meta.paneId },
+				...(meta.requestId === undefined ? {} : { requestId: meta.requestId }),
+				...(meta.providerInstanceId === undefined ? {} : { providerInstanceId: meta.providerInstanceId }),
+			});
+		}
 		if (!interactive()) {
 			state = { workers: [] };
 			syncTool(); // no herdr -> no team -> no tool
@@ -1131,6 +1331,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		await refreshSelf();
 
 		const flag = pi.getFlag("orchestrated-by");
+		let shouldReportReady = false;
 		if (typeof flag === "string" && flag && event.reason === "startup" && !state.orchestratedBy) {
 			state.orchestratedBy = flag;
 			const role = pi.getFlag("team-role");
@@ -1140,16 +1341,30 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			}
 			persist();
 		}
+		const runFlag = pi.getFlag("worker-run-id");
+		const correlationFlag = pi.getFlag("worker-correlation-id");
+		const startupBinding = {
+			protocol: LIFECYCLE_PROTOCOL_V1,
+			runId: runFlag,
+			...(typeof correlationFlag === "string" ? { correlationId: correlationFlag } : {}),
+		};
+		if (event.reason === "startup" && state.orchestratedBy && isWorkerRunBinding(startupBinding)) {
+			state.activeRun = { ...startupBinding, sourceInstanceId: randomUUID(), sourceSequence: 0 };
+			shouldReportReady = true;
+			persist();
+		}
 
 		startListening();
 		updateUi(); // also gates the SendToAgent tool
+		for (const entry of ctx.sessionManager.getEntries()) acceptPersistedLifecycleReport(entry);
+		if (shouldReportReady) await reportWorkerReady().catch(() => {});
 	});
 
 	function acknowledgePersistedInbox(ctx: ExtensionContext) {
-		if (!inFlightEnvelopes.size) return;
 		// message_end precedes persistence; only acknowledge records actually in SessionManager.
 		for (const entry of ctx.sessionManager.getEntries()) {
-			if (entry.type !== "custom_message" || entry.customType !== "herdr-worker.message") continue;
+			if (entry.type !== "custom_message" || (entry.customType !== MESSAGE_CUSTOM_TYPE && entry.customType !== LIFECYCLE_REPORT_CUSTOM_TYPE)) continue;
+			if (entry.customType === LIFECYCLE_REPORT_CUSTOM_TYPE && !acceptPersistedLifecycleReport(entry)) continue;
 			const id = (entry.details as { envelopeId?: string })?.envelopeId;
 			if (id && inFlightEnvelopes.delete(id) && /^[a-zA-Z0-9_.-]+\.json$/.test(id)) {
 				try { fs.rmSync(path.join(inboxDir(SELF_PANE), id), { force: true }); } catch {}

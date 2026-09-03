@@ -176,6 +176,30 @@ test("restores all current-session journal entries without replay publication", 
 	assert.equal(next.accepted && next.event.acceptedSequence, 2);
 });
 
+test("accepts informational worker messages after settlement without changing terminal status", () => {
+	const h = setup();
+	h.acceptor.bindRun(binding);
+	assert.equal(h.acceptor.accept(candidate({
+		eventId: "event-completed",
+		sourceInstanceId: "worker-1",
+		sourceSequence: 1,
+		source: "worker",
+		status: "completed",
+		evidence: { kind: "worker_completed", result: "Done" },
+	})).accepted, true);
+	const message = h.acceptor.accept(candidate({
+		eventId: "event-final-note",
+		sourceInstanceId: "worker-1",
+		sourceSequence: 2,
+		source: "worker",
+		status: "message",
+		evidence: { kind: "worker_message", message: "Artifacts are in the workspace" },
+	}));
+	assert.equal(message.accepted, true);
+	assert.equal(h.acceptor.getRun(binding.runId)?.status, "completed");
+	assert.equal(h.acceptor.getRun(binding.runId)?.acceptedSequence, 2);
+});
+
 test("isolates subscriber failures and preserves later delivery", async () => {
 	const bus = new FakeIsolatedEventBus();
 	const delivered: string[] = [];
