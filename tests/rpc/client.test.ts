@@ -5,7 +5,7 @@ import { CHANNELS, failure, replyChannel, success } from "../../rpc/protocol.js"
 import { FakeEventBus } from "../support/fake-event-bus.js";
 
 const provider = { protocol: 1 as const, provider: "herdr" as const, providerInstanceId: "provider", available: true as const, capabilities: [], constraints: { requiresHerdrPane: true as const, requiresInteractivePi: true as const } };
-const workerReference = { name: "worker", paneId: "%1", cwd: "/tmp", adopted: false };
+const workerReference = { runId: "run-1", name: "worker", paneId: "%1", cwd: "/tmp", adopted: false };
 const deliveryReceipt = { target: "worker", paneId: "%1", transport: "inbox" as const, requestedMode: "follow-up" as const, priorityApplied: false };
 const inspection = { name: "worker", paneId: "%1", relationship: "worker" as const, managedBySession: true };
 
@@ -266,7 +266,7 @@ test("addressed operations validate every successful result shape", async () => 
 
 test("malformed addressed successes reject without exposing provider data and clean up", async () => {
   const malformedCases = [
-    { operation: "spawn", result: { ...workerReference, adopted: "secret-spawn" } },
+    { operation: "spawn", result: { ...workerReference, runId: "unsafe/secret-spawn" } },
     { operation: "send", result: { ...deliveryReceipt, transport: "secret-send" } },
     { operation: "inspect", result: { ...inspection, relationship: "secret-inspect" } },
   ] as const;
@@ -306,18 +306,33 @@ test("stop rejects an unexpected success as an invalid response", async () => {
   assert.equal(events.listenerCount(), 1);
 });
 
-test("spawn forwards direction and thinking in the addressed request", async () => {
+test("spawn forwards correlation and options in the addressed request", async () => {
   const events = new FakeEventBus();
   events.on(CHANNELS.spawn, (payload) => {
     const request = payload as Record<string, unknown> & { requestId: string };
     assert.equal(request.direction, "down");
     assert.equal(request.thinking, "xhigh");
-    events.emit(replyChannel(CHANNELS.spawn, request.requestId), success(request.requestId, { name: "agent-test", paneId: "%1", cwd: "/tmp", adopted: false }));
+    assert.equal(request.correlationId, "dispatch-1");
+    events.emit(replyChannel(CHANNELS.spawn, request.requestId), success(request.requestId, { runId: "run-1", correlationId: "dispatch-1", name: "agent-test", paneId: "%1", cwd: "/tmp", adopted: false }));
   });
   const result = await createWorkerRpcClient({ events, createRequestId: () => "spawn-options" }).spawn(
-    { name: "test", direction: "down", thinking: "xhigh" }, provider,
+    { name: "test", direction: "down", thinking: "xhigh", correlationId: "dispatch-1" }, provider,
   );
   assert.equal(result.name, "agent-test");
+  assert.equal(result.runId, "run-1");
+  assert.equal(result.correlationId, "dispatch-1");
+});
+
+test("send carries an explicit run association in the addressed request", async () => {
+  const events = new FakeEventBus();
+  events.on(CHANNELS.send, (payload) => {
+    const request = payload as Record<string, unknown> & { requestId: string };
+    assert.equal(request.runId, "run-1");
+    events.emit(replyChannel(CHANNELS.send, request.requestId), success(request.requestId, deliveryReceipt));
+  });
+  await createWorkerRpcClient({ events, createRequestId: () => "send-run" }).send(
+    { runId: "run-1", target: "worker", message: "hello" }, provider,
+  );
 });
 
 test("timeout, abort, server error, and emit failure clean up", async () => {

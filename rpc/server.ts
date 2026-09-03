@@ -19,12 +19,13 @@ import {
   type SendInput,
   type DeliveryReceipt,
   type SpawnInput,
+  type SpawnProvenance,
   type WorkerReference,
   WorkerRpcServiceError,
 } from "./protocol.js";
 
 export interface WorkerRpcService {
-  spawn(input: SpawnInput, signal?: AbortSignal): Promise<WorkerReference>;
+  spawn(input: SpawnInput, provenance: SpawnProvenance, signal?: AbortSignal): Promise<WorkerReference>;
   send(input: SendInput, signal?: AbortSignal): Promise<DeliveryReceipt>;
   inspect(input: InspectInput, signal?: AbortSignal): Promise<Inspection>;
 }
@@ -101,6 +102,7 @@ export function registerWorkerRpcServer(options: WorkerRpcServerOptions): Worker
       if (channel === CHANNELS.spawn) {
         const input = request as unknown as SpawnInput;
         data = await options.service.spawn({
+          ...(input.correlationId === undefined ? {} : { correlationId: input.correlationId }),
           ...(input.name === undefined ? {} : { name: input.name }),
           ...(input.direction === undefined ? {} : { direction: input.direction }),
           ...(input.model === undefined ? {} : { model: input.model }),
@@ -109,10 +111,11 @@ export function registerWorkerRpcServer(options: WorkerRpcServerOptions): Worker
           ...(input.purpose === undefined ? {} : { purpose: input.purpose }),
           ...(input.cwd === undefined ? {} : { cwd: input.cwd }),
           ...(input.initialPrompt === undefined ? {} : { initialPrompt: input.initialPrompt }),
-        });
+        }, { requestId, providerInstanceId });
       } else if (channel === CHANNELS.send) {
         const input = request as unknown as SendInput;
         data = await options.service.send({
+          ...(input.runId === undefined ? {} : { runId: input.runId }),
           target: input.target,
           message: input.message,
           ...(input.mode === undefined ? {} : { mode: input.mode }),

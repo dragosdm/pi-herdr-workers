@@ -21,12 +21,13 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { registerWorkerRpcServer, type WorkerRpcService } from "../rpc/server.js";
-import { WorkerRpcServiceError, type InspectInput, type Inspection, type SendInput, type DeliveryReceipt, type SpawnInput } from "../rpc/protocol.js";
+import { WorkerRpcServiceError, type InspectInput, type Inspection, type SendInput, type DeliveryReceipt, type SpawnInput, type SpawnProvenance } from "../rpc/protocol.js";
 
 // ───────────────────────── herdr env ─────────────────────────
 
@@ -69,6 +70,10 @@ interface WorkerMeta {
 	purpose?: string; // free text, e.g. "explore only, never edit files"
 	model?: string; // provider/id
 	paneId?: string;
+	runId?: string;
+	correlationId?: string;
+	requestId?: string;
+	providerInstanceId?: string;
 }
 
 interface State {
@@ -109,8 +114,10 @@ interface Envelope {
 	message: string;
 	priority: boolean;
 	ts: number;
+	runId?: string;
+	correlationId?: string;
 	// control
-	action?: "orchestrated-by" | "released";
+	action?: "orchestrated-by" | "released" | "bind-run";
 }
 
 // ───────────────────────── message framing ─────────────────────────
@@ -166,6 +173,14 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	});
 	pi.registerFlag("team-role", {
 		description: "Herdr worker: '<type>: <purpose>' describing what this worker is for (set by the orchestrator)",
+		type: "string",
+	});
+	pi.registerFlag("worker-run-id", {
+		description: "Herdr worker: internal assignment run identity",
+		type: "string",
+	});
+	pi.registerFlag("worker-correlation-id", {
+		description: "Herdr worker: internal caller correlation identity",
 		type: "string",
 	});
 
@@ -466,7 +481,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		}
 	}
 
-	async function send(targetId: string, message: string, priority: boolean, signal?: AbortSignal): Promise<DeliveryReceipt> {
+	async function send(targetId: string, message: string, priority: boolean, signal?: AbortSignal, runId?: string): Promise<DeliveryReceipt> {
 		if (!HERDR_ENV) throw new Error("Not running inside herdr (HERDR_ENV != 1); SendToAgent is unavailable.");
 		const target = await agentGet(targetId);
 		if (!target) {
@@ -479,7 +494,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			throw new SendServiceError("NOT_TEAM_MEMBER", "Target is not a team member.", `"${targetId}" is not in your team (it would drop the message anyway). Workers: ${state.workers.join(", ") || "(none)"}; orchestrator: ${state.orchestratedBy ?? "(none)"}. Use /team add or /team adopt first.`);
 		}
 
-		const env = await makeEnvelope(targetId, target, message, priority);
+		const env = await makeEnvelope(targetId, target, message, priority, runId === undefined ? {} : { runId });
 		const label = target.name ?? target.paneId;
 
 		if (target.kind === "pi" && isListening(target.paneId)) {
@@ -497,10 +512,10 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		return `Typed into ${receipt.target} (pane ${receipt.paneId}, ${receipt.kind ?? "agent"}, no inbox listener) via \`herdr agent prompt\`. Priority flag not applicable there.`;
 	}
 
-	async function sendControl(targetId: string, action: NonNullable<Envelope["action"]>): Promise<boolean> {
+	async function sendControl(targetId: string, action: NonNullable<Envelope["action"]>, binding: { runId: string; correlationId?: string } | undefined = undefined): Promise<boolean> {
 		const target = await agentGet(targetId);
 		if (!target || !isListening(target.paneId)) return false;
-		const env = await makeEnvelope(targetId, target, "", false, { type: "control", action });
+		const env = await makeEnvelope(targetId, target, "", false, { type: "control", action, ...binding });
 		writeEnvelope(target.paneId, env);
 		return true;
 	}
@@ -645,6 +660,9 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	}
 
 	interface CreateOpts {
+		runId: string;
+		correlationId?: string;
+		provenance?: SpawnProvenance;
 		name?: string;
 		direction?: Direction;
 		type?: string;
@@ -654,6 +672,8 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		initialPrompt?: string;
 	}
 	interface CreateResult {
+		runId: string;
+		correlationId?: string;
 		name: string;
 		paneId: string;
 		model?: string;
@@ -669,7 +689,6 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		const dir: Direction = opts.direction ?? "right";
 		const type = opts.type?.trim().toLowerCase() || undefined;
 		const requested = (opts.name?.trim() || type || "").toLowerCase();
-		if (requested && (!NAME_RE.test(requested) || RESERVED.has(requested))) throw new Error(`Invalid worker name "${requested}" (use [a-z][a-z0-9_-]{0,31}; not ${[...RESERVED].join("/")})`);
 		const model = opts.model?.trim() || (type && TYPE_MODELS[type]) || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
 
 		await refreshSelf();
@@ -688,9 +707,20 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			const existing = await agentGet(wanted);
 			if (existing && existing.paneId !== SELF_PANE && existing.tabId === SELF_TAB && !state.workers.includes(wanted)) {
 				await adopt(wanted);
-				if (opts.initialPrompt) await send(wanted, opts.initialPrompt, false);
+				const priorMeta = state.meta?.[wanted];
+				state.meta = { ...(state.meta ?? {}), [wanted]: {
+					...priorMeta,
+					paneId: existing.paneId,
+					runId: opts.runId,
+					correlationId: opts.correlationId,
+					requestId: opts.provenance?.requestId,
+					providerInstanceId: opts.provenance?.providerInstanceId,
+				} };
+				persist();
+				await sendControl(wanted, "bind-run", { runId: opts.runId, ...(opts.correlationId === undefined ? {} : { correlationId: opts.correlationId }) });
+				if (opts.initialPrompt) await send(wanted, opts.initialPrompt, false, undefined, opts.runId);
 				const meta = state.meta?.[wanted];
-				return { name: wanted, paneId: existing.paneId, model: meta?.model, type: meta?.type, purpose: meta?.purpose, cwd: existing.cwd?.trim() ? existing.cwd : cwd, how: "re-adopted existing pane", adopted: true };
+				return { runId: opts.runId, correlationId: opts.correlationId, name: wanted, paneId: existing.paneId, model: meta?.model, type: meta?.type, purpose: meta?.purpose, cwd: existing.cwd?.trim() ? existing.cwd : cwd, how: "re-adopted existing pane", adopted: true };
 			}
 		}
 		const name = await uniqueName(requested);
@@ -706,7 +736,8 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		}
 
 		await new Promise((r) => setTimeout(r, 1200)); // let the shell come up
-		const piArgs = ["--orchestrated-by", me];
+		const piArgs = ["--orchestrated-by", me, "--worker-run-id", opts.runId];
+		if (opts.correlationId) piArgs.push("--worker-correlation-id", opts.correlationId);
 		if (model) piArgs.push("--model", opts.thinking ? `${model}:${opts.thinking}` : model);
 		const role = [type, opts.purpose?.trim()].filter(Boolean).join(": ");
 		if (role) piArgs.push("--team-role", role);
@@ -718,16 +749,25 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		}
 
 		if (!state.workers.includes(name)) state.workers.push(name);
-		state.meta = { ...(state.meta ?? {}), [name]: { type, purpose: opts.purpose?.trim() || undefined, model, paneId } };
+		state.meta = { ...(state.meta ?? {}), [name]: {
+			type,
+			purpose: opts.purpose?.trim() || undefined,
+			model,
+			paneId,
+			runId: opts.runId,
+			correlationId: opts.correlationId,
+			requestId: opts.provenance?.requestId,
+			providerInstanceId: opts.provenance?.providerInstanceId,
+		} };
 		persist();
 		updateUi();
 
 		if (opts.initialPrompt?.trim()) {
 			// Wait for the worker's extension to come up and register its inbox, then hand over the brief.
 			for (let i = 0; i < 20 && !isListening(paneId); i++) await new Promise((r) => setTimeout(r, 500));
-			await send(name, opts.initialPrompt, false);
+			await send(name, opts.initialPrompt, false, undefined, opts.runId);
 		}
-		return { name, paneId, model, type, purpose: opts.purpose?.trim() || undefined, cwd, how: target.how, adopted: false };
+		return { runId: opts.runId, correlationId: opts.correlationId, name, paneId, model, type, purpose: opts.purpose?.trim() || undefined, cwd, how: target.how, adopted: false };
 	}
 
 	function validateSpawnCwd(value: string): string {
@@ -744,11 +784,14 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	}
 
 	type SpawnOptions = SpawnInput;
-	async function spawnWorker(input: SpawnOptions, signal?: AbortSignal): Promise<CreateResult> {
+	async function spawnWorker(input: SpawnOptions, signal?: AbortSignal, provenance?: SpawnProvenance): Promise<CreateResult> {
 			const ctx = ctxRef;
 			if (!ctx) throw new Error("Session is not ready.");
 			const cwd = validateSpawnCwd(input.cwd ?? ctx.cwd);
+			const requested = (input.name?.trim() || input.type?.trim() || "").toLowerCase();
+			if (requested && (!NAME_RE.test(requested) || RESERVED.has(requested))) throw new Error(`Invalid worker name "${requested}" (use [a-z][a-z0-9_-]{0,31}; not ${[...RESERVED].join("/")})`);
 			signal?.throwIfAborted();
+			const runId = randomUUID();
 			if (!state.orchestratedBy && !state.teamMode) {
 				state.teamMode = true;
 				persist();
@@ -756,16 +799,18 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			}
 			const pending = createQueue.then(() => {
 				signal?.throwIfAborted();
-				return createAgent({ name: input.name, direction: input.direction, model: input.model, type: input.type, purpose: input.purpose, thinking: input.thinking, initialPrompt: input.initialPrompt }, ctx, cwd);
+				return createAgent({ runId, correlationId: input.correlationId, provenance, name: input.name, direction: input.direction, model: input.model, type: input.type, purpose: input.purpose, thinking: input.thinking, initialPrompt: input.initialPrompt }, ctx, cwd);
 			});
 			createQueue = pending.then(() => {}, () => {});
 			const result = await pending;
 			return result;
 	}
 	const service: WorkerRpcService = {
-		async spawn(input, signal) {
-			const result = await spawnWorker(input, signal);
+		async spawn(input, provenance, signal) {
+			const result = await spawnWorker(input, signal, provenance);
 			return {
+				runId: result.runId,
+				...(result.correlationId === undefined ? {} : { correlationId: result.correlationId }),
 				name: result.name,
 				paneId: result.paneId,
 				cwd: result.cwd,
@@ -777,7 +822,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		},
 		async send(input: SendInput, signal?: AbortSignal): Promise<DeliveryReceipt> {
 			const priority = input.mode === undefined ? input.priority ?? false : input.mode === "steer";
-			return send(input.target, input.message, priority, signal);
+			return send(input.target, input.message, priority, signal, input.runId);
 		},
 		async inspect(input: InspectInput, signal?: AbortSignal): Promise<Inspection> {
 			const target = input.target;

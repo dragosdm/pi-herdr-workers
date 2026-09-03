@@ -114,8 +114,12 @@ test("RPC spawn validates cwd before side effects, activates team mode, and retu
 	assert.equal(h.entries.length, 0);
 
 	const spawned = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, "spawn", { requestId: "spawn", providerInstanceId, protocol: 1, name: "scout" });
-	assert.deepEqual(spawned.success && spawned.data, { name: "agent-scout", paneId: "worker-pane", cwd: "/tmp", adopted: true });
+	assert.equal(spawned.success, true);
+	if (!spawned.success) return;
+	assert.match(spawned.data.runId, /^[0-9a-f-]{36}$/);
+	assert.deepEqual({ ...spawned.data, runId: "<run>" }, { runId: "<run>", name: "agent-scout", paneId: "worker-pane", cwd: "/tmp", adopted: true });
 	assert.equal(h.entries.some((entry) => entry.data.teamMode === true), true);
+	assert.equal(h.entries.some((entry) => entry.data.meta?.["agent-scout"]?.runId === spawned.data.runId), true);
 	assert.equal(h.activeTools().includes("CreateAgentPanel"), true);
 });
 
@@ -127,6 +131,27 @@ test("CreateAgentPanel preserves parameter mapping through the shared spawn faca
 	assert.match(result.content[0].text, /Worker agent-scout ready in pane worker-pane/);
 	assert.equal(result.details.adopted, true);
 	assert.equal(result.details.cwd, "/workspace/live");
+	assert.match(result.details.runId, /^[0-9a-f-]{36}$/);
+});
+
+test("re-adoption sends the run binding before its assignment prompt", async () => {
+	const h = await harness({ listening: true });
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	const probe = await emitForReply<any>(h.events, CHANNELS.probe, "binding-probe", { requestId: "binding-probe", supportedProtocols: [1] });
+	const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
+	const spawned = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, "binding", {
+		requestId: "binding", providerInstanceId, protocol: 1, correlationId: "dispatch-1", name: "scout", initialPrompt: "Map the code",
+	});
+	assert.equal(spawned.success, true);
+	if (!spawned.success) return;
+	assert.equal(spawned.data.correlationId, "dispatch-1");
+	const bindingIndex = h.writtenEnvelopes.findIndex(({ envelope }) => envelope.type === "control" && envelope.action === "bind-run");
+	const promptIndex = h.writtenEnvelopes.findIndex(({ envelope }) => envelope.type === "message" && envelope.message === "Map the code");
+	assert.ok(bindingIndex >= 0);
+	assert.ok(promptIndex > bindingIndex);
+	assert.equal(h.writtenEnvelopes[bindingIndex].envelope.runId, spawned.data.runId);
+	assert.equal(h.writtenEnvelopes[bindingIndex].envelope.correlationId, "dispatch-1");
+	assert.equal(h.writtenEnvelopes[promptIndex].envelope.runId, spawned.data.runId);
 });
 
 test("RPC re-adoption prefers observed cwd over a different explicit request", async () => {
@@ -200,6 +225,28 @@ test("RPC direction and thinking reach the canonical creation sequence", async (
 	const start = h.execCalls.find((args) => args[0] === "agent" && args[1] === "start");
 	assert.ok(start);
 	assert.equal(start.includes("test/model:high"), true);
+	assert.equal(start.includes("--worker-run-id"), true);
+	assert.equal(start[start.indexOf("--worker-run-id") + 1], spawned.success ? spawned.data.runId : undefined);
+});
+
+test("new workers receive RPC correlation with the generated run identity", async () => {
+	const h = await harness();
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	const probe = await emitForReply<any>(h.events, CHANNELS.probe, "correlation-probe", { requestId: "correlation-probe", supportedProtocols: [1] });
+	const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
+	const spawned = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, "correlation", {
+		requestId: "correlation", providerInstanceId, protocol: 1, correlationId: "dispatch-new", name: "builder",
+	});
+	assert.equal(spawned.success, true);
+	if (!spawned.success) return;
+	const start = h.execCalls.find((args) => args[0] === "agent" && args[1] === "start");
+	assert.ok(start);
+	assert.equal(start[start.indexOf("--worker-run-id") + 1], spawned.data.runId);
+	assert.equal(start[start.indexOf("--worker-correlation-id") + 1], "dispatch-new");
+	const team = [...h.entries].reverse().find((entry) => entry.data.meta?.["agent-builder"]);
+	assert.equal(team?.data.meta["agent-builder"].runId, spawned.data.runId);
+	assert.equal(team?.data.meta["agent-builder"].requestId, "correlation");
+	assert.equal(team?.data.meta["agent-builder"].providerInstanceId, providerInstanceId);
 });
 
 test("RPC inspect projects worker and orchestrator facts from authorized relationships", async () => {
