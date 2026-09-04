@@ -6,7 +6,7 @@ import { FakeEventBus } from "../support/fake-event-bus.js";
 
 function service(overrides: Partial<WorkerRpcService> = {}): WorkerRpcService {
   return {
-    spawn: async () => ({ name: "worker", paneId: "%1", cwd: "/tmp", adopted: false }),
+    spawn: async () => ({ runId: "run-1", name: "worker", paneId: "%1", cwd: "/tmp", adopted: false }),
     send: async () => ({ target: "worker", paneId: "%1", transport: "inbox", requestedMode: "follow-up", priorityApplied: false }),
     inspect: async () => ({ name: "worker", paneId: "%1", relationship: "worker", managedBySession: true }),
     ...overrides,
@@ -51,7 +51,7 @@ test("oversized UTF-8 fields are rejected before service dispatch", async () => 
   registerWorkerRpcServer({
     events,
     service: service({
-      spawn: async () => { spawnCalls++; return { name: "worker", paneId: "%1", cwd: "/tmp", adopted: false }; },
+      spawn: async () => { spawnCalls++; return { runId: "run-1", name: "worker", paneId: "%1", cwd: "/tmp", adopted: false }; },
       send: async () => { sendCalls++; return { target: "worker", paneId: "%1", transport: "inbox", requestedMode: "follow-up", priorityApplied: false }; },
     }),
     getProviderState: () => ({ available: true }),
@@ -87,7 +87,7 @@ test("malformed generated and service results become fixed internal errors", asy
   registerWorkerRpcServer({
     events,
     service: service({
-      spawn: async () => ({ name: "worker", paneId: "%1", cwd: "/tmp", adopted: "private" } as never),
+      spawn: async () => ({ runId: "private/run", name: "worker", paneId: "%1", cwd: "/tmp", adopted: false } as never),
       send: async () => ({ target: "worker", paneId: "%1", transport: "private", requestedMode: "steer", priorityApplied: true } as never),
       inspect: async () => ({ name: "worker", paneId: "%1", relationship: "private", managedBySession: true } as never),
     }),
@@ -125,20 +125,21 @@ test("addressed spawn forwards bounded input once and returns worker facts", asy
   let calls = 0;
   registerWorkerRpcServer({
     events,
-    service: service({ spawn: async (input) => {
+    service: service({ spawn: async (input, provenance) => {
       calls++;
-      assert.deepEqual(input, { name: "scout", direction: "left", cwd: "/workspace", thinking: "high", initialPrompt: "Investigate" });
-      return { name: "agent-scout", paneId: "%2", cwd: "/workspace", model: "test/model", type: "explore", purpose: "Investigate", adopted: false };
+      assert.deepEqual(input, { correlationId: "dispatch-1", name: "scout", direction: "left", cwd: "/workspace", thinking: "high", initialPrompt: "Investigate" });
+      assert.deepEqual(provenance, { requestId: "spawn", providerInstanceId: "instance" });
+      return { runId: "run-1", correlationId: "dispatch-1", name: "agent-scout", paneId: "%2", cwd: "/workspace", model: "test/model", type: "explore", purpose: "Investigate", adopted: false };
     } }),
     getProviderState: () => ({ available: true }),
     createInstanceId: () => "instance",
   });
   let reply: RpcReply | undefined;
   events.on(replyChannel(CHANNELS.spawn, "spawn"), (payload) => { reply = payload as RpcReply; });
-  events.emit(CHANNELS.spawn, { requestId: "spawn", providerInstanceId: "instance", protocol: 1, name: "scout", direction: "left", cwd: "/workspace", thinking: "high", initialPrompt: "Investigate", future: true });
+  events.emit(CHANNELS.spawn, { requestId: "spawn", providerInstanceId: "instance", protocol: 1, correlationId: "dispatch-1", name: "scout", direction: "left", cwd: "/workspace", thinking: "high", initialPrompt: "Investigate", future: true });
   await flush();
   assert.equal(calls, 1);
-  assert.deepEqual(reply, { requestId: "spawn", protocol: 1, success: true, data: { name: "agent-scout", paneId: "%2", cwd: "/workspace", model: "test/model", type: "explore", purpose: "Investigate", adopted: false } });
+  assert.deepEqual(reply, { requestId: "spawn", protocol: 1, success: true, data: { runId: "run-1", correlationId: "dispatch-1", name: "agent-scout", paneId: "%2", cwd: "/workspace", model: "test/model", type: "explore", purpose: "Investigate", adopted: false } });
 });
 
 test("send validates before delegation and returns typed transport facts", async () => {
@@ -158,12 +159,12 @@ test("send validates before delegation and returns typed transport facts", async
   const replies: RpcReply[] = [];
   for (const id of ["invalid-send", "steer", "follow-up"]) events.on(replyChannel(CHANNELS.send, id), (payload) => { replies.push(payload as RpcReply); });
   events.emit(CHANNELS.send, { requestId: "invalid-send", providerInstanceId: "instance", protocol: 1, target: "worker", message: "" });
-  events.emit(CHANNELS.send, { requestId: "steer", providerInstanceId: "instance", protocol: 1, target: "worker", message: "private steer body", mode: "steer" });
+  events.emit(CHANNELS.send, { requestId: "steer", providerInstanceId: "instance", protocol: 1, runId: "run-1", target: "worker", message: "private steer body", mode: "steer" });
   events.emit(CHANNELS.send, { requestId: "follow-up", providerInstanceId: "instance", protocol: 1, target: "worker", message: "private follow-up body", priority: false });
   await flush();
   assert.equal(inputs.length, 2);
   assert.deepEqual(inputs, [
-    { target: "worker", message: "private steer body", mode: "steer" },
+    { runId: "run-1", target: "worker", message: "private steer body", mode: "steer" },
     { target: "worker", message: "private follow-up body", priority: false },
   ]);
   assert.equal(replies[0].success, false);

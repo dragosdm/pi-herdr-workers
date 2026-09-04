@@ -23,8 +23,12 @@ test("request schemas enforce identifiers, limits, and unique protocols", () => 
   assert.equal(Check(SendRequestSchema, {
     requestId: "r", providerInstanceId: "p", protocol: 1, target: "worker", message: "x".repeat(LIMITS.message + 1),
   }), false);
+  assert.equal(Check(SendRequestSchema, { ...addressed, runId: "run-1", target: "worker", message: "hello" }), true);
+  assert.equal(Check(SendRequestSchema, { ...addressed, runId: "unsafe/id", target: "worker", message: "hello" }), false);
   const spawnBase = { requestId: "r", providerInstanceId: "p", protocol: 1 };
   assert.equal(Check(SpawnRequestSchema, { ...spawnBase, direction: "left", thinking: "xhigh" }), true);
+  assert.equal(Check(SpawnRequestSchema, { ...spawnBase, correlationId: "dispatch-1" }), true);
+  assert.equal(Check(SpawnRequestSchema, { ...spawnBase, correlationId: "unsafe/id" }), false);
   assert.equal(Check(SpawnRequestSchema, { ...spawnBase, direction: "diagonal" }), false);
   assert.equal(Check(SpawnRequestSchema, { ...spawnBase, thinking: "unlimited" }), false);
 });
@@ -109,8 +113,8 @@ test("result schemas validate complete shapes and accept unknown fields", () => 
   const results = [
     {
       schema: WorkerReferenceSchema,
-      valid: { name: "worker", paneId: "%1", cwd: "/tmp", adopted: false, future: true },
-      invalid: { name: "worker", paneId: "%1", cwd: "/tmp", adopted: "no" },
+      valid: { runId: "run-1", correlationId: "dispatch-1", name: "worker", paneId: "%1", cwd: "/tmp", adopted: false, future: true },
+      invalid: { name: "worker", paneId: "%1", cwd: "/tmp", adopted: false },
     },
     {
       schema: DeliveryReceiptSchema,

@@ -21,12 +21,24 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
+import { createLifecycleAcceptor, type LifecycleAcceptor } from "../lifecycle/acceptor.js";
+import {
+	LIFECYCLE_PROTOCOL_V1,
+	WorkerRunReportInputSchema,
+	isWorkerRunBinding,
+	isWorkerRunReport,
+	isWorkerRunReportInput,
+	type WorkerRunBinding,
+	type WorkerRunReport,
+	type WorkerRunReportInput,
+} from "../lifecycle/protocol.js";
 import { registerWorkerRpcServer, type WorkerRpcService } from "../rpc/server.js";
-import { WorkerRpcServiceError, type InspectInput, type Inspection, type SendInput, type DeliveryReceipt, type SpawnInput } from "../rpc/protocol.js";
+import { WorkerRpcServiceError, type InspectInput, type Inspection, type SendInput, type DeliveryReceipt, type SpawnInput, type SpawnProvenance } from "../rpc/protocol.js";
 
 // ───────────────────────── herdr env ─────────────────────────
 
@@ -37,6 +49,9 @@ const STATUS_KEY = "herdr-worker";
 const META_SOURCE = "pi-herdr-worker";
 const TOOL_NAME = "SendToAgent";
 const CREATE_TOOL = "CreateAgentPanel";
+const REPORT_TOOL = "ReportWorkerRun";
+const MESSAGE_CUSTOM_TYPE = "herdr-worker.message";
+const LIFECYCLE_REPORT_CUSTOM_TYPE = "herdr-worker.lifecycle-report";
 const NAME_RE = /^[a-z][a-z0-9_-]{0,31}$/;
 const RESERVED = new Set(["add", "list", "release", "from", "status", "help", "adopt", "right", "down", "left", "up"]);
 type Direction = "right" | "down" | "left" | "up";
@@ -69,6 +84,10 @@ interface WorkerMeta {
 	purpose?: string; // free text, e.g. "explore only, never edit files"
 	model?: string; // provider/id
 	paneId?: string;
+	runId?: string;
+	correlationId?: string;
+	requestId?: string;
+	providerInstanceId?: string;
 }
 
 interface State {
@@ -79,6 +98,7 @@ interface State {
 	meta?: Record<string, WorkerMeta>;
 	orchestratedBy?: string; // herdr agent name or pane id
 	role?: { type?: string; purpose?: string }; // what our orchestrator said we are for
+	activeRun?: WorkerRunBinding & { sourceInstanceId: string; sourceSequence: number };
 }
 
 /** Agent types with a preferred model. Anything else defaults to the orchestrator's model. */
@@ -103,23 +123,42 @@ interface AgentInfo {
 	cwd?: string;
 }
 
-interface Envelope {
-	type: "message" | "control";
-	from: { id: string; paneId: string; name?: string; role: "orchestrator" | "worker" | "agent" };
+interface Sender {
+	id: string;
+	paneId: string;
+	name?: string;
+	role: "orchestrator" | "worker" | "agent";
+}
+interface MessageEnvelope {
+	type: "message";
+	from: Sender;
 	message: string;
 	priority: boolean;
 	ts: number;
-	// control
-	action?: "orchestrated-by" | "released";
+	runId?: string;
 }
+interface ControlEnvelope {
+	type: "control";
+	from: Sender;
+	action: "orchestrated-by" | "released" | "bind-run";
+	binding?: WorkerRunBinding;
+	ts: number;
+}
+interface LifecycleEnvelope {
+	type: "lifecycle";
+	from: Sender;
+	report: WorkerRunReport;
+	ts: number;
+}
+type Envelope = MessageEnvelope | ControlEnvelope | LifecycleEnvelope;
 
 // ───────────────────────── message framing ─────────────────────────
 
-function roleLabel(role: Envelope["from"]["role"]): string {
+function roleLabel(role: Sender["role"]): string {
 	return role === "orchestrator" ? "Orchestrator" : role === "worker" ? "Worker" : "Agent";
 }
 
-function frameMessage(env: Envelope): string {
+function frameMessage(env: MessageEnvelope): string {
 	const label = roleLabel(env.from.role);
 	const who = env.from.name ? `${label} "${env.from.name}" in pane ${env.from.paneId}` : `${label} in pane ${env.from.paneId}`;
 	return [
@@ -138,6 +177,27 @@ interface HerdrWorkerTestOptions {
 	disableInbox?: boolean;
 	isListening?: (paneId: string) => boolean;
 	writeEnvelope?: (paneId: string, envelope: Envelope) => void;
+	onInboxHandler?: (deliverEnvelope: (envelope: unknown, envelopeId: string) => Promise<void>) => void;
+}
+
+interface CreateOpts {
+	runId: string;
+	correlationId?: string;
+	provenance?: SpawnProvenance;
+	name?: string;
+	direction?: Direction;
+	type?: string;
+	purpose?: string;
+	model?: string;
+	thinking?: string;
+	initialPrompt?: string;
+}
+
+interface PendingSpawnLifecycle {
+	opts: CreateOpts;
+	name: string;
+	paneId?: string;
+	scope: "pane_creation" | "agent_start" | "assignment_delivery";
 }
 
 export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions = {}) {
@@ -150,6 +210,9 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	let stopped = false;
 	const lifetime = new AbortController();
 	let createQueue = Promise.resolve();
+	let lifecycleAcceptor: LifecycleAcceptor | undefined;
+	let providerLifecycleSequence = 0;
+	const pendingSpawnLifecycles = new Map<string, PendingSpawnLifecycle>();
 	const inFlightEnvelopes = new Set<string>();
 	const interactive = () => HERDR_ENV && !!SELF_PANE && ctxRef?.mode === "tui" && !stopped;
 	const providerState = () => {
@@ -166,6 +229,14 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	});
 	pi.registerFlag("team-role", {
 		description: "Herdr worker: '<type>: <purpose>' describing what this worker is for (set by the orchestrator)",
+		type: "string",
+	});
+	pi.registerFlag("worker-run-id", {
+		description: "Herdr worker: internal assignment run identity",
+		type: "string",
+	});
+	pi.registerFlag("worker-correlation-id", {
+		description: "Herdr worker: internal caller correlation identity",
 		type: "string",
 	});
 
@@ -226,7 +297,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		return selfInfo?.name || selfInfo?.paneId || SELF_PANE || "unknown";
 	}
 
-	function myRoleToward(targetId: string, target?: AgentInfo): Envelope["from"]["role"] {
+	function myRoleToward(targetId: string, target?: AgentInfo): Sender["role"] {
 		const ids = [targetId, target?.name, target?.paneId].filter(Boolean) as string[];
 		if (ids.some((id) => state.workers.includes(id))) return "orchestrator";
 		if (state.orchestratedBy && ids.includes(state.orchestratedBy)) return "worker";
@@ -250,6 +321,13 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		// A clone must not acquire the source session's live team authority.
 		if (found?.sessionId && found.sessionId !== ctx.sessionManager.getSessionId()) found = undefined;
 		state = found && Array.isArray(found.workers) ? structuredClone(found) : { workers: [] };
+		if (state.activeRun && (!isWorkerRunBinding(state.activeRun)
+			|| typeof state.activeRun.sourceInstanceId !== "string"
+			|| !/^[A-Za-z0-9._-]{1,128}$/.test(state.activeRun.sourceInstanceId)
+			|| !Number.isInteger(state.activeRun.sourceSequence)
+			|| state.activeRun.sourceSequence < 0)) {
+			state.activeRun = undefined;
+		}
 	}
 
 	function statusText(): string | undefined {
@@ -277,6 +355,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		const want = new Map<string, boolean>([
 			[TOOL_NAME, inTeam()],
 			[CREATE_TOOL, isOrchestrator()],
+			[REPORT_TOOL, interactive() && !!state.orchestratedBy && !!state.activeRun],
 		]);
 		let next = active.filter((t) => want.get(t) !== false);
 		for (const [tool, on] of want) if (on && !next.includes(tool)) next = [...next, tool];
@@ -346,8 +425,15 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 				if (stopped) return;
 				if (inFlightEnvelopes.has(f)) continue;
 				const full = path.join(dir, f);
-				const acknowledged = ctxRef?.sessionManager.getEntries().some((e) => e.type === "custom_message" && e.customType === "herdr-worker.message" && (e.details as { envelopeId?: string })?.envelopeId === f);
-				if (acknowledged) { fs.rmSync(full, { force: true }); continue; }
+				const acknowledgedEntry = ctxRef?.sessionManager.getEntries().find((e) => e.type === "custom_message"
+					&& (e.customType === MESSAGE_CUSTOM_TYPE || e.customType === LIFECYCLE_REPORT_CUSTOM_TYPE)
+					&& (e.details as { envelopeId?: string })?.envelopeId === f);
+				if (acknowledgedEntry) {
+					if ((acknowledgedEntry as { customType?: unknown }).customType !== LIFECYCLE_REPORT_CUSTOM_TYPE || acceptPersistedLifecycleReport(acknowledgedEntry)) {
+						fs.rmSync(full, { force: true });
+					}
+					continue;
+				}
 				let env: Envelope | undefined;
 				try {
 					env = JSON.parse(fs.readFileSync(full, "utf8"));
@@ -380,29 +466,63 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		return out;
 	}
 
-	async function deliver(env: Envelope, envelopeId: string) {
+	function acceptPersistedLifecycleReport(value: unknown): boolean {
+		const entry = value as { customType?: unknown; details?: unknown } | undefined;
+		if (entry?.customType !== LIFECYCLE_REPORT_CUSTOM_TYPE || !lifecycleAcceptor) return false;
+		const details = entry.details as { from?: Sender; report?: unknown } | undefined;
+		if (!details?.from || typeof details.from.paneId !== "string" || !isWorkerRunReport(details.report)) return true;
+		const report = details.report;
+		const record = lifecycleAcceptor.getRun(report.runId);
+		if (!record) return false;
+		if (record.worker.paneId !== details.from.paneId) return true;
+		try {
+			lifecycleAcceptor.accept({
+				...report,
+				worker: { ...record.worker },
+				source: "worker",
+				...(record.correlationId === undefined ? {} : { correlationId: record.correlationId }),
+			});
+			return true;
+		} catch {
+			return false;
+		}
+	}
+
+	async function deliver(env: unknown, envelopeId: string) {
 		const ctx = ctxRef;
-		if (!env.from || typeof env.from.id !== "string" || typeof env.message !== "string") return;
+		if (!env || typeof env !== "object") return;
+		const envelope = env as Partial<Envelope> & { from?: Partial<Sender> };
+		if (!envelope.from || typeof envelope.from.id !== "string" || typeof envelope.from.paneId !== "string") return;
 		const peers = await knownPeerPanes();
 		if (stopped) return;
-		const known = env.from?.paneId ? peers.get(env.from.paneId) : undefined;
+		const known = peers.get(envelope.from.paneId);
 
-		if (env.type === "control") {
-			if (env.action === "orchestrated-by") {
+		if (envelope.type === "control") {
+			if (envelope.action === "orchestrated-by") {
 				// Adoption handshake: only while we have no orchestrator (or it is the current one re-asserting).
 				if (state.orchestratedBy && !known) {
-					ctx?.hasUI && ctx.ui.notify(`Ignored adoption request from ${env.from.id} (pane ${env.from.paneId}); already orchestrated by ${state.orchestratedBy}.`, "warning");
+					ctx?.hasUI && ctx.ui.notify(`Ignored adoption request from ${envelope.from.id} (pane ${envelope.from.paneId}); already orchestrated by ${state.orchestratedBy}.`, "warning");
 					return;
 				}
-				state.orchestratedBy = env.from.id;
+				if (state.orchestratedBy !== envelope.from.id) state.activeRun = undefined;
+				state.orchestratedBy = envelope.from.id;
 				persist();
 				updateUi();
-				ctx?.hasUI && ctx.ui.notify(`Now orchestrated by ${env.from.id}`, "info");
-			} else if (env.action === "released" && known && state.orchestratedBy === env.from.id) {
+				ctx?.hasUI && ctx.ui.notify(`Now orchestrated by ${envelope.from.id}`, "info");
+			} else if (envelope.action === "released" && known && state.orchestratedBy === envelope.from.id) {
 				state.orchestratedBy = undefined;
+				state.activeRun = undefined;
 				persist();
 				updateUi();
-				ctx?.hasUI && ctx.ui.notify(`Released by orchestrator ${env.from.id}`, "info");
+				ctx?.hasUI && ctx.ui.notify(`Released by orchestrator ${envelope.from.id}`, "info");
+			} else if (envelope.action === "bind-run"
+				&& (!state.orchestratedBy || (known && state.orchestratedBy === envelope.from.id))
+				&& isWorkerRunBinding(envelope.binding)) {
+				state.orchestratedBy ??= envelope.from.id;
+				state.activeRun = { ...envelope.binding, sourceInstanceId: randomUUID(), sourceSequence: 0 };
+				persist();
+				updateUi();
+				void reportWorkerReady().catch(() => {});
 			}
 			return;
 		}
@@ -410,16 +530,32 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		if (!known) {
 			ctx?.hasUI &&
 				ctx.ui.notify(
-					`Dropped message from unknown agent ${env.from?.id ?? "?"} (pane ${env.from?.paneId ?? "?"}). Only your orchestrator and workers may message you; use /team adopt or /orchestrated-by to allow it.`,
+					`Dropped message from unknown agent ${envelope.from.id} (pane ${envelope.from.paneId}). Only your orchestrator and workers may message you; use /team adopt or /orchestrated-by to allow it.`,
 					"warning",
 				);
 			return;
 		}
+		if (envelope.type === "lifecycle") {
+			if (!isWorkerRunReport(envelope.report)) return;
+			const record = lifecycleAcceptor?.getRun(envelope.report.runId);
+			if (!record || record.worker.paneId !== envelope.from.paneId) return;
+			inFlightEnvelopes.add(envelopeId);
+			pi.sendMessage({
+				customType: LIFECYCLE_REPORT_CUSTOM_TYPE,
+				content: `Worker ${record.worker.name} reported ${envelope.report.status} for run ${envelope.report.runId}.`,
+				display: true,
+				details: { envelopeId, from: envelope.from, report: envelope.report },
+			}, { triggerTurn: true, deliverAs: "followUp" });
+			return;
+		}
+		if (envelope.type !== "message" || typeof envelope.message !== "string" || typeof envelope.priority !== "boolean") return;
+		const messageEnvelope = envelope as MessageEnvelope;
 		inFlightEnvelopes.add(envelopeId);
 		// The mailbox is the outbox until pi actually persists this custom message.
-		pi.sendMessage({ customType: "herdr-worker.message", content: frameMessage(env), display: true,
-			details: { envelopeId, from: env.from } }, { triggerTurn: true, deliverAs: env.priority ? "steer" : "followUp" });
+		pi.sendMessage({ customType: MESSAGE_CUSTOM_TYPE, content: frameMessage(messageEnvelope), display: true,
+			details: { envelopeId, from: messageEnvelope.from } }, { triggerTurn: true, deliverAs: messageEnvelope.priority ? "steer" : "followUp" });
 	}
+	testOptions.onInboxHandler?.(deliver);
 
 	// ── sending ──
 
@@ -448,15 +584,24 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		fs.renameSync(tmp, path.join(dir, name));
 	}
 
-	async function makeEnvelope(targetId: string, target: AgentInfo | undefined, message: string, priority: boolean, extra: Partial<Envelope> = {}): Promise<Envelope> {
+	async function makeSender(targetId: string, target: AgentInfo | undefined): Promise<Sender> {
 		if (!selfInfo) await refreshSelf();
 		return {
+			id: selfId(),
+			paneId: SELF_PANE,
+			...(selfInfo?.name === undefined ? {} : { name: selfInfo.name }),
+			role: myRoleToward(targetId, target),
+		};
+	}
+
+	async function makeMessageEnvelope(targetId: string, target: AgentInfo | undefined, message: string, priority: boolean, runId?: string): Promise<MessageEnvelope> {
+		return {
 			type: "message",
-			from: { id: selfId(), paneId: SELF_PANE, name: selfInfo?.name, role: myRoleToward(targetId, target) },
+			from: await makeSender(targetId, target),
 			message,
 			priority,
 			ts: Date.now(),
-			...extra,
+			...(runId === undefined ? {} : { runId }),
 		};
 	}
 
@@ -466,7 +611,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		}
 	}
 
-	async function send(targetId: string, message: string, priority: boolean, signal?: AbortSignal): Promise<DeliveryReceipt> {
+	async function send(targetId: string, message: string, priority: boolean, signal?: AbortSignal, runId?: string): Promise<DeliveryReceipt> {
 		if (!HERDR_ENV) throw new Error("Not running inside herdr (HERDR_ENV != 1); SendToAgent is unavailable.");
 		const target = await agentGet(targetId);
 		if (!target) {
@@ -479,7 +624,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			throw new SendServiceError("NOT_TEAM_MEMBER", "Target is not a team member.", `"${targetId}" is not in your team (it would drop the message anyway). Workers: ${state.workers.join(", ") || "(none)"}; orchestrator: ${state.orchestratedBy ?? "(none)"}. Use /team add or /team adopt first.`);
 		}
 
-		const env = await makeEnvelope(targetId, target, message, priority);
+		const env = await makeMessageEnvelope(targetId, target, message, priority, runId);
 		const label = target.name ?? target.paneId;
 
 		if (target.kind === "pi" && isListening(target.paneId)) {
@@ -497,12 +642,77 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		return `Typed into ${receipt.target} (pane ${receipt.paneId}, ${receipt.kind ?? "agent"}, no inbox listener) via \`herdr agent prompt\`. Priority flag not applicable there.`;
 	}
 
-	async function sendControl(targetId: string, action: NonNullable<Envelope["action"]>): Promise<boolean> {
+	async function sendControl(targetId: string, action: ControlEnvelope["action"], binding: { runId: string; correlationId?: string } | undefined = undefined): Promise<boolean> {
 		const target = await agentGet(targetId);
 		if (!target || !isListening(target.paneId)) return false;
-		const env = await makeEnvelope(targetId, target, "", false, { type: "control", action });
+		const env: ControlEnvelope = {
+			type: "control",
+			from: await makeSender(targetId, target),
+			action,
+			...(binding === undefined ? {} : { binding: { protocol: LIFECYCLE_PROTOCOL_V1, ...binding } }),
+			ts: Date.now(),
+		};
 		writeEnvelope(target.paneId, env);
 		return true;
+	}
+
+	async function sendWorkerReport(input: WorkerRunReportInput): Promise<WorkerRunReport> {
+		if (!isWorkerRunReportInput(input)) throw new Error("Invalid worker lifecycle report.");
+		const activeRun = state.activeRun;
+		if (!activeRun || !state.orchestratedBy) throw new Error("No active worker run is bound.");
+		const target = await agentGet(state.orchestratedBy);
+		if (!target || !isListening(target.paneId)) throw new Error("The orchestrator is not listening for worker lifecycle reports.");
+		const sourceSequence = activeRun.sourceSequence + 1;
+		const evidence = input.status === "message"
+			? { kind: "worker_message" as const, message: input.message }
+			: input.status === "completed"
+				? { kind: "worker_completed" as const, ...(input.result === undefined ? {} : { result: input.result }) }
+				: { kind: "worker_failed" as const, error: input.error };
+		const report = {
+			protocol: LIFECYCLE_PROTOCOL_V1,
+			eventId: randomUUID(),
+			runId: activeRun.runId,
+			sourceInstanceId: activeRun.sourceInstanceId,
+			sourceSequence,
+			observedAt: Date.now(),
+			status: input.status,
+			evidence,
+		} as WorkerRunReport;
+		state.activeRun = { ...activeRun, sourceSequence };
+		persist();
+		writeEnvelope(target.paneId, {
+			type: "lifecycle",
+			from: await makeSender(state.orchestratedBy, target),
+			report,
+			ts: Date.now(),
+		});
+		return report;
+	}
+
+	async function reportWorkerReady(): Promise<void> {
+		const activeRun = state.activeRun;
+		if (!activeRun || !state.orchestratedBy) return;
+		const target = await agentGet(state.orchestratedBy);
+		if (!target || !isListening(target.paneId)) return;
+		const sourceSequence = activeRun.sourceSequence + 1;
+		const report: WorkerRunReport = {
+			protocol: LIFECYCLE_PROTOCOL_V1,
+			eventId: randomUUID(),
+			runId: activeRun.runId,
+			sourceInstanceId: activeRun.sourceInstanceId,
+			sourceSequence,
+			observedAt: Date.now(),
+			status: "started",
+			evidence: { kind: "worker_ready", readiness: "confirmed" },
+		};
+		state.activeRun = { ...activeRun, sourceSequence };
+		persist();
+		writeEnvelope(target.paneId, {
+			type: "lifecycle",
+			from: await makeSender(state.orchestratedBy, target),
+			report,
+			ts: Date.now(),
+		});
 	}
 
 	// ── tool ──
@@ -557,6 +767,24 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			if (lines.length > shown.length) out += "\n" + theme.fg("dim", `│ … ${lines.length - shown.length} more lines`);
 			if (d.status) out += "\n" + theme.fg("dim", d.status);
 			return new Text(out, 0, 0);
+		},
+	});
+
+	pi.registerTool({
+		name: REPORT_TOOL,
+		label: "Report Worker Run",
+		description: "Report an authoritative message, successful completion, or failure for the worker's currently bound assignment. Identity and ordering are supplied by the extension.",
+		promptSnippet: "Report progress or the explicit outcome of the current worker assignment",
+		promptGuidelines: [
+			"Use ReportWorkerRun for assignment-aware updates and final outcomes; do not claim completion until the assigned work is actually complete.",
+		],
+		parameters: WorkerRunReportInputSchema,
+		async execute(_id, params) {
+			const report = await sendWorkerReport(params);
+			const text = report.status === "message"
+				? "Worker message reported to the orchestrator."
+				: `Worker run reported ${report.status} to the orchestrator.`;
+			return { content: [{ type: "text", text }], details: { runId: report.runId, eventId: report.eventId, status: report.status } };
 		},
 	});
 
@@ -644,16 +872,9 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		return { pane: last, direction: along, swap: false, how: `stacked ${along === "down" ? "below" : "right of"} ${last}` };
 	}
 
-	interface CreateOpts {
-		name?: string;
-		direction?: Direction;
-		type?: string;
-		purpose?: string;
-		model?: string;
-		thinking?: string;
-		initialPrompt?: string;
-	}
 	interface CreateResult {
+		runId: string;
+		correlationId?: string;
 		name: string;
 		paneId: string;
 		model?: string;
@@ -664,12 +885,78 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		adopted: boolean;
 	}
 
+	function bindLifecycleRun(opts: CreateOpts, name: string, paneId: string): boolean {
+		return lifecycleAcceptor?.bindRun({
+			runId: opts.runId,
+			...(opts.correlationId === undefined ? {} : { correlationId: opts.correlationId }),
+			worker: { name, paneId },
+			...(opts.provenance?.requestId === undefined ? {} : { requestId: opts.provenance.requestId }),
+			providerInstanceId: opts.provenance?.providerInstanceId ?? rpcServer.providerInstanceId,
+		}) ?? false;
+	}
+
+	function observeProviderStarted(opts: CreateOpts, name: string, paneId: string): void {
+		try {
+			if (!bindLifecycleRun(opts, name, paneId)) return;
+			lifecycleAcceptor?.accept({
+				protocol: LIFECYCLE_PROTOCOL_V1,
+				eventId: randomUUID(),
+				runId: opts.runId,
+				sourceInstanceId: opts.provenance?.providerInstanceId ?? rpcServer.providerInstanceId,
+				sourceSequence: ++providerLifecycleSequence,
+				status: "started",
+				worker: { name, paneId },
+				observedAt: Date.now(),
+				source: "provider",
+				...(opts.correlationId === undefined ? {} : { correlationId: opts.correlationId }),
+				evidence: { kind: "agent_start_returned", readiness: "unconfirmed" },
+			});
+		} catch {
+			// Lifecycle persistence and publication must not change worker creation outcomes.
+		}
+	}
+
+	function observeProviderUncertain(
+		opts: CreateOpts,
+		name: string,
+		paneId: string | undefined,
+		scope: PendingSpawnLifecycle["scope"],
+		detail: string,
+	): void {
+		try {
+			const bound = paneId === undefined
+				? lifecycleAcceptor?.bindRun({
+					runId: opts.runId,
+					...(opts.correlationId === undefined ? {} : { correlationId: opts.correlationId }),
+					worker: { name },
+					...(opts.provenance?.requestId === undefined ? {} : { requestId: opts.provenance.requestId }),
+					providerInstanceId: opts.provenance?.providerInstanceId ?? rpcServer.providerInstanceId,
+				})
+				: bindLifecycleRun(opts, name, paneId);
+			if (!bound) return;
+			lifecycleAcceptor?.accept({
+				protocol: LIFECYCLE_PROTOCOL_V1,
+				eventId: randomUUID(),
+				runId: opts.runId,
+				sourceInstanceId: opts.provenance?.providerInstanceId ?? rpcServer.providerInstanceId,
+				sourceSequence: ++providerLifecycleSequence,
+				status: "uncertain",
+				worker: { name, ...(paneId === undefined ? {} : { paneId }) },
+				observedAt: Date.now(),
+				source: "provider",
+				...(opts.correlationId === undefined ? {} : { correlationId: opts.correlationId }),
+				evidence: { kind: "uncertain", scope, detail },
+			});
+		} catch {
+			// Lifecycle persistence and publication must not replace the operation's own failure.
+		}
+	}
+
 	async function createAgent(opts: CreateOpts, ctx: ExtensionContext, cwd: string): Promise<CreateResult> {
 		if (!HERDR_ENV || !SELF_PANE) throw new Error("Not running inside herdr.");
 		const dir: Direction = opts.direction ?? "right";
 		const type = opts.type?.trim().toLowerCase() || undefined;
 		const requested = (opts.name?.trim() || type || "").toLowerCase();
-		if (requested && (!NAME_RE.test(requested) || RESERVED.has(requested))) throw new Error(`Invalid worker name "${requested}" (use [a-z][a-z0-9_-]{0,31}; not ${[...RESERVED].join("/")})`);
 		const model = opts.model?.trim() || (type && TYPE_MODELS[type]) || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
 
 		await refreshSelf();
@@ -688,46 +975,114 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			const existing = await agentGet(wanted);
 			if (existing && existing.paneId !== SELF_PANE && existing.tabId === SELF_TAB && !state.workers.includes(wanted)) {
 				await adopt(wanted);
-				if (opts.initialPrompt) await send(wanted, opts.initialPrompt, false);
+				const priorMeta = state.meta?.[wanted];
+				state.meta = { ...(state.meta ?? {}), [wanted]: {
+					...priorMeta,
+					paneId: existing.paneId,
+					runId: opts.runId,
+					correlationId: opts.correlationId,
+					requestId: opts.provenance?.requestId,
+					providerInstanceId: opts.provenance?.providerInstanceId,
+				} };
+				persist();
+				bindLifecycleRun(opts, wanted, existing.paneId);
+				pendingSpawnLifecycles.set(opts.runId, { opts, name: wanted, paneId: existing.paneId, scope: "assignment_delivery" });
+				try {
+					await sendControl(wanted, "bind-run", { runId: opts.runId, ...(opts.correlationId === undefined ? {} : { correlationId: opts.correlationId }) });
+					if (opts.initialPrompt) await send(wanted, opts.initialPrompt, false, undefined, opts.runId);
+				} catch (error) {
+					observeProviderUncertain(opts, wanted, existing.paneId, "assignment_delivery", "The re-adopted worker assignment delivery outcome is ambiguous.");
+					throw error;
+				} finally {
+					pendingSpawnLifecycles.delete(opts.runId);
+				}
 				const meta = state.meta?.[wanted];
-				return { name: wanted, paneId: existing.paneId, model: meta?.model, type: meta?.type, purpose: meta?.purpose, cwd: existing.cwd?.trim() ? existing.cwd : cwd, how: "re-adopted existing pane", adopted: true };
+				return { runId: opts.runId, correlationId: opts.correlationId, name: wanted, paneId: existing.paneId, model: meta?.model, type: meta?.type, purpose: meta?.purpose, cwd: existing.cwd?.trim() ? existing.cwd : cwd, how: "re-adopted existing pane", adopted: true };
 			}
 		}
 		const name = await uniqueName(requested);
 
 		// Create the pane: start a worker stack on the requested side, or extend the existing one.
 		const target = await pickSplit(dir);
-		const split = await herdr(["pane", "split", target.pane, "--direction", target.direction, "--cwd", cwd, "--no-focus"]);
+		pendingSpawnLifecycles.set(opts.runId, { opts, name, scope: "pane_creation" });
+		let split: any;
+		try {
+			split = await herdr(["pane", "split", target.pane, "--direction", target.direction, "--cwd", cwd, "--no-focus"]);
+		} catch (error) {
+			observeProviderUncertain(opts, name, undefined, "pane_creation", "The pane creation outcome is ambiguous.");
+			pendingSpawnLifecycles.delete(opts.runId);
+			throw error;
+		}
 		const paneId: string | undefined = split?.result?.pane?.pane_id;
-		if (!paneId) throw new Error(`pane split returned no pane id: ${JSON.stringify(split)}`);
-		pi.appendEntry("herdr-worker.operation.v1", { name, paneId, phase: "pane-created", at: Date.now() });
+		if (!paneId) {
+			observeProviderUncertain(opts, name, undefined, "pane_creation", "Pane creation returned without a pane identity, so external effects cannot be excluded.");
+			pendingSpawnLifecycles.delete(opts.runId);
+			throw new Error(`pane split returned no pane id: ${JSON.stringify(split)}`);
+		}
+		pendingSpawnLifecycles.set(opts.runId, { opts, name, paneId, scope: "agent_start" });
+		try {
+			pi.appendEntry("herdr-worker.operation.v1", { name, paneId, phase: "pane-created", at: Date.now() });
+		} catch (error) {
+			observeProviderUncertain(opts, name, paneId, "pane_creation", "A pane was created but its operation checkpoint could not be persisted.");
+			pendingSpawnLifecycles.delete(opts.runId);
+			throw error;
+		}
 		if (target.swap) {
 			await herdr(["pane", "swap", "--source-pane", SELF_PANE, "--target-pane", paneId]).catch(() => {});
 		}
 
 		await new Promise((r) => setTimeout(r, 1200)); // let the shell come up
-		const piArgs = ["--orchestrated-by", me];
+		const piArgs = ["--orchestrated-by", me, "--worker-run-id", opts.runId];
+		if (opts.correlationId) piArgs.push("--worker-correlation-id", opts.correlationId);
 		if (model) piArgs.push("--model", opts.thinking ? `${model}:${opts.thinking}` : model);
 		const role = [type, opts.purpose?.trim()].filter(Boolean).join(": ");
 		if (role) piArgs.push("--team-role", role);
 		try {
 			await herdr(["agent", "start", name, "--kind", "pi", "--pane", paneId, "--timeout", "60000", "--", ...piArgs], { timeout: 70000 });
 		} catch (e: any) {
-			if (!stopped) pi.appendEntry("herdr-worker.operation.v1", { name, paneId, phase: "start-failed", at: Date.now() });
+			if (!stopped) {
+				try { pi.appendEntry("herdr-worker.operation.v1", { name, paneId, phase: "start-failed", at: Date.now() }); } catch {}
+			}
+			observeProviderUncertain(opts, name, paneId, "agent_start", "Agent start did not return conclusively after pane creation.");
+			pendingSpawnLifecycles.delete(opts.runId);
 			throw new Error(`Started pane ${paneId} but agent start failed: ${e.message}. Check \`herdr pane read ${paneId}\`.`);
 		}
 
-		if (!state.workers.includes(name)) state.workers.push(name);
-		state.meta = { ...(state.meta ?? {}), [name]: { type, purpose: opts.purpose?.trim() || undefined, model, paneId } };
-		persist();
-		updateUi();
+		try {
+			if (!state.workers.includes(name)) state.workers.push(name);
+			state.meta = { ...(state.meta ?? {}), [name]: {
+				type,
+				purpose: opts.purpose?.trim() || undefined,
+				model,
+				paneId,
+				runId: opts.runId,
+				correlationId: opts.correlationId,
+				requestId: opts.provenance?.requestId,
+				providerInstanceId: opts.provenance?.providerInstanceId,
+			} };
+			persist();
+			updateUi();
+		} catch (error) {
+			observeProviderUncertain(opts, name, paneId, "agent_start", "Agent start returned but the worker relationship could not be persisted.");
+			pendingSpawnLifecycles.delete(opts.runId);
+			throw error;
+		}
+		observeProviderStarted(opts, name, paneId);
 
 		if (opts.initialPrompt?.trim()) {
+			pendingSpawnLifecycles.set(opts.runId, { opts, name, paneId, scope: "assignment_delivery" });
 			// Wait for the worker's extension to come up and register its inbox, then hand over the brief.
 			for (let i = 0; i < 20 && !isListening(paneId); i++) await new Promise((r) => setTimeout(r, 500));
-			await send(name, opts.initialPrompt, false);
+			try {
+				await send(name, opts.initialPrompt, false, undefined, opts.runId);
+			} catch (error) {
+				observeProviderUncertain(opts, name, paneId, "assignment_delivery", "The initial assignment delivery outcome is ambiguous after worker start.");
+				pendingSpawnLifecycles.delete(opts.runId);
+				throw error;
+			}
 		}
-		return { name, paneId, model, type, purpose: opts.purpose?.trim() || undefined, cwd, how: target.how, adopted: false };
+		pendingSpawnLifecycles.delete(opts.runId);
+		return { runId: opts.runId, correlationId: opts.correlationId, name, paneId, model, type, purpose: opts.purpose?.trim() || undefined, cwd, how: target.how, adopted: false };
 	}
 
 	function validateSpawnCwd(value: string): string {
@@ -744,11 +1099,14 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	}
 
 	type SpawnOptions = SpawnInput;
-	async function spawnWorker(input: SpawnOptions, signal?: AbortSignal): Promise<CreateResult> {
+	async function spawnWorker(input: SpawnOptions, signal?: AbortSignal, provenance?: SpawnProvenance): Promise<CreateResult> {
 			const ctx = ctxRef;
 			if (!ctx) throw new Error("Session is not ready.");
 			const cwd = validateSpawnCwd(input.cwd ?? ctx.cwd);
+			const requested = (input.name?.trim() || input.type?.trim() || "").toLowerCase();
+			if (requested && (!NAME_RE.test(requested) || RESERVED.has(requested))) throw new Error(`Invalid worker name "${requested}" (use [a-z][a-z0-9_-]{0,31}; not ${[...RESERVED].join("/")})`);
 			signal?.throwIfAborted();
+			const runId = randomUUID();
 			if (!state.orchestratedBy && !state.teamMode) {
 				state.teamMode = true;
 				persist();
@@ -756,16 +1114,18 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			}
 			const pending = createQueue.then(() => {
 				signal?.throwIfAborted();
-				return createAgent({ name: input.name, direction: input.direction, model: input.model, type: input.type, purpose: input.purpose, thinking: input.thinking, initialPrompt: input.initialPrompt }, ctx, cwd);
+				return createAgent({ runId, correlationId: input.correlationId, provenance, name: input.name, direction: input.direction, model: input.model, type: input.type, purpose: input.purpose, thinking: input.thinking, initialPrompt: input.initialPrompt }, ctx, cwd);
 			});
 			createQueue = pending.then(() => {}, () => {});
 			const result = await pending;
 			return result;
 	}
 	const service: WorkerRpcService = {
-		async spawn(input, signal) {
-			const result = await spawnWorker(input, signal);
+		async spawn(input, provenance, signal) {
+			const result = await spawnWorker(input, signal, provenance);
 			return {
+				runId: result.runId,
+				...(result.correlationId === undefined ? {} : { correlationId: result.correlationId }),
 				name: result.name,
 				paneId: result.paneId,
 				cwd: result.cwd,
@@ -777,7 +1137,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		},
 		async send(input: SendInput, signal?: AbortSignal): Promise<DeliveryReceipt> {
 			const priority = input.mode === undefined ? input.priority ?? false : input.mode === "steer";
-			return send(input.target, input.message, priority, signal);
+			return send(input.target, input.message, priority, signal, input.runId);
 		},
 		async inspect(input: InspectInput, signal?: AbortSignal): Promise<Inspection> {
 			const target = input.target;
@@ -833,6 +1193,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 
 	async function setOrchestrator(id: string): Promise<string> {
 		if (!id) throw new Error("Usage: /orchestrated-by <agent name or pane id>");
+		if (state.orchestratedBy !== id) state.activeRun = undefined;
 		state.orchestratedBy = id;
 		persist();
 		updateUi();
@@ -1035,6 +1396,23 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	pi.on("session_start", async (event, ctx) => {
 		ctxRef = ctx;
 		restore(ctx);
+		lifecycleAcceptor = createLifecycleAcceptor({
+			sessionId: ctx.sessionManager.getSessionId(),
+			getEntries: () => ctx.sessionManager.getEntries(),
+			appendEntry: (customType, data) => pi.appendEntry(customType, data),
+			emit: (channel, payload) => pi.events.emit(channel, payload),
+		});
+		for (const name of state.workers) {
+			const meta = state.meta?.[name];
+			if (!meta?.runId || !meta.paneId) continue;
+			lifecycleAcceptor.bindRun({
+				runId: meta.runId,
+				...(meta.correlationId === undefined ? {} : { correlationId: meta.correlationId }),
+				worker: { name, paneId: meta.paneId },
+				...(meta.requestId === undefined ? {} : { requestId: meta.requestId }),
+				...(meta.providerInstanceId === undefined ? {} : { providerInstanceId: meta.providerInstanceId }),
+			});
+		}
 		if (!interactive()) {
 			state = { workers: [] };
 			syncTool(); // no herdr -> no team -> no tool
@@ -1043,6 +1421,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		await refreshSelf();
 
 		const flag = pi.getFlag("orchestrated-by");
+		let shouldReportReady = false;
 		if (typeof flag === "string" && flag && event.reason === "startup" && !state.orchestratedBy) {
 			state.orchestratedBy = flag;
 			const role = pi.getFlag("team-role");
@@ -1052,16 +1431,30 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			}
 			persist();
 		}
+		const runFlag = pi.getFlag("worker-run-id");
+		const correlationFlag = pi.getFlag("worker-correlation-id");
+		const startupBinding = {
+			protocol: LIFECYCLE_PROTOCOL_V1,
+			runId: runFlag,
+			...(typeof correlationFlag === "string" ? { correlationId: correlationFlag } : {}),
+		};
+		if (event.reason === "startup" && state.orchestratedBy && isWorkerRunBinding(startupBinding)) {
+			state.activeRun = { ...startupBinding, sourceInstanceId: randomUUID(), sourceSequence: 0 };
+			shouldReportReady = true;
+			persist();
+		}
 
 		startListening();
 		updateUi(); // also gates the SendToAgent tool
+		for (const entry of ctx.sessionManager.getEntries()) acceptPersistedLifecycleReport(entry);
+		if (shouldReportReady) await reportWorkerReady().catch(() => {});
 	});
 
 	function acknowledgePersistedInbox(ctx: ExtensionContext) {
-		if (!inFlightEnvelopes.size) return;
 		// message_end precedes persistence; only acknowledge records actually in SessionManager.
 		for (const entry of ctx.sessionManager.getEntries()) {
-			if (entry.type !== "custom_message" || entry.customType !== "herdr-worker.message") continue;
+			if (entry.type !== "custom_message" || (entry.customType !== MESSAGE_CUSTOM_TYPE && entry.customType !== LIFECYCLE_REPORT_CUSTOM_TYPE)) continue;
+			if (entry.customType === LIFECYCLE_REPORT_CUSTOM_TYPE && !acceptPersistedLifecycleReport(entry)) continue;
 			const id = (entry.details as { envelopeId?: string })?.envelopeId;
 			if (id && inFlightEnvelopes.delete(id) && /^[a-zA-Z0-9_.-]+\.json$/.test(id)) {
 				try { fs.rmSync(path.join(inboxDir(SELF_PANE), id), { force: true }); } catch {}
@@ -1078,11 +1471,22 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	pi.on("session_shutdown", async () => {
 		// Headless sessions must not remove the interactive pane's listener file.
 		const wasListening = !!watcher || !!poller;
+		for (const pending of pendingSpawnLifecycles.values()) {
+			observeProviderUncertain(
+				pending.opts,
+				pending.name,
+				pending.paneId,
+				pending.scope,
+				"Provider shutdown interrupted worker creation after an external side effect may have occurred.",
+			);
+		}
+		pendingSpawnLifecycles.clear();
 		stopped = true;
 		rpcServer.dispose();
 		lifetime.abort();
 		if (wasListening) stopListening();
 		if (ctxRef?.hasUI) ctxRef.ui.setStatus(STATUS_KEY, undefined);
+		lifecycleAcceptor = undefined;
 		ctxRef = undefined;
 	});
 }

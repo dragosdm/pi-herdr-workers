@@ -8,5 +8,5 @@
     "skipLibCheck": true,
     "types": ["node"]
   },
-  "include": ["extensions/**/*.ts", "loop/**/*.ts", "rpc/**/*.ts", "tests/**/*.ts"]
+  "include": ["extensions/**/*.ts", "lifecycle/**/*.ts", "loop/**/*.ts", "rpc/**/*.ts", "tests/**/*.ts"]
 }

@@ -74,6 +74,7 @@ const AddressedRequestSchema = {
 };
 export const SpawnRequestSchema = Type.Object({
   ...AddressedRequestSchema,
+  correlationId: Type.Optional(IdSchema),
   name: Type.Optional(bounded(LIMITS.workerName)),
   direction: Type.Optional(Type.Union(SPAWN_DIRECTIONS.map((direction) => Type.Literal(direction)))),
   model: Type.Optional(bounded(LIMITS.model)),
@@ -85,6 +86,7 @@ export const SpawnRequestSchema = Type.Object({
 });
 export const SendRequestSchema = Type.Object({
   ...AddressedRequestSchema,
+  runId: Type.Optional(IdSchema),
   target: bounded(LIMITS.target),
   message: bounded(LIMITS.message),
   mode: Type.Optional(Type.Union([Type.Literal("follow-up"), Type.Literal("steer")])),
@@ -100,9 +102,10 @@ export type InspectRequest = Static<typeof InspectRequestSchema>;
 export type StopRequest = Static<typeof StopRequestSchema>;
 export type AddressedRequest = SpawnRequest | SendRequest | InspectRequest | StopRequest;
 
-export interface SpawnInput { name?: string; direction?: SpawnDirection; model?: string; thinking?: ThinkingLevel; type?: string; purpose?: string; cwd?: string; initialPrompt?: string }
-export interface SendInput { target: string; message: string; mode?: "follow-up" | "steer"; priority?: boolean }
+export interface SpawnInput { correlationId?: string; name?: string; direction?: SpawnDirection; model?: string; thinking?: ThinkingLevel; type?: string; purpose?: string; cwd?: string; initialPrompt?: string }
+export interface SendInput { runId?: string; target: string; message: string; mode?: "follow-up" | "steer"; priority?: boolean }
 export interface InspectInput { target: string }
+export interface SpawnProvenance { requestId: string; providerInstanceId: string }
 
 const CapabilitySchema = Type.Union(CAPABILITIES.map((capability) => Type.Literal(capability)));
 const AvailabilityReasonSchema = Type.Union(AVAILABILITY_REASONS.map((reason) => Type.Literal(reason)));
@@ -132,6 +135,8 @@ export const ProbeDataSchema = Type.Union([
   }),
 ]);
 export const WorkerReferenceSchema = Type.Object({
+  runId: IdSchema,
+  correlationId: Type.Optional(IdSchema),
   name: bounded(LIMITS.workerName),
   paneId: bounded(LIMITS.target),
   model: Type.Optional(bounded(LIMITS.model)),
