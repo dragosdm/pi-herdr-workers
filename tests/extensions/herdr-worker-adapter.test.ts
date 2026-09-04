@@ -19,6 +19,8 @@ async function harness(options: {
 	flags?: Record<string, unknown>;
 	selfName?: string;
 	agents?: any[];
+	execOverride?: (args: string[]) => Promise<any> | any;
+	writeEnvelopeErrorForType?: string;
 } = {}) {
 	const { default: herdrWorker } = await import("../../extensions/herdr-worker.js");
 	const timeline: string[] = [];
@@ -32,6 +34,7 @@ async function harness(options: {
 	const writtenEnvelopes: Array<{ paneId: string; envelope: any }> = [];
 	const sentMessages: Array<{ message: any; options: any }> = [];
 	const agentGetTargets: string[] = [];
+	const startedAgents = new Set<string>();
 	let inboxHandler: ((envelope: unknown, envelopeId: string) => Promise<void>) | undefined;
 	let activeTools: string[] = [];
 	const pi: any = {
@@ -56,6 +59,11 @@ async function harness(options: {
 		sendUserMessage() {},
 		async exec(_command: string, args: string[]) {
 			execCalls.push(args);
+			const overridden = await options.execOverride?.(args);
+			if (overridden !== undefined) {
+				if (args[0] === "agent" && args[1] === "start" && overridden.code === 0) startedAgents.add(args[2]);
+				return overridden;
+			}
 			if (args[0] === "pane" && args[1] === "layout") return { code: 0, stdout: JSON.stringify({ result: { layout: { panes: [] } } }), stderr: "" };
 			if (args[0] === "pane" && args[1] === "split") return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "new-pane" } } }), stderr: "" };
 			if (args[0] === "agent" && args[1] === "get") {
@@ -63,9 +71,9 @@ async function harness(options: {
 				agentGetTargets.push(target);
 				const agent = target === "self-pane"
 					? { pane_id: "self-pane", tab_id: "tab-1", name: options.selfName ?? "orchestrator", agent: "pi", cwd: "/tmp" }
-					: (target === "agent-scout" || target === "worker-pane") && !options.missingAgents?.includes(target)
+					: (target === "agent-scout" || target === "worker-pane" || startedAgents.has(target)) && !options.missingAgents?.includes(target)
 						? {
-							pane_id: "worker-pane", tab_id: "tab-1", name: "agent-scout", agent: "pi", agent_status: "idle",
+							pane_id: startedAgents.has(target) ? "new-pane" : "worker-pane", tab_id: "tab-1", name: startedAgents.has(target) ? target : "agent-scout", agent: "pi", agent_status: "idle",
 							...(options.workerCwd === null ? {} : { cwd: options.workerCwd ?? "/tmp" }),
 						}
 						: target === "boss" && !options.missingAgents?.includes(target)
@@ -74,6 +82,7 @@ async function harness(options: {
 				return { code: agent ? 0 : 1, stdout: agent ? JSON.stringify({ result: { agent } }) : "", stderr: agent ? "" : "missing" };
 			}
 			if (args[0] === "agent" && args[1] === "list") return { code: 0, stdout: JSON.stringify({ result: { agents: options.agents ?? [] } }), stderr: "" };
+			if (args[0] === "agent" && args[1] === "start") startedAgents.add(args[2]);
 			return { code: 0, stdout: JSON.stringify({ result: {} }), stderr: "" };
 		},
 	};
@@ -90,7 +99,10 @@ async function harness(options: {
 	herdrWorker(pi, {
 		disableInbox: true,
 		isListening: () => options.listening ?? false,
-		writeEnvelope: (paneId, envelope) => writtenEnvelopes.push({ paneId, envelope }),
+		writeEnvelope: (paneId, envelope) => {
+			if (envelope.type === options.writeEnvelopeErrorForType) throw new Error("mailbox write failed");
+			writtenEnvelopes.push({ paneId, envelope });
+		},
 		onInboxHandler: (handler) => { inboxHandler = handler; },
 	});
 	return {
@@ -454,6 +466,104 @@ test("new worker start is journaled before canonical and projected publication",
 	assert.ok(lifecycleAppend > h.timeline.findIndex((item) => item === "append:herdr-worker"));
 	assert.ok(canonical > lifecycleAppend);
 	assert.ok(projected > canonical);
+});
+
+test("spawn failures preserve the external side-effect evidence boundary", async () => {
+	const cases = [
+		{
+			label: "split command",
+			execOverride: (args: string[]) => args[0] === "pane" && args[1] === "split"
+				? { code: 1, stdout: "", stderr: "split failed" }
+				: undefined,
+			expected: [{ status: "uncertain", paneId: undefined, scope: "pane_creation" }],
+		},
+		{
+			label: "missing split identity",
+			execOverride: (args: string[]) => args[0] === "pane" && args[1] === "split"
+				? { code: 0, stdout: JSON.stringify({ result: {} }), stderr: "" }
+				: undefined,
+			expected: [{ status: "uncertain", paneId: undefined, scope: "pane_creation" }],
+		},
+		{
+			label: "agent start",
+			execOverride: (args: string[]) => args[0] === "agent" && args[1] === "start"
+				? { code: 1, stdout: "", stderr: "start failed" }
+				: undefined,
+			expected: [{ status: "uncertain", paneId: "new-pane", scope: "agent_start" }],
+		},
+	] as const;
+
+	for (const item of cases) {
+		const h = await harness({ execOverride: item.execOverride });
+		await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+		const requestId = item.label.replaceAll(" ", "-");
+		const probe = await emitForReply<any>(h.events, CHANNELS.probe, `${requestId}-probe`, { requestId: `${requestId}-probe`, supportedProtocols: [1] });
+		const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
+		const reply = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, requestId, {
+			requestId, providerInstanceId, protocol: 1, name: "builder",
+		});
+		assert.equal(reply.success ? "success" : reply.error.code, "INTERNAL_ERROR", item.label);
+		const lifecycle = h.entries.filter((entry) => entry.type === LIFECYCLE_JOURNAL_ENTRY).map((entry) => entry.data.event);
+		assert.deepEqual(lifecycle.map((event) => ({
+			status: event.status,
+			paneId: event.worker.paneId,
+			scope: event.evidence.scope,
+		})), item.expected, item.label);
+		assert.equal(h.events.emissions.some(({ channel }) => channel === LIFECYCLE_CHANNELS.failed), false, item.label);
+	}
+});
+
+test("post-start assignment failure retains started evidence and records uncertainty", async () => {
+	const h = await harness({ listening: true, writeEnvelopeErrorForType: "message" });
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	const probe = await emitForReply<any>(h.events, CHANNELS.probe, "prompt-probe", { requestId: "prompt-probe", supportedProtocols: [1] });
+	const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
+	const reply = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, "prompt-failure", {
+		requestId: "prompt-failure", providerInstanceId, protocol: 1, name: "builder", initialPrompt: "Do the work",
+	});
+	assert.equal(reply.success ? "success" : reply.error.code, "INTERNAL_ERROR");
+	const lifecycle = h.entries.filter((entry) => entry.type === LIFECYCLE_JOURNAL_ENTRY).map((entry) => entry.data.event);
+	assert.deepEqual(lifecycle.map((event) => [event.status, event.evidence.kind, event.evidence.scope]), [
+		["started", "agent_start_returned", undefined],
+		["uncertain", "uncertain", "assignment_delivery"],
+	]);
+	assert.deepEqual(lifecycle.map((event) => event.acceptedSequence), [1, 2]);
+});
+
+test("shutdown during creation records uncertainty without claiming a stop", async () => {
+	let releaseStart!: () => void;
+	let markStartEntered!: () => void;
+	const startEntered = new Promise<void>((resolve) => { markStartEntered = resolve; });
+	const blockedStart = new Promise<void>((resolve) => { releaseStart = resolve; });
+	const h = await harness({
+		execOverride: async (args) => {
+			if (args[0] !== "agent" || args[1] !== "start") return undefined;
+			markStartEntered();
+			await blockedStart;
+			return { code: 0, stdout: JSON.stringify({ result: {} }), stderr: "" };
+		},
+	});
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	await h.commands.get("team").handler("list", h.ctx);
+	const creation = h.tools.get("CreateAgentPanel").execute("shutdown-create", { name: "builder" }, h.ctx.signal, undefined, h.ctx);
+	await startEntered;
+	await h.handlers.get("session_shutdown")![0]();
+	releaseStart();
+	await assert.rejects(creation);
+	const lifecycle = h.entries.filter((entry) => entry.type === LIFECYCLE_JOURNAL_ENTRY).map((entry) => entry.data.event);
+	assert.deepEqual(lifecycle.map((event) => [event.status, event.evidence.scope]), [["uncertain", "agent_start"]]);
+	assert.equal(h.events.emissions.some(({ channel }) => channel === LIFECYCLE_CHANNELS.stopped), false);
+});
+
+test("release and ordinary send receipts do not synthesize terminal lifecycle events", async () => {
+	const h = await harness({ branch: teamBranch({ workers: ["agent-scout"], meta: { "agent-scout": { paneId: "worker-pane", runId: "run-release" } } }) });
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	await h.tools.get("SendToAgent").execute("send", { target_id: "agent-scout", message: "FYI", priority: false }, h.ctx.signal);
+	await h.commands.get("team").handler("release agent-scout", h.ctx);
+	await h.handlers.get("session_shutdown")![0]();
+	for (const channel of [LIFECYCLE_CHANNELS.completed, LIFECYCLE_CHANNELS.failed, LIFECYCLE_CHANNELS.stopped]) {
+		assert.equal(h.events.emissions.some((item) => item.channel === channel), false, channel);
+	}
 });
 
 test("re-adoption binds a run without claiming a provider-observed start", async () => {

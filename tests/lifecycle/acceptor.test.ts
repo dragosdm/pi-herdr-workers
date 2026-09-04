@@ -2,8 +2,10 @@ import assert from "node:assert/strict";
 import test from "node:test";
 import {
 	LIFECYCLE_JOURNAL_ENTRY,
+	LIFECYCLE_REJECTION_ENTRY,
 	createLifecycleAcceptor,
 	type LifecycleJournalEntry,
+	type LifecycleRejectionEntry,
 } from "../../lifecycle/acceptor.js";
 import { LIFECYCLE_CHANNELS, type LifecycleCandidate } from "../../lifecycle/protocol.js";
 import { FakeIsolatedEventBus } from "../support/fake-isolated-event-bus.js";
@@ -36,20 +38,22 @@ function candidate(overrides: Partial<LifecycleCandidate> = {}): LifecycleCandid
 function setup(initialEntries: any[] = []) {
 	const timeline: string[] = [];
 	const journal: LifecycleJournalEntry[] = [];
+	const rejections: LifecycleRejectionEntry[] = [];
 	const emissions: Array<{ channel: string; payload: any }> = [];
 	const acceptor = createLifecycleAcceptor({
 		sessionId: "session-1",
 		getEntries: () => initialEntries,
 		appendEntry: (customType, data) => {
 			timeline.push(`append:${customType}`);
-			journal.push(data);
+			if (customType === LIFECYCLE_JOURNAL_ENTRY && "event" in data) journal.push(data);
+			if (customType === LIFECYCLE_REJECTION_ENTRY && "candidate" in data) rejections.push(data);
 		},
 		emit: (channel, payload) => {
 			timeline.push(`emit:${channel}`);
 			emissions.push({ channel, payload });
 		},
 	});
-	return { acceptor, timeline, journal, emissions };
+	return { acceptor, timeline, journal, rejections, emissions };
 }
 
 test("journals before canonical and projected publication with one accepted object", () => {
@@ -176,6 +180,30 @@ test("restores all current-session journal entries without replay publication", 
 	assert.equal(next.accepted && next.event.acceptedSequence, 2);
 });
 
+test("enriches a pane-less ambiguous binding when stronger evidence identifies the worker", () => {
+	const h = setup();
+	assert.equal(h.acceptor.bindRun({ ...binding, worker: { name: binding.worker.name } }), true);
+	assert.equal(h.acceptor.accept(candidate({
+		eventId: "event-uncertain",
+		worker: { name: binding.worker.name },
+		status: "uncertain",
+		evidence: { kind: "uncertain", scope: "pane_creation", detail: "Pane identity was not returned" },
+	})).accepted, true);
+
+	assert.equal(h.acceptor.bindRun(binding), true);
+	const reconciled = h.acceptor.accept(candidate({
+		eventId: "event-reconciled",
+		sourceInstanceId: "reconciler-1",
+		sourceSequence: 1,
+		source: "reconciler",
+		status: "started",
+		evidence: { kind: "reconciled_started", detail: "The worker pane was found" },
+	}));
+	assert.equal(reconciled.accepted, true);
+	assert.deepEqual(h.acceptor.getRun(binding.runId)?.worker, binding.worker);
+	assert.equal(h.acceptor.getRun(binding.runId)?.status, "started");
+});
+
 test("accepts informational worker messages after settlement without changing terminal status", () => {
 	const h = setup();
 	h.acceptor.bindRun(binding);
@@ -198,6 +226,105 @@ test("accepts informational worker messages after settlement without changing te
 	assert.equal(message.accepted, true);
 	assert.equal(h.acceptor.getRun(binding.runId)?.status, "completed");
 	assert.equal(h.acceptor.getRun(binding.runId)?.acceptedSequence, 2);
+});
+
+test("records authenticated transition conflicts without mutating canonical state", () => {
+	const h = setup();
+	h.acceptor.bindRun(binding);
+	assert.equal(h.acceptor.accept(candidate({
+		eventId: "event-completed",
+		sourceInstanceId: "worker-1",
+		sourceSequence: 1,
+		source: "worker",
+		status: "completed",
+		evidence: { kind: "worker_completed", result: "Done" },
+	})).accepted, true);
+
+	const duplicate = h.acceptor.accept(candidate({
+		eventId: "event-completed-duplicate",
+		sourceInstanceId: "worker-1",
+		sourceSequence: 2,
+		source: "worker",
+		status: "completed",
+		evidence: { kind: "worker_completed", result: "Done" },
+	}));
+	assert.deepEqual(duplicate.accepted ? undefined : duplicate.reason, "terminal_duplicate");
+	assert.equal(h.rejections.length, 0);
+
+	const conflict = h.acceptor.accept(candidate({
+		eventId: "event-completed-conflict",
+		sourceInstanceId: "worker-1",
+		sourceSequence: 2,
+		source: "worker",
+		status: "completed",
+		evidence: { kind: "worker_completed", result: "Different result" },
+	}));
+	assert.deepEqual(conflict.accepted ? undefined : conflict.reason, "terminal_conflict");
+	assert.equal(h.rejections.length, 1);
+	assert.equal(h.rejections[0].candidate.eventId, "event-completed-conflict");
+	assert.equal(h.acceptor.getRun(binding.runId)?.acceptedSequence, 1);
+	assert.deepEqual(h.acceptor.getRun(binding.runId)?.terminalEvidence, { kind: "worker_completed", result: "Done" });
+});
+
+test("enforces source precedence and journals reserved stop rejection", () => {
+	const h = setup();
+	h.acceptor.bindRun(binding);
+	assert.equal(h.acceptor.accept(candidate({
+		eventId: "event-ready",
+		sourceInstanceId: "worker-1",
+		sourceSequence: 1,
+		source: "worker",
+		status: "started",
+		evidence: { kind: "worker_ready", readiness: "confirmed" },
+	})).accepted, true);
+	const weaker = h.acceptor.accept(candidate({
+		eventId: "event-weaker",
+		sourceSequence: 2,
+		status: "uncertain",
+		evidence: { kind: "uncertain", scope: "agent_start", detail: "Late provider ambiguity" },
+	}));
+	assert.deepEqual(weaker.accepted ? undefined : weaker.reason, "invalid_transition");
+	assert.equal(h.acceptor.getRun(binding.runId)?.status, "started");
+
+	const stopped = h.acceptor.accept(candidate({
+		eventId: "event-stopped",
+		sourceInstanceId: "controller-1",
+		sourceSequence: 1,
+		source: "controller",
+		status: "stopped",
+		evidence: { kind: "stop_acknowledged", stopRequestId: "stop-1" },
+	}));
+	assert.deepEqual(stopped.accepted ? undefined : stopped.reason, "unsupported_stopped");
+	assert.deepEqual(h.rejections.map((entry) => entry.reason), ["invalid_transition", "unsupported_stopped"]);
+	assert.equal(h.journal.length, 1);
+});
+
+test("restores terminal evidence and keeps duplicate replay idempotent", () => {
+	const first = setup();
+	first.acceptor.bindRun(binding);
+	assert.equal(first.acceptor.accept(candidate({
+		eventId: "event-failed",
+		sourceInstanceId: "worker-1",
+		sourceSequence: 1,
+		source: "worker",
+		status: "failed",
+		evidence: { kind: "worker_failed", error: "Blocked" },
+	})).accepted, true);
+	const entry = { type: "custom", customType: LIFECYCLE_JOURNAL_ENTRY, data: first.journal[0] };
+	const restored = setup([entry, structuredClone(entry)]);
+	assert.equal(restored.acceptor.getRun(binding.runId)?.acceptedSequence, 1);
+	assert.deepEqual(restored.acceptor.getRun(binding.runId)?.terminalEvidence, { kind: "worker_failed", error: "Blocked" });
+	assert.equal(restored.emissions.length, 0);
+	assert.equal(restored.acceptor.bindRun(binding), true);
+	const duplicate = restored.acceptor.accept(candidate({
+		eventId: "event-failed-again",
+		sourceInstanceId: "worker-1",
+		sourceSequence: 2,
+		source: "worker",
+		status: "failed",
+		evidence: { kind: "worker_failed", error: "Blocked" },
+	}));
+	assert.deepEqual(duplicate.accepted ? undefined : duplicate.reason, "terminal_duplicate");
 });
 
 test("isolates subscriber failures and preserves later delivery", async () => {

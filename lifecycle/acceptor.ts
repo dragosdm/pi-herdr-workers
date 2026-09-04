@@ -10,14 +10,23 @@ import {
 	type AcceptedLifecycleEvent,
 	type LifecycleCandidate,
 	type LifecycleStatus,
+	type WorkerLifecycleEvidence,
 } from "./protocol.js";
 
 export const LIFECYCLE_JOURNAL_ENTRY = "herdr-worker.lifecycle.v1";
+export const LIFECYCLE_REJECTION_ENTRY = "herdr-worker.lifecycle-rejection.v1";
 
 export interface LifecycleJournalEntry {
 	version: 1;
 	sessionId: string;
 	event: AcceptedLifecycleEvent;
+}
+
+export interface LifecycleRejectionEntry {
+	version: 1;
+	sessionId: string;
+	reason: Extract<LifecycleRejectionReason, "invalid_transition" | "terminal_conflict" | "unsupported_stopped">;
+	candidate: LifecycleCandidate;
 }
 
 export interface RunBinding {
@@ -31,6 +40,7 @@ export interface RunBinding {
 export interface RunLifecycleRecord extends RunBinding {
 	status?: LifecycleStatus;
 	readiness?: "unconfirmed" | "confirmed";
+	terminalEvidence?: WorkerLifecycleEvidence;
 	acceptedSequence: number;
 	eventIds: Set<string>;
 	sourceSequences: Map<string, number>;
@@ -60,7 +70,7 @@ interface SessionEntry {
 export interface LifecycleAcceptorOptions {
 	sessionId: string;
 	getEntries: () => readonly SessionEntry[];
-	appendEntry: (customType: string, data: LifecycleJournalEntry) => void;
+	appendEntry: (customType: string, data: LifecycleJournalEntry | LifecycleRejectionEntry) => void;
 	emit: (channel: string, payload: AcceptedLifecycleEvent) => unknown;
 }
 
@@ -70,9 +80,14 @@ function copyRecord(record: RunLifecycleRecord): RunLifecycleRecord {
 	return {
 		...record,
 		worker: { ...record.worker },
+		...(record.terminalEvidence === undefined ? {} : { terminalEvidence: structuredClone(record.terminalEvidence) }),
 		eventIds: new Set(record.eventIds),
 		sourceSequences: new Map(record.sourceSequences),
 	};
+}
+
+function sameEvidence(left: WorkerLifecycleEvidence | undefined, right: WorkerLifecycleEvidence): boolean {
+	return left !== undefined && JSON.stringify(left) === JSON.stringify(right);
 }
 
 function validBinding(binding: RunBinding): boolean {
@@ -90,16 +105,27 @@ function sameBinding(record: RunLifecycleRecord, candidate: Pick<LifecycleCandid
 		&& record.worker.paneId === candidate.worker.paneId;
 }
 
+function compatibleBinding(record: RunLifecycleRecord, binding: RunBinding): boolean {
+	return record.correlationId === binding.correlationId
+		&& record.worker.name === binding.worker.name
+		&& (record.worker.paneId === undefined || binding.worker.paneId === undefined || record.worker.paneId === binding.worker.paneId);
+}
+
 function transitionReason(record: RunLifecycleRecord, candidate: LifecycleCandidate): LifecycleRejectionReason | undefined {
 	const current = record.status;
 	if (candidate.status === "stopped") return "unsupported_stopped";
 	if (candidate.status === "message") return undefined;
 	if (TERMINAL_STATUSES.has(current as LifecycleStatus)) {
-		if (candidate.status === current) return "terminal_duplicate";
+		if (candidate.status === current && sameEvidence(record.terminalEvidence, candidate.evidence)) return "terminal_duplicate";
 		if (TERMINAL_STATUSES.has(candidate.status)) return "terminal_conflict";
 		return "invalid_transition";
 	}
-	if (candidate.status === "uncertain") return undefined;
+	if (candidate.status === "uncertain") {
+		if (current === "started" && record.readiness === "confirmed" && candidate.evidence.scope !== "assignment_delivery") {
+			return "invalid_transition";
+		}
+		return undefined;
+	}
 	if (candidate.status === "started") {
 		if (current === undefined || current === "uncertain") return undefined;
 		if (current === "started" && candidate.evidence.kind === "worker_ready" && record.readiness !== "confirmed") return undefined;
@@ -120,6 +146,7 @@ function applyAccepted(record: RunLifecycleRecord, event: AcceptedLifecycleEvent
 		return;
 	}
 	record.status = event.status;
+	if (TERMINAL_STATUSES.has(event.status)) record.terminalEvidence = structuredClone(event.evidence);
 }
 
 function safeEmit(emit: LifecycleAcceptorOptions["emit"], channel: string, event: AcceptedLifecycleEvent): void {
@@ -142,10 +169,11 @@ export class LifecycleAcceptor {
 		if (!validBinding(binding)) return false;
 		const current = this.records.get(binding.runId);
 		if (current) {
-			const matches = sameBinding(current, binding)
+			const matches = compatibleBinding(current, binding)
 				&& (current.requestId === undefined || binding.requestId === undefined || current.requestId === binding.requestId)
 				&& (current.providerInstanceId === undefined || binding.providerInstanceId === undefined || current.providerInstanceId === binding.providerInstanceId);
 			if (matches) {
+				current.worker.paneId ??= binding.worker.paneId;
 				current.requestId ??= binding.requestId;
 				current.providerInstanceId ??= binding.providerInstanceId;
 			}
@@ -181,7 +209,10 @@ export class LifecycleAcceptor {
 			return { accepted: false, reason: "stale_source", record: copyRecord(record) };
 		}
 		const reason = transitionReason(record, candidate);
-		if (reason) return { accepted: false, reason, record: copyRecord(record) };
+		if (reason) {
+			this.recordRejection(reason, candidate);
+			return { accepted: false, reason, record: copyRecord(record) };
+		}
 
 		const event = { ...candidate, acceptedSequence: record.acceptedSequence + 1 } as AcceptedLifecycleEvent;
 		this.options.appendEntry(LIFECYCLE_JOURNAL_ENTRY, {
@@ -193,6 +224,18 @@ export class LifecycleAcceptor {
 		safeEmit(this.options.emit, LIFECYCLE_CHANNELS.lifecycle, event);
 		safeEmit(this.options.emit, lifecycleChannel(event.status), event);
 		return { accepted: true, event, record: copyRecord(record) };
+	}
+
+	private recordRejection(reason: LifecycleRejectionReason, candidate: LifecycleCandidate): void {
+		if (reason !== "invalid_transition" && reason !== "terminal_conflict" && reason !== "unsupported_stopped") return;
+		try {
+			this.options.appendEntry(LIFECYCLE_REJECTION_ENTRY, {
+				version: 1,
+				sessionId: this.options.sessionId,
+				reason,
+				candidate,
+			});
+		} catch {}
 	}
 
 	private restore(): void {

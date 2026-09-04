@@ -180,6 +180,26 @@ interface HerdrWorkerTestOptions {
 	onInboxHandler?: (deliverEnvelope: (envelope: unknown, envelopeId: string) => Promise<void>) => void;
 }
 
+interface CreateOpts {
+	runId: string;
+	correlationId?: string;
+	provenance?: SpawnProvenance;
+	name?: string;
+	direction?: Direction;
+	type?: string;
+	purpose?: string;
+	model?: string;
+	thinking?: string;
+	initialPrompt?: string;
+}
+
+interface PendingSpawnLifecycle {
+	opts: CreateOpts;
+	name: string;
+	paneId?: string;
+	scope: "pane_creation" | "agent_start" | "assignment_delivery";
+}
+
 export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions = {}) {
 	let state: State = { workers: [] };
 	let ctxRef: ExtensionContext | undefined;
@@ -192,6 +212,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	let createQueue = Promise.resolve();
 	let lifecycleAcceptor: LifecycleAcceptor | undefined;
 	let providerLifecycleSequence = 0;
+	const pendingSpawnLifecycles = new Map<string, PendingSpawnLifecycle>();
 	const inFlightEnvelopes = new Set<string>();
 	const interactive = () => HERDR_ENV && !!SELF_PANE && ctxRef?.mode === "tui" && !stopped;
 	const providerState = () => {
@@ -851,18 +872,6 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		return { pane: last, direction: along, swap: false, how: `stacked ${along === "down" ? "below" : "right of"} ${last}` };
 	}
 
-	interface CreateOpts {
-		runId: string;
-		correlationId?: string;
-		provenance?: SpawnProvenance;
-		name?: string;
-		direction?: Direction;
-		type?: string;
-		purpose?: string;
-		model?: string;
-		thinking?: string;
-		initialPrompt?: string;
-	}
 	interface CreateResult {
 		runId: string;
 		correlationId?: string;
@@ -907,6 +916,42 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		}
 	}
 
+	function observeProviderUncertain(
+		opts: CreateOpts,
+		name: string,
+		paneId: string | undefined,
+		scope: PendingSpawnLifecycle["scope"],
+		detail: string,
+	): void {
+		try {
+			const bound = paneId === undefined
+				? lifecycleAcceptor?.bindRun({
+					runId: opts.runId,
+					...(opts.correlationId === undefined ? {} : { correlationId: opts.correlationId }),
+					worker: { name },
+					...(opts.provenance?.requestId === undefined ? {} : { requestId: opts.provenance.requestId }),
+					providerInstanceId: opts.provenance?.providerInstanceId ?? rpcServer.providerInstanceId,
+				})
+				: bindLifecycleRun(opts, name, paneId);
+			if (!bound) return;
+			lifecycleAcceptor?.accept({
+				protocol: LIFECYCLE_PROTOCOL_V1,
+				eventId: randomUUID(),
+				runId: opts.runId,
+				sourceInstanceId: opts.provenance?.providerInstanceId ?? rpcServer.providerInstanceId,
+				sourceSequence: ++providerLifecycleSequence,
+				status: "uncertain",
+				worker: { name, ...(paneId === undefined ? {} : { paneId }) },
+				observedAt: Date.now(),
+				source: "provider",
+				...(opts.correlationId === undefined ? {} : { correlationId: opts.correlationId }),
+				evidence: { kind: "uncertain", scope, detail },
+			});
+		} catch {
+			// Lifecycle persistence and publication must not replace the operation's own failure.
+		}
+	}
+
 	async function createAgent(opts: CreateOpts, ctx: ExtensionContext, cwd: string): Promise<CreateResult> {
 		if (!HERDR_ENV || !SELF_PANE) throw new Error("Not running inside herdr.");
 		const dir: Direction = opts.direction ?? "right";
@@ -941,8 +986,16 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 				} };
 				persist();
 				bindLifecycleRun(opts, wanted, existing.paneId);
-				await sendControl(wanted, "bind-run", { runId: opts.runId, ...(opts.correlationId === undefined ? {} : { correlationId: opts.correlationId }) });
-				if (opts.initialPrompt) await send(wanted, opts.initialPrompt, false, undefined, opts.runId);
+				pendingSpawnLifecycles.set(opts.runId, { opts, name: wanted, paneId: existing.paneId, scope: "assignment_delivery" });
+				try {
+					await sendControl(wanted, "bind-run", { runId: opts.runId, ...(opts.correlationId === undefined ? {} : { correlationId: opts.correlationId }) });
+					if (opts.initialPrompt) await send(wanted, opts.initialPrompt, false, undefined, opts.runId);
+				} catch (error) {
+					observeProviderUncertain(opts, wanted, existing.paneId, "assignment_delivery", "The re-adopted worker assignment delivery outcome is ambiguous.");
+					throw error;
+				} finally {
+					pendingSpawnLifecycles.delete(opts.runId);
+				}
 				const meta = state.meta?.[wanted];
 				return { runId: opts.runId, correlationId: opts.correlationId, name: wanted, paneId: existing.paneId, model: meta?.model, type: meta?.type, purpose: meta?.purpose, cwd: existing.cwd?.trim() ? existing.cwd : cwd, how: "re-adopted existing pane", adopted: true };
 			}
@@ -951,10 +1004,29 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 
 		// Create the pane: start a worker stack on the requested side, or extend the existing one.
 		const target = await pickSplit(dir);
-		const split = await herdr(["pane", "split", target.pane, "--direction", target.direction, "--cwd", cwd, "--no-focus"]);
+		pendingSpawnLifecycles.set(opts.runId, { opts, name, scope: "pane_creation" });
+		let split: any;
+		try {
+			split = await herdr(["pane", "split", target.pane, "--direction", target.direction, "--cwd", cwd, "--no-focus"]);
+		} catch (error) {
+			observeProviderUncertain(opts, name, undefined, "pane_creation", "The pane creation outcome is ambiguous.");
+			pendingSpawnLifecycles.delete(opts.runId);
+			throw error;
+		}
 		const paneId: string | undefined = split?.result?.pane?.pane_id;
-		if (!paneId) throw new Error(`pane split returned no pane id: ${JSON.stringify(split)}`);
-		pi.appendEntry("herdr-worker.operation.v1", { name, paneId, phase: "pane-created", at: Date.now() });
+		if (!paneId) {
+			observeProviderUncertain(opts, name, undefined, "pane_creation", "Pane creation returned without a pane identity, so external effects cannot be excluded.");
+			pendingSpawnLifecycles.delete(opts.runId);
+			throw new Error(`pane split returned no pane id: ${JSON.stringify(split)}`);
+		}
+		pendingSpawnLifecycles.set(opts.runId, { opts, name, paneId, scope: "agent_start" });
+		try {
+			pi.appendEntry("herdr-worker.operation.v1", { name, paneId, phase: "pane-created", at: Date.now() });
+		} catch (error) {
+			observeProviderUncertain(opts, name, paneId, "pane_creation", "A pane was created but its operation checkpoint could not be persisted.");
+			pendingSpawnLifecycles.delete(opts.runId);
+			throw error;
+		}
 		if (target.swap) {
 			await herdr(["pane", "swap", "--source-pane", SELF_PANE, "--target-pane", paneId]).catch(() => {});
 		}
@@ -968,30 +1040,48 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		try {
 			await herdr(["agent", "start", name, "--kind", "pi", "--pane", paneId, "--timeout", "60000", "--", ...piArgs], { timeout: 70000 });
 		} catch (e: any) {
-			if (!stopped) pi.appendEntry("herdr-worker.operation.v1", { name, paneId, phase: "start-failed", at: Date.now() });
+			if (!stopped) {
+				try { pi.appendEntry("herdr-worker.operation.v1", { name, paneId, phase: "start-failed", at: Date.now() }); } catch {}
+			}
+			observeProviderUncertain(opts, name, paneId, "agent_start", "Agent start did not return conclusively after pane creation.");
+			pendingSpawnLifecycles.delete(opts.runId);
 			throw new Error(`Started pane ${paneId} but agent start failed: ${e.message}. Check \`herdr pane read ${paneId}\`.`);
 		}
 
-		if (!state.workers.includes(name)) state.workers.push(name);
-		state.meta = { ...(state.meta ?? {}), [name]: {
-			type,
-			purpose: opts.purpose?.trim() || undefined,
-			model,
-			paneId,
-			runId: opts.runId,
-			correlationId: opts.correlationId,
-			requestId: opts.provenance?.requestId,
-			providerInstanceId: opts.provenance?.providerInstanceId,
-		} };
-		persist();
-		updateUi();
+		try {
+			if (!state.workers.includes(name)) state.workers.push(name);
+			state.meta = { ...(state.meta ?? {}), [name]: {
+				type,
+				purpose: opts.purpose?.trim() || undefined,
+				model,
+				paneId,
+				runId: opts.runId,
+				correlationId: opts.correlationId,
+				requestId: opts.provenance?.requestId,
+				providerInstanceId: opts.provenance?.providerInstanceId,
+			} };
+			persist();
+			updateUi();
+		} catch (error) {
+			observeProviderUncertain(opts, name, paneId, "agent_start", "Agent start returned but the worker relationship could not be persisted.");
+			pendingSpawnLifecycles.delete(opts.runId);
+			throw error;
+		}
 		observeProviderStarted(opts, name, paneId);
 
 		if (opts.initialPrompt?.trim()) {
+			pendingSpawnLifecycles.set(opts.runId, { opts, name, paneId, scope: "assignment_delivery" });
 			// Wait for the worker's extension to come up and register its inbox, then hand over the brief.
 			for (let i = 0; i < 20 && !isListening(paneId); i++) await new Promise((r) => setTimeout(r, 500));
-			await send(name, opts.initialPrompt, false, undefined, opts.runId);
+			try {
+				await send(name, opts.initialPrompt, false, undefined, opts.runId);
+			} catch (error) {
+				observeProviderUncertain(opts, name, paneId, "assignment_delivery", "The initial assignment delivery outcome is ambiguous after worker start.");
+				pendingSpawnLifecycles.delete(opts.runId);
+				throw error;
+			}
 		}
+		pendingSpawnLifecycles.delete(opts.runId);
 		return { runId: opts.runId, correlationId: opts.correlationId, name, paneId, model, type, purpose: opts.purpose?.trim() || undefined, cwd, how: target.how, adopted: false };
 	}
 
@@ -1381,6 +1471,16 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	pi.on("session_shutdown", async () => {
 		// Headless sessions must not remove the interactive pane's listener file.
 		const wasListening = !!watcher || !!poller;
+		for (const pending of pendingSpawnLifecycles.values()) {
+			observeProviderUncertain(
+				pending.opts,
+				pending.name,
+				pending.paneId,
+				pending.scope,
+				"Provider shutdown interrupted worker creation after an external side effect may have occurred.",
+			);
+		}
+		pendingSpawnLifecycles.clear();
 		stopped = true;
 		rpcServer.dispose();
 		lifetime.abort();

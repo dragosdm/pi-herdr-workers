@@ -50,11 +50,17 @@ Workers are named `agent-<name>` (or `agent-<type>` / `agent-N`). First worker o
 
 `priority: true` steers; otherwise follow-up. Transport is a per-pane inbox under `$XDG_RUNTIME_DIR/pi-herdr-worker/`. Pi receives a durable, model-visible custom message attributed to the sending agent, not a fabricated user message. Non-Pi targets fall back to `herdr agent prompt`.
 
+### `ReportWorkerRun` and lifecycle events
+
+Each worker assignment has a provider-generated `runId`, separate from an RPC `requestId`, optional caller `correlationId`, worker name, and pane identity. A bound worker can use `ReportWorkerRun` for typed `message`, `completed`, or `failed` reports. The extension supplies trusted identity and ordering fields; ordinary `SendToAgent` prose is never interpreted as an outcome.
+
+Accepted observations are journaled in the parent session before publication on `herdr-workers:lifecycle` and the matching `herdr-workers:<status>` channel. Provider-observed start, worker readiness, explicit outcomes, and scoped uncertainty carry different evidence. Release and extension shutdown do not mean the worker stopped. See `docs/lifecycle-events.md` for the contract, durability, deduplication, and consumer boundaries.
+
 ### Inter-extension RPC
 
 Extensions loaded in the same Pi process can probe `herdr-workers:rpc:probe` and call the worker provider directly, without a model turn. Probe first, negotiate protocol 1, select one available provider instance, and use its request-specific reply channels. The fixed capabilities are `spawn`, `send`, `steer`, and team-scoped `inspect`; existing `/team`, `CreateAgentPanel`, and `SendToAgent` behavior is unchanged.
 
-The event bus is process-local, requests are not durable, and callers should use bounded waits and fall back when no provider is available. The registered stop channel is reserved: stop is not advertised and returns `UNSUPPORTED_OPERATION`; it does not release a worker, close a pane, or send Ctrl-C. See `docs/rpc-protocol.md` for the import-free JSON contract, limits, routing, errors, and raw `pi.events` usage.
+The event bus is process-local, requests are not durable, and callers should use bounded waits and fall back when no provider is available. A spawn reply identifies the run and closes the request; a send receipt confirms transport acceptance; lifecycle observations record evidence; only explicit run-aware `completed` or `failed` reports state an assignment outcome. The registered stop channel is reserved: stop is not advertised and returns `UNSUPPORTED_OPERATION`; it does not release a worker, close a pane, or send Ctrl-C. See `docs/rpc-protocol.md` for the import-free JSON contract, limits, routing, errors, and raw `pi.events` usage.
 
 ---
 
@@ -123,6 +129,7 @@ MonitorStop monitorId="1"
 - Team snapshots are immutable, versioned, restored on `session_start` and `/tree`, and scoped to the source session. A new fork does not inherit another session's worker-control authority. Legacy unversioned team records remain readable.
 - Loops and monitor handles are **operational facts**: `/tree` does not undo an external launch or resurrect a deleted controller. New session IDs do not inherit active controllers or monitor handles. In explicit shared-store mode, the shared file remains authoritative.
 - Pending loop wakes are journaled before delivery and acknowledged only after their custom message is present in SessionManager. Team messages retain their mailbox file until that same persistence boundary. `message_end` is too early: pi invokes that hook before saving the message.
+- Worker lifecycle observations are appended as `herdr-worker.lifecycle.v1` before local publication and restored from all entries in the current session. Duplicate inbox delivery and reload do not republish a new accepted observation; `/tree` does not erase operational lifecycle history.
 - Restoring state never creates panes, restarts commands, or re-sends an already recorded wake. A dynamic iteration awaiting `LoopUpdate` stays awaiting an update after reload; interrupted external work is not blindly repeated. Inspect it and provide the update, or pause/resume it explicitly from `/loop` when safe. A reached fire cap cannot be resumed; renewal requires a new authorized controller.
 - Timers, subscriptions, in-flight requests, sampled process status and UI contexts are runtime resources, not replayed state. Shutdown aborts/cleans them without killing worker or monitor panes. Headless pi instances do not claim a pane's team mailbox.
 - Status items are compact counts, next-wake/awaiting-update state and unverified/unavailable monitors. Detailed rosters remain in `/team list`, `LoopList`, and `MonitorList`.
@@ -132,13 +139,15 @@ MonitorStop monitorId="1"
 
 - `@trevonistrevon/pi-loop` kitchen sink (workflows, native tasks, pi-subagents batches)
 - `OrchestrationCreate` — use `/team` + `CreateAgentPanel` instead
+- Automatic mapping from worker lifecycle events into loop orchestration; a future loop-owned adapter must preserve reducer ownership and wake acknowledgement
 
 ---
 
 ## Layout
 
 ```text
-extensions/herdr-worker.ts   /team, CreateAgentPanel, SendToAgent
+extensions/herdr-worker.ts   /team, CreateAgentPanel, SendToAgent, ReportWorkerRun
+lifecycle/                   worker lifecycle protocol, acceptance, persistence, publication
 extensions/split-handoff.ts  /split-handoff, /split-fork, /splits
 loop/                        /loop + Monitor* (Herdr-backed)
 ```
