@@ -1,8 +1,9 @@
 import { isDeepStrictEqual } from "node:util";
 import { Type, type Static } from "typebox";
 import { Check } from "typebox/value";
+import { LIFECYCLE_PROTOCOL_V1, LIFECYCLE_PROTOCOL_V2, type LifecycleProtocol } from "../lifecycle/protocol.js";
 import type { RunLifecycleRecord } from "../lifecycle/acceptor.js";
-import type { WorkerRunRecordV1, WorkerRunStatus } from "./protocol.js";
+import type { WorkerRunRecordV2, WorkerRunStatus } from "./protocol.js";
 
 export const RUN_REGISTRATION_ENTRY = "herdr-worker.run-registration.v1";
 export const RUN_ENDPOINT_BINDING_ENTRY = "herdr-worker.run-endpoint-bound.v1";
@@ -27,6 +28,7 @@ export const RunRegistrationV1Schema = Type.Object({
 	registeredAt: Type.Integer({ minimum: 0 }),
 	correlationId: Type.Optional(safeId),
 	requestId: Type.Optional(safeId),
+	lifecycleProtocol: Type.Optional(Type.Union([Type.Literal(LIFECYCLE_PROTOCOL_V1), Type.Literal(LIFECYCLE_PROTOCOL_V2)])),
 	assignment: Type.Object({
 		cwd: bounded(LIMITS.cwd),
 		model: Type.Optional(bounded(LIMITS.model)),
@@ -133,9 +135,10 @@ export class RunRegistry {
 		return [...this.registrations.values()].map(clone);
 	}
 
-	projectRun(runId: string, lifecycle?: RunLifecycleRecord, observation?: LiveEndpointObservation): WorkerRunRecordV1 | undefined {
+	projectRun(runId: string, lifecycle?: RunLifecycleRecord, observation?: LiveEndpointObservation): WorkerRunRecordV2 | undefined {
 		const registration = this.registrations.get(runId);
 		if (registration) {
+			const lifecycleProtocol = registration.lifecycleProtocol ?? LIFECYCLE_PROTOCOL_V1;
 			const endpoint = this.endpoints.get(runId);
 			const matchingObservation = endpoint !== undefined
 				&& observation?.agentName === endpoint.agentName
@@ -143,13 +146,14 @@ export class RunRegistry {
 				? observation
 				: undefined;
 			return clone({
-				protocol: 1,
+				protocol: 2,
+				lifecycleProtocol,
 				runId: registration.runId,
 				...(registration.correlationId === undefined ? {} : { correlationId: registration.correlationId }),
 				...(registration.requestId === undefined ? {} : { requestId: registration.requestId }),
 				sessionId: registration.sessionId,
 				registeredAt: registration.registeredAt,
-				lifecycle: lifecycleView(lifecycle),
+				lifecycle: lifecycleView(lifecycle, lifecycleProtocol),
 				assignment: clone(registration.assignment),
 				...(endpoint === undefined ? {} : {
 					endpoint: {
@@ -163,12 +167,13 @@ export class RunRegistry {
 		}
 		if (!lifecycle || lifecycle.acceptedSequence === 0) return undefined;
 		return clone({
-			protocol: 1,
+			protocol: 2,
 			legacy: true,
+			lifecycleProtocol: lifecycle.lifecycleProtocol,
 			runId: lifecycle.runId,
 			...(lifecycle.correlationId === undefined ? {} : { correlationId: lifecycle.correlationId }),
 			sessionId: this.options.sessionId,
-			lifecycle: lifecycleView(lifecycle),
+			lifecycle: lifecycleView(lifecycle, lifecycle.lifecycleProtocol),
 			worker: {
 				agentName: lifecycle.worker.name,
 				...(lifecycle.worker.paneId === undefined ? {} : { paneId: lifecycle.worker.paneId }),
@@ -176,14 +181,14 @@ export class RunRegistry {
 		});
 	}
 
-	listRunRecords(lifecycleRecords: readonly RunLifecycleRecord[]): WorkerRunRecordV1[] {
+	listRunRecords(lifecycleRecords: readonly RunLifecycleRecord[]): WorkerRunRecordV2[] {
 		const lifecycleByRun = new Map(lifecycleRecords.map((record) => [record.runId, record]));
 		const runIds = new Set(this.registrations.keys());
 		for (const record of lifecycleRecords) if (record.acceptedSequence > 0) runIds.add(record.runId);
 		return [...runIds]
 			.sort()
 			.map((runId) => this.projectRun(runId, lifecycleByRun.get(runId)))
-			.filter((record): record is WorkerRunRecordV1 => record !== undefined);
+			.filter((record): record is WorkerRunRecordV2 => record !== undefined);
 	}
 
 	private restore(): void {
@@ -204,7 +209,7 @@ export class RunRegistry {
 	}
 }
 
-function lifecycleView(record?: RunLifecycleRecord): WorkerRunRecordV1["lifecycle"] {
+function lifecycleView(record: RunLifecycleRecord | undefined, lifecycleProtocol: LifecycleProtocol): WorkerRunRecordV2["lifecycle"] {
 	let status: WorkerRunStatus = "registered";
 	if (record?.status === "started" || record?.status === "completed" || record?.status === "failed" || record?.status === "uncertain") {
 		status = record.status;
@@ -212,6 +217,10 @@ function lifecycleView(record?: RunLifecycleRecord): WorkerRunRecordV1["lifecycl
 	return {
 		status,
 		acceptedSequence: record?.acceptedSequence ?? 0,
+		orchestrationGradeCompletion: status === "completed"
+			&& lifecycleProtocol === LIFECYCLE_PROTOCOL_V2
+			&& (record?.terminalEvidence?.kind === "worker_completed_v2"
+				|| record?.terminalEvidence?.kind === "reconciled_completed_v2"),
 		...(record?.readiness === undefined ? {} : { readiness: record.readiness }),
 	};
 }

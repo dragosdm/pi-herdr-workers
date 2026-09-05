@@ -4,6 +4,7 @@ import type { RpcEventBus } from "../rpc/client.js";
 import {
 	RUN_QUERY_CHANNELS,
 	RUN_QUERY_PROTOCOL_V1,
+	RUN_QUERY_SUPPORTED_PROTOCOLS,
 	RUN_QUERY_RESULT_SCHEMAS,
 	isRunQueryReplyEnvelope,
 	isValidReplayRunResult,
@@ -18,7 +19,7 @@ import {
 	type RunQueryProbeData,
 	type RunQueryReply,
 	type RunQueryRequestChannel,
-	type WorkerRunRecordV1,
+	type WorkerRunRecord,
 } from "./protocol.js";
 
 export interface RunQueryCallOptions { timeoutMs?: number; signal?: AbortSignal }
@@ -90,7 +91,8 @@ export class RunQueryClient {
 					unsupportedProtocol ??= new RunQueryResponseError(payload.error.code, payload.error.message);
 					return;
 				}
-				if (!isValidRunQueryResult("probe", payload.data)) {
+				if (payload.protocol !== (payload.data as { protocol?: unknown }).protocol
+					|| !isValidRunQueryResult("probe", payload.data, payload.protocol)) {
 					malformedSuccess = true;
 					return;
 				}
@@ -105,24 +107,24 @@ export class RunQueryClient {
 			}), timeoutMs);
 			options.signal?.addEventListener("abort", onAbort, { once: true });
 			try {
-				this.events.emit(RUN_QUERY_CHANNELS.probe, { requestId, supportedProtocols: [RUN_QUERY_PROTOCOL_V1] });
+				this.events.emit(RUN_QUERY_CHANNELS.probe, { requestId, supportedProtocols: [...RUN_QUERY_SUPPORTED_PROTOCOLS] });
 			} catch (error) {
 				finish(() => reject(error));
 			}
 		});
 	}
 
-	async get(input: GetRunInput, provider: RunQueryProbeData, options?: RunQueryCallOptions): Promise<WorkerRunRecordV1> {
-		return this.operation("get", input, provider, RUN_QUERY_RESULT_SCHEMAS.get, options);
+	async get(input: GetRunInput, provider: RunQueryProbeData, options?: RunQueryCallOptions): Promise<WorkerRunRecord> {
+		return this.operation("get", input, provider, RUN_QUERY_RESULT_SCHEMAS[provider.protocol].get, options);
 	}
 
 	async list(input: ListRunsInput, provider: RunQueryProbeData, options?: RunQueryCallOptions): Promise<ListRunsResult> {
-		return this.operation("list", input, provider, RUN_QUERY_RESULT_SCHEMAS.list, options);
+		return this.operation("list", input, provider, RUN_QUERY_RESULT_SCHEMAS[provider.protocol].list, options);
 	}
 
 	async replay(input: ReplayRunInput, provider: RunQueryProbeData, options?: RunQueryCallOptions): Promise<ReplayRunResult> {
-		const result = await this.operation<ReplayRunResult>("replay", input, provider, RUN_QUERY_RESULT_SCHEMAS.replay, options);
-		if (!isValidReplayRunResult(result, input)) throw new RunQueryProtocolError();
+		const result = await this.operation<ReplayRunResult>("replay", input, provider, RUN_QUERY_RESULT_SCHEMAS[provider.protocol].replay, options);
+		if (!isValidReplayRunResult(result, input, provider.protocol)) throw new RunQueryProtocolError();
 		return result;
 	}
 
@@ -134,10 +136,10 @@ export class RunQueryClient {
 			providerInstanceId: provider.providerInstanceId,
 			protocol: provider.protocol,
 		} as RunQueryAddressedRequest;
-		return this.call(RUN_QUERY_CHANNELS[operation], request, resultSchema, timeoutFor(operation, options.timeoutMs), options.signal);
+		return this.call(RUN_QUERY_CHANNELS[operation], request, resultSchema, timeoutFor(operation, options.timeoutMs), options.signal, provider.protocol);
 	}
 
-	private call<T>(channel: RunQueryRequestChannel, request: RunQueryAddressedRequest, _resultSchema: TSchema, timeoutMs: number, signal?: AbortSignal): Promise<T> {
+	private call<T>(channel: RunQueryRequestChannel, request: RunQueryAddressedRequest, _resultSchema: TSchema, timeoutMs: number, signal: AbortSignal | undefined, protocol: 1 | 2): Promise<T> {
 		return new Promise((resolve, reject) => {
 			let settled = false;
 			let timer: ReturnType<typeof setTimeout> | undefined;
@@ -147,13 +149,13 @@ export class RunQueryClient {
 			const onAbort = () => finish(() => reject(new RunQueryAbortError()));
 			if (signal?.aborted) return onAbort();
 			unsubscribe = this.events.on(runQueryReplyChannel(channel, request.requestId), (payload) => {
-				if (!isRunQueryReplyEnvelope(payload) || payload.requestId !== request.requestId) return;
+				if (!isRunQueryReplyEnvelope(payload) || payload.requestId !== request.requestId || payload.protocol !== protocol) return;
 				if (!payload.success) {
 					finish(() => reject(new RunQueryResponseError(payload.error.code, payload.error.message)));
 					return;
 				}
 				const operation = channel === RUN_QUERY_CHANNELS.get ? "get" : channel === RUN_QUERY_CHANNELS.list ? "list" : "replay";
-				if (!isValidRunQueryResult(operation, payload.data)) {
+				if (!isValidRunQueryResult(operation, payload.data, protocol)) {
 					finish(() => reject(new RunQueryProtocolError()));
 					return;
 				}

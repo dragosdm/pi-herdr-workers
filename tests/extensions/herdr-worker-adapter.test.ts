@@ -3,6 +3,7 @@ import test from "node:test";
 import { LIFECYCLE_JOURNAL_ENTRY } from "../../lifecycle/acceptor.js";
 import { LIFECYCLE_CHANNELS, type AcceptedLifecycleEvent } from "../../lifecycle/protocol.js";
 import { CHANNELS, replyChannel, type DeliveryReceipt, type Inspection, type RpcReply, type WorkerReference } from "../../rpc/protocol.js";
+import { RECONCILIATION_CHANNELS, reconciliationReplyChannel, type ReconciliationReply } from "../../reconciliation/protocol.js";
 import { RUN_QUERY_CHANNELS, runQueryReplyChannel, type RunQueryReply, type WorkerRunRecordV1 } from "../../runs/protocol.js";
 import { RUN_ENDPOINT_BINDING_ENTRY, RUN_REGISTRATION_ENTRY } from "../../runs/registry.js";
 import { FakeIsolatedEventBus } from "../support/fake-isolated-event-bus.js";
@@ -136,20 +137,30 @@ async function emitRunQueryForReply<T>(events: FakeIsolatedEventBus, channel: (t
 	});
 }
 
+async function emitReconciliationForReply<T>(events: FakeIsolatedEventBus, channel: (typeof RECONCILIATION_CHANNELS)[keyof typeof RECONCILIATION_CHANNELS], requestId: string, payload: unknown): Promise<ReconciliationReply<T>> {
+	return await new Promise((resolve) => {
+		const unsubscribe = events.on(reconciliationReplyChannel(channel, requestId), (reply) => {
+			unsubscribe();
+			resolve(reply as ReconciliationReply<T>);
+		});
+		events.emit(channel, payload);
+	});
+}
+
 function teamBranch(data: any): any[] {
 	return [{ type: "custom", customType: "herdr-worker", data: { version: 1, sessionId: "session", workers: [], ...data } }];
 }
 
 function workerReport(runId: string, overrides: Record<string, unknown> = {}) {
 	return {
-		protocol: 1,
+		protocol: 2,
 		eventId: "worker-event-1",
 		runId,
 		sourceInstanceId: "worker-source-1",
 		sourceSequence: 1,
 		observedAt: 1_786_000_000_000,
 		status: "completed",
-		evidence: { kind: "worker_completed", result: "Done" },
+		evidence: { kind: "worker_completed_v2", result: "Done" },
 		...overrides,
 	};
 }
@@ -162,11 +173,11 @@ test("registers once, exposes live availability, and disposes on shutdown", asyn
 	let probe = await emitForReply<any>(h.events, CHANNELS.probe, "before", { requestId: "before", supportedProtocols: [1] });
 	assert.equal(probe.success && probe.data.reason, "SESSION_NOT_READY");
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
-	assert.equal(h.events.listenerCount(), 9);
+	assert.equal(h.events.listenerCount(), 11);
 	probe = await emitForReply<any>(h.events, CHANNELS.probe, "after", { requestId: "after", supportedProtocols: [1] });
 	assert.equal(probe.success && probe.data.available, true);
 	await h.handlers.get("session_tree")![0]({}, h.ctx);
-	assert.equal(h.events.listenerCount(), 9);
+	assert.equal(h.events.listenerCount(), 11);
 	await h.handlers.get("session_shutdown")![0]();
 	assert.equal(h.events.listenerCount(), 0);
 });
@@ -197,6 +208,7 @@ test("RPC spawn validates cwd before side effects, activates team mode, and retu
 		sessionId: "session",
 		registeredAt: 0,
 		requestId: "spawn",
+		lifecycleProtocol: 2,
 		assignment: { cwd: "/tmp", model: "test/model" },
 	});
 	assert.equal(h.activeTools().includes("CreateAgentPanel"), true);
@@ -217,6 +229,7 @@ test("CreateAgentPanel preserves parameter mapping through the shared spawn faca
 		runId: "<run>",
 		sessionId: "session",
 		registeredAt: 0,
+		lifecycleProtocol: 2,
 		assignment: { cwd: "/tmp", model: "xai/grok-4.6", role: "research" },
 	});
 });
@@ -272,6 +285,7 @@ test("re-adoption sends the run binding before its assignment prompt", async () 
 	assert.ok(bindingIndex >= 0);
 	assert.ok(promptIndex > bindingIndex);
 	assert.equal(h.writtenEnvelopes[bindingIndex].envelope.binding.runId, spawned.data.runId);
+	assert.equal(h.writtenEnvelopes[bindingIndex].envelope.binding.protocol, 2);
 	assert.equal(h.writtenEnvelopes[bindingIndex].envelope.binding.correlationId, "dispatch-1");
 	assert.equal(h.writtenEnvelopes[promptIndex].envelope.runId, spawned.data.runId);
 	const registrationIndex = h.entries.findIndex((entry) => entry.type === RUN_REGISTRATION_ENTRY);
@@ -286,7 +300,7 @@ test("new workers bind startup flags, report readiness, and gate ReportWorkerRun
 	const h = await harness({
 		listening: true,
 		selfName: "agent-child",
-		flags: { "orchestrated-by": "boss", "worker-run-id": "run-child", "worker-correlation-id": "dispatch-child" },
+		flags: { "orchestrated-by": "boss", "worker-run-id": "run-child", "worker-correlation-id": "dispatch-child", "worker-lifecycle-protocol": "2" },
 	});
 	assert.equal(h.activeTools().includes("ReportWorkerRun"), false);
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
@@ -295,18 +309,46 @@ test("new workers bind startup flags, report readiness, and gate ReportWorkerRun
 	assert.equal(ready.paneId, "boss-pane");
 	assert.equal(ready.envelope.type, "lifecycle");
 	assert.equal(ready.envelope.report.runId, "run-child");
+	assert.equal(ready.envelope.report.protocol, 2);
 	assert.equal(ready.envelope.report.sourceSequence, 1);
 	assert.deepEqual(ready.envelope.report.evidence, { kind: "worker_ready", readiness: "confirmed" });
 
 	const messageResult = await h.tools.get("ReportWorkerRun").execute("report-1", { status: "message", message: "Still working" });
-	const completedResult = await h.tools.get("ReportWorkerRun").execute("report-2", { status: "completed", result: "Implemented" });
+	await assert.rejects(
+		h.tools.get("ReportWorkerRun").execute("report-invalid", { status: "completed" }),
+		/bound contract/,
+	);
+	const completedResult = await h.tools.get("ReportWorkerRun").execute("report-2", {
+		status: "completed",
+		result: "Implemented",
+		artifacts: [{ path: "reports/result.md", description: "Final report" }],
+		checks: [{ kind: "test", command: "npm test", outcome: "passed" }],
+	});
 	assert.equal(messageResult.details.runId, "run-child");
 	assert.equal(completedResult.details.status, "completed");
 	const reports = h.writtenEnvelopes.map(({ envelope }) => envelope.report).filter(Boolean);
 	assert.deepEqual(reports.map((report) => report.sourceSequence), [1, 2, 3]);
 	assert.deepEqual(reports[1].evidence, { kind: "worker_message", message: "Still working" });
-	assert.deepEqual(reports[2].evidence, { kind: "worker_completed", result: "Implemented" });
+	assert.deepEqual(reports[2].evidence, {
+		kind: "worker_completed_v2",
+		result: "Implemented",
+		artifacts: [{ path: "reports/result.md", description: "Final report" }],
+		checks: [{ kind: "test", command: "npm test", outcome: "passed" }],
+	});
 	assert.equal(h.entries.some((entry) => entry.data.activeRun?.sourceSequence === 3), true);
+});
+
+test("bound worker prompt reserves terminal reporting for ReportWorkerRun", async () => {
+	const h = await harness({
+		listening: true,
+		selfName: "agent-child",
+		flags: { "orchestrated-by": "boss", "worker-run-id": "run-child", "worker-lifecycle-protocol": "2" },
+	});
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	const prompt = await h.handlers.get("before_agent_start")![0]({ systemPrompt: "base" });
+	assert.match(prompt.systemPrompt, /Use SendToAgent for questions and ordinary communication/);
+	assert.match(prompt.systemPrompt, /Report terminal outcomes only with ReportWorkerRun/);
+	assert.match(prompt.systemPrompt, /non-empty result/);
 });
 
 test("re-adopted workers apply a trusted run binding before reporting ready", async () => {
@@ -322,7 +364,7 @@ test("re-adopted workers apply a trusted run binding before reporting ready", as
 		type: "control",
 		from: { id: "boss", paneId: "boss-pane", name: "boss", role: "orchestrator" },
 		action: "bind-run",
-		binding: { protocol: 1, runId: "run-adopted", correlationId: "dispatch-adopted" },
+		binding: { protocol: 2, runId: "run-adopted", correlationId: "dispatch-adopted" },
 		ts: Date.now(),
 	}, "bind-run.json");
 	await new Promise((resolve) => setImmediate(resolve));
@@ -335,7 +377,7 @@ test("re-adopted workers apply a trusted run binding before reporting ready", as
 test("parent accepts trusted lifecycle reports only after custom-message persistence", async () => {
 	const runId = "run-parent";
 	const h = await harness({
-		branch: teamBranch({ workers: ["agent-scout"], meta: { "agent-scout": { paneId: "worker-pane", runId, correlationId: "dispatch-parent" } } }),
+		branch: teamBranch({ workers: ["agent-scout"], meta: { "agent-scout": { paneId: "worker-pane", runId, correlationId: "dispatch-parent", lifecycleProtocol: 2 } } }),
 		agents: [{ pane_id: "worker-pane", tab_id: "tab-1", name: "agent-scout", agent: "pi" }],
 	});
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
@@ -369,7 +411,7 @@ test("parent accepts trusted lifecycle reports only after custom-message persist
 test("parent rejects untrusted and pane-mismatched lifecycle senders", async () => {
 	const runId = "run-trusted";
 	const h = await harness({
-		branch: teamBranch({ workers: ["agent-scout"], meta: { "agent-scout": { paneId: "worker-pane", runId } } }),
+		branch: teamBranch({ workers: ["agent-scout"], meta: { "agent-scout": { paneId: "worker-pane", runId, lifecycleProtocol: 2 } } }),
 		agents: [{ pane_id: "worker-pane", tab_id: "tab-1", name: "agent-scout", agent: "pi" }],
 	});
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
@@ -398,7 +440,7 @@ test("reload accepts a persisted trusted report that was not yet journaled", asy
 		},
 	}];
 	const h = await harness({
-		branch: teamBranch({ workers: ["agent-scout"], meta: { "agent-scout": { paneId: "worker-pane", runId } } }),
+		branch: teamBranch({ workers: ["agent-scout"], meta: { "agent-scout": { paneId: "worker-pane", runId, lifecycleProtocol: 2 } } }),
 		sessionEntries,
 	});
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
@@ -480,6 +522,7 @@ test("RPC direction and thinking reach the canonical creation sequence", async (
 	assert.ok(start);
 	assert.equal(start.includes("test/model:high"), true);
 	assert.equal(start.includes("--worker-run-id"), true);
+	assert.equal(start[start.indexOf("--worker-lifecycle-protocol") + 1], "2");
 	assert.equal(start[start.indexOf("--worker-run-id") + 1], spawned.success ? spawned.data.runId : undefined);
 });
 
@@ -603,6 +646,76 @@ test("post-start assignment failure retains started evidence and records uncerta
 	assert.deepEqual(lifecycle.map((event) => event.acceptedSequence), [1, 2]);
 });
 
+test("reconciliation resolves the original uncertain run without worker side effects and survives reload", async () => {
+	const h = await harness({ listening: true, writeEnvelopeErrorForType: "message" });
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	const workerProbe = await emitForReply<any>(h.events, CHANNELS.probe, "reconcile-worker-probe", { requestId: "reconcile-worker-probe", supportedProtocols: [1] });
+	const workerProviderId = workerProbe.success ? workerProbe.data.providerInstanceId : "";
+	const spawned = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, "reconcile-spawn", {
+		requestId: "reconcile-spawn", providerInstanceId: workerProviderId, protocol: 1, name: "builder", initialPrompt: "Do the work",
+	});
+	assert.equal(spawned.success, false);
+	const registration = h.entries.find((entry) => entry.type === RUN_REGISTRATION_ENTRY)?.data;
+	const runId = registration.runId as string;
+	const endpointEntriesBefore = h.entries.filter((entry) => entry.type === RUN_ENDPOINT_BINDING_ENTRY).length;
+	const execCallsBefore = h.execCalls.length;
+
+	const probe = await emitReconciliationForReply<any>(h.events, RECONCILIATION_CHANNELS.probe, "reconciliation-probe", {
+		requestId: "reconciliation-probe", supportedProtocols: [1],
+	});
+	assert.equal(probe.success && probe.data.available, true);
+	const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
+	const completed = await emitReconciliationForReply<AcceptedLifecycleEvent>(h.events, RECONCILIATION_CHANNELS.reconcile, "reconciliation-complete", {
+		requestId: "reconciliation-complete",
+		providerInstanceId,
+		protocol: 1,
+		runId,
+		expectedAcceptedSequence: 2,
+		resolution: {
+			status: "completed",
+			result: "Recovered the completed implementation.",
+			detail: "Git and tests establish completion on the original run.",
+			observations: [{ source: "git", detail: "Expected changes are present in the worktree.", observedAt: 1_786_000_000_100 }],
+			artifacts: [{ path: "reports/result.md" }],
+			checks: [{ kind: "test", command: "npm test", outcome: "passed" }],
+		},
+	});
+	assert.equal(completed.success, true);
+	if (!completed.success) return;
+	assert.equal(completed.data.runId, runId);
+	assert.equal(completed.data.acceptedSequence, 3);
+	assert.equal(completed.data.evidence.kind, "reconciled_completed_v2");
+	assert.equal(h.execCalls.length, execCallsBefore);
+	assert.equal(h.entries.filter((entry) => entry.type === RUN_ENDPOINT_BINDING_ENTRY).length, endpointEntriesBefore);
+	assert.equal(h.entries.filter((entry) => entry.type === RUN_REGISTRATION_ENTRY).length, 1);
+
+	const stale = await emitReconciliationForReply(h.events, RECONCILIATION_CHANNELS.reconcile, "reconciliation-stale", {
+		requestId: "reconciliation-stale",
+		providerInstanceId,
+		protocol: 1,
+		runId,
+		expectedAcceptedSequence: 2,
+		resolution: { status: "started", detail: "Still active", observations: [{ source: "journal", detail: "Old snapshot", observedAt: 1 }] },
+	});
+	assert.equal(stale.success ? "success" : stale.error.code, "STALE_ACCEPTED_SEQUENCE");
+
+	await h.handlers.get("session_shutdown")![0]();
+	h.herdrWorker(h.pi, { disableInbox: true });
+	await h.handlers.get("session_start")![1]({ reason: "startup" }, h.ctx);
+	const queryProbe = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.probe, "reconciled-query-probe", { requestId: "reconciled-query-probe", supportedProtocols: [2, 1] });
+	const queryProviderId = queryProbe.success ? queryProbe.data.providerInstanceId : "";
+	const record = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.get, "reconciled-query-get", {
+		requestId: "reconciled-query-get", providerInstanceId: queryProviderId, protocol: 2, runId,
+	});
+	assert.equal(record.success && record.data.lifecycle.status, "completed");
+	assert.equal(record.success && record.data.lifecycle.acceptedSequence, 3);
+	assert.equal(record.success && record.data.lifecycle.orchestrationGradeCompletion, true);
+	const replay = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.replay, "reconciled-query-replay", {
+		requestId: "reconciled-query-replay", providerInstanceId: queryProviderId, protocol: 2, runId, afterAcceptedSequence: 2,
+	});
+	assert.deepEqual(replay.success && replay.data.events, [completed.data]);
+});
+
 test("shutdown during creation records uncertainty without claiming a stop", async () => {
 	let releaseStart!: () => void;
 	let markStartEntered!: () => void;
@@ -705,7 +818,7 @@ test("run query returns durable strict handles across provider reloads", async (
 		requestId: "query-get-2", providerInstanceId: secondProbe.data.providerInstanceId, protocol: 1, runId: spawned.data.runId,
 	});
 	assert.deepEqual(secondGet.success && secondGet.data, firstGet.success && firstGet.data);
-	assert.equal(h.events.listenerCount(), 9);
+	assert.equal(h.events.listenerCount(), 11);
 });
 
 test("run query lists lifecycle-only history without fabricating strict facts", async () => {
@@ -893,5 +1006,5 @@ test("reload replaces the provider instance and stale addressed requests are no-
 	await new Promise((resolve) => setImmediate(resolve));
 	unsubscribe();
 	assert.equal(replied, false);
-	assert.equal(h.events.listenerCount(), 9);
+	assert.equal(h.events.listenerCount(), 11);
 });

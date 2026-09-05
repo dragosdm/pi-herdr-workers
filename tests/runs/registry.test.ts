@@ -151,3 +151,43 @@ test("enriches only an exactly matching endpoint observation without persisting 
 	assert.equal(h.appended.length, appendCount);
 	assert.deepEqual(h.registry.getEndpoint(registration.runId), endpoint);
 });
+
+test("persists selected lifecycle contract and defaults old registrations to contract 1", () => {
+	const old = setup();
+	old.registry.register(registration);
+	const oldRecord = old.registry.projectRun(registration.runId)!;
+	assert.equal(oldRecord.protocol, 2);
+	assert.equal(oldRecord.lifecycleProtocol, 1);
+	assert.equal(oldRecord.lifecycle.orchestrationGradeCompletion, false);
+
+	const selectedRegistration = { ...registration, runId: "run-v2", lifecycleProtocol: 2 as const };
+	const selected = setup();
+	selected.registry.register(selectedRegistration);
+	assert.equal(selected.appended[0].data && "lifecycleProtocol" in selected.appended[0].data
+		? selected.appended[0].data.lifecycleProtocol
+		: undefined, 2);
+	assert.equal(selected.registry.getRegistration("run-v2")?.lifecycleProtocol, 2);
+	assert.equal(selected.registry.projectRun("run-v2")?.lifecycleProtocol, 2);
+});
+
+test("marks only matching contract 2 terminal evidence as orchestration-grade", () => {
+	const h = setup();
+	h.registry.register({ ...registration, lifecycleProtocol: 2 });
+	const baseLifecycle = {
+		runId: registration.runId,
+		lifecycleProtocol: 2 as const,
+		worker: { name: "agent-scout", paneId: "pane-1" },
+		status: "completed" as const,
+		acceptedSequence: 1,
+		eventIds: new Set<string>(),
+		sourceSequences: new Map<string, number>(),
+	};
+	assert.equal(h.registry.projectRun(registration.runId, {
+		...baseLifecycle,
+		terminalEvidence: { kind: "worker_completed_v2", result: "Done" },
+	})?.lifecycle.orchestrationGradeCompletion, true);
+	assert.equal(h.registry.projectRun(registration.runId, {
+		...baseLifecycle,
+		terminalEvidence: { kind: "worker_completed", result: "Legacy" },
+	})?.lifecycle.orchestrationGradeCompletion, false);
+});

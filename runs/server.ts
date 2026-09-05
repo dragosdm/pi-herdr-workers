@@ -3,12 +3,14 @@ import type { RpcEventBus } from "../rpc/client.js";
 import {
 	RUN_QUERY_CHANNELS,
 	RUN_QUERY_PROTOCOL_V1,
-	RUN_QUERY_RESULT_SCHEMAS,
+	RUN_QUERY_PROTOCOL_V2,
+	RUN_QUERY_SUPPORTED_PROTOCOLS,
 	RunQueryServiceError,
 	extractRunQueryRequestId,
 	isValidRunQueryRequest,
 	isValidRunQueryResult,
 	isValidReplayRunResult,
+	projectRunQueryResult,
 	runQueryFailure,
 	runQueryReplyChannel,
 	runQuerySuccess,
@@ -21,10 +23,11 @@ import {
 	type RunQueryProbeRequest,
 	type RunQueryRequestChannel,
 	type WorkerRunRecordV1,
+	type WorkerRunRecord,
 } from "./protocol.js";
 
 export interface RunQueryService {
-	get(input: GetRunInput, signal?: AbortSignal): Promise<WorkerRunRecordV1>;
+	get(input: GetRunInput, signal?: AbortSignal): Promise<WorkerRunRecord>;
 	list(input: ListRunsInput, signal?: AbortSignal): Promise<ListRunsResult>;
 	replay(input: ReplayRunInput, signal?: AbortSignal): Promise<ReplayRunResult>;
 }
@@ -58,14 +61,16 @@ export function registerRunQueryServer(options: RunQueryServerOptions): RunQuery
 		const requestId = extractRunQueryRequestId(payload);
 		if (!requestId) return;
 		if (!isValidRunQueryRequest(channel, payload)) {
-			emit(channel, requestId, runQueryFailure(requestId, "INVALID_REQUEST", FIXED_MESSAGES.INVALID_REQUEST));
+			const requestedProtocol = (payload as { protocol?: unknown }).protocol;
+			emit(channel, requestId, runQueryFailure(requestId, "INVALID_REQUEST", FIXED_MESSAGES.INVALID_REQUEST,
+				requestedProtocol === RUN_QUERY_PROTOCOL_V2 ? RUN_QUERY_PROTOCOL_V2 : RUN_QUERY_PROTOCOL_V1));
 			return;
 		}
 		if (channel === RUN_QUERY_CHANNELS.probe) {
 			const request = payload as RunQueryProbeRequest;
 			const protocol = [...request.supportedProtocols]
 				.sort((left, right) => right - left)
-				.find((item) => item === RUN_QUERY_PROTOCOL_V1);
+				.find((item): item is 1 | 2 => RUN_QUERY_SUPPORTED_PROTOCOLS.includes(item as 1 | 2));
 			if (!protocol) {
 				emit(channel, requestId, runQueryFailure(requestId, "UNSUPPORTED_PROTOCOL", FIXED_MESSAGES.UNSUPPORTED_PROTOCOL));
 				return;
@@ -80,20 +85,20 @@ export function registerRunQueryServer(options: RunQueryServerOptions): RunQuery
 				...(state.available ? {} : { reason: state.reason ?? "SESSION_NOT_READY" }),
 				constraints: { sessionScoped: true, requiresHerdrPane: false, requiresInteractivePi: false },
 			};
-			emit(channel, requestId, isValidRunQueryResult("probe", data)
-				? runQuerySuccess(requestId, data)
-				: runQueryFailure(requestId, "INTERNAL_ERROR", FIXED_MESSAGES.INTERNAL_ERROR));
+			emit(channel, requestId, isValidRunQueryResult("probe", data, protocol)
+				? runQuerySuccess(requestId, data, protocol)
+				: runQueryFailure(requestId, "INTERNAL_ERROR", FIXED_MESSAGES.INTERNAL_ERROR, protocol));
 			return;
 		}
 
 		const request = payload as Record<string, unknown> & { providerInstanceId: string; protocol: number };
 		if (request.providerInstanceId !== providerInstanceId) return;
-		if (request.protocol !== RUN_QUERY_PROTOCOL_V1) {
+		if (request.protocol !== RUN_QUERY_PROTOCOL_V1 && request.protocol !== RUN_QUERY_PROTOCOL_V2) {
 			emit(channel, requestId, runQueryFailure(requestId, "UNSUPPORTED_PROTOCOL", FIXED_MESSAGES.UNSUPPORTED_PROTOCOL));
 			return;
 		}
 		if (!options.getProviderState().available) {
-			emit(channel, requestId, runQueryFailure(requestId, "PROVIDER_UNAVAILABLE", FIXED_MESSAGES.PROVIDER_UNAVAILABLE));
+			emit(channel, requestId, runQueryFailure(requestId, "PROVIDER_UNAVAILABLE", FIXED_MESSAGES.PROVIDER_UNAVAILABLE, request.protocol));
 			return;
 		}
 
@@ -114,20 +119,21 @@ export function registerRunQueryServer(options: RunQueryServerOptions): RunQuery
 						...(request.limit === undefined ? {} : { limit: request.limit as number }),
 					});
 			const operation = channel === RUN_QUERY_CHANNELS.get ? "get" : channel === RUN_QUERY_CHANNELS.list ? "list" : "replay";
-			const valid = isValidRunQueryResult(operation, data)
-				&& (operation !== "replay" || isValidReplayRunResult(data, {
+			const projected = projectRunQueryResult(operation, data, request.protocol);
+			const valid = isValidRunQueryResult(operation, projected, request.protocol)
+				&& (operation !== "replay" || isValidReplayRunResult(projected, {
 					runId: request.runId as string,
 					afterAcceptedSequence: request.afterAcceptedSequence as number,
 					...(request.limit === undefined ? {} : { limit: request.limit as number }),
-				}));
+				}, request.protocol));
 			emit(channel, requestId, valid
-				? runQuerySuccess(requestId, data)
-				: runQueryFailure(requestId, "INTERNAL_ERROR", FIXED_MESSAGES.INTERNAL_ERROR));
+				? runQuerySuccess(requestId, projected, request.protocol)
+				: runQueryFailure(requestId, "INTERNAL_ERROR", FIXED_MESSAGES.INTERNAL_ERROR, request.protocol));
 		} catch (error) {
 			if (error instanceof RunQueryServiceError) {
-				emit(channel, requestId, runQueryFailure(requestId, error.code, error.message));
+				emit(channel, requestId, runQueryFailure(requestId, error.code, error.message, request.protocol));
 			} else {
-				emit(channel, requestId, runQueryFailure(requestId, "INTERNAL_ERROR", FIXED_MESSAGES.INTERNAL_ERROR));
+				emit(channel, requestId, runQueryFailure(requestId, "INTERNAL_ERROR", FIXED_MESSAGES.INTERNAL_ERROR, request.protocol));
 			}
 		}
 	};

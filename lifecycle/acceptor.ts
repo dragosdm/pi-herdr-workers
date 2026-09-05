@@ -1,4 +1,6 @@
+import { randomUUID } from "node:crypto";
 import { Check } from "typebox/value";
+import { isReconcileRunInput, type ReconcileRunInput } from "../reconciliation/protocol.js";
 import {
 	LIFECYCLE_CHANNELS,
 	LifecycleCorrelationIdSchema,
@@ -9,6 +11,7 @@ import {
 	lifecycleChannel,
 	type AcceptedLifecycleEvent,
 	type LifecycleCandidate,
+	type LifecycleProtocol,
 	type LifecycleStatus,
 	type WorkerLifecycleEvidence,
 } from "./protocol.js";
@@ -31,6 +34,7 @@ export interface LifecycleRejectionEntry {
 
 export interface RunBinding {
 	runId: string;
+	lifecycleProtocol: LifecycleProtocol;
 	correlationId?: string;
 	worker: { name: string; paneId?: string };
 	requestId?: string;
@@ -50,16 +54,32 @@ export type LifecycleRejectionReason =
 	| "invalid_candidate"
 	| "unbound_run"
 	| "binding_mismatch"
+	| "protocol_mismatch"
 	| "duplicate"
 	| "stale_source"
 	| "invalid_transition"
 	| "terminal_duplicate"
 	| "terminal_conflict"
-	| "unsupported_stopped";
+	| "unsupported_stopped"
+	| "not_uncertain"
+	| "stale_accepted_sequence"
+	| "endpoint_mismatch"
+	| "unsupported_lifecycle_protocol";
 
 export type LifecycleAcceptanceResult =
 	| { accepted: true; event: AcceptedLifecycleEvent; record: RunLifecycleRecord }
 	| { accepted: false; reason: LifecycleRejectionReason; record?: RunLifecycleRecord };
+
+export interface ReconciliationAuthority {
+	sourceInstanceId: string;
+	eventId?: string;
+	observedAt?: number;
+}
+
+export interface ReconciliationEndpoint {
+	agentName: string;
+	paneId: string;
+}
 
 interface SessionEntry {
 	type?: unknown;
@@ -92,6 +112,7 @@ function sameEvidence(left: WorkerLifecycleEvidence | undefined, right: WorkerLi
 
 function validBinding(binding: RunBinding): boolean {
 	return Check(LifecycleRunIdSchema, binding.runId)
+		&& (binding.lifecycleProtocol === 1 || binding.lifecycleProtocol === 2)
 		&& (binding.correlationId === undefined || Check(LifecycleCorrelationIdSchema, binding.correlationId))
 		&& typeof binding.worker.name === "string"
 		&& binding.worker.name.length > 0
@@ -106,7 +127,8 @@ function sameBinding(record: RunLifecycleRecord, candidate: Pick<LifecycleCandid
 }
 
 function compatibleBinding(record: RunLifecycleRecord, binding: RunBinding): boolean {
-	return record.correlationId === binding.correlationId
+	return record.lifecycleProtocol === binding.lifecycleProtocol
+		&& record.correlationId === binding.correlationId
 		&& record.worker.name === binding.worker.name
 		&& (record.worker.paneId === undefined || binding.worker.paneId === undefined || record.worker.paneId === binding.worker.paneId);
 }
@@ -217,6 +239,7 @@ export class LifecycleAcceptor {
 		const candidate = value;
 		const record = this.records.get(candidate.runId);
 		if (!record) return { accepted: false, reason: "unbound_run" };
+		if (candidate.protocol !== record.lifecycleProtocol) return { accepted: false, reason: "protocol_mismatch", record: copyRecord(record) };
 		if (!sameBinding(record, candidate)) return { accepted: false, reason: "binding_mismatch", record: copyRecord(record) };
 		if (candidate.source === "provider" && record.providerInstanceId !== undefined && candidate.sourceInstanceId !== record.providerInstanceId) {
 			return { accepted: false, reason: "binding_mismatch", record: copyRecord(record) };
@@ -243,6 +266,58 @@ export class LifecycleAcceptor {
 		safeEmit(this.options.emit, LIFECYCLE_CHANNELS.lifecycle, event);
 		safeEmit(this.options.emit, lifecycleChannel(event.status), event);
 		return { accepted: true, event, record: copyRecord(record) };
+	}
+
+	reconcile(value: unknown, authority: ReconciliationAuthority, endpoint?: ReconciliationEndpoint): LifecycleAcceptanceResult {
+		if (!isReconcileRunInput(value) || !Check(LifecycleSourceInstanceIdSchema, authority.sourceInstanceId)) {
+			return { accepted: false, reason: "invalid_candidate" };
+		}
+		const input = value as ReconcileRunInput;
+		const record = this.records.get(input.runId);
+		if (!record) return { accepted: false, reason: "unbound_run" };
+		if (record.lifecycleProtocol !== 2) {
+			return { accepted: false, reason: "unsupported_lifecycle_protocol", record: copyRecord(record) };
+		}
+		if (record.acceptedSequence !== input.expectedAcceptedSequence) {
+			return { accepted: false, reason: "stale_accepted_sequence", record: copyRecord(record) };
+		}
+		if (record.status !== "uncertain") {
+			return { accepted: false, reason: "not_uncertain", record: copyRecord(record) };
+		}
+		for (const observation of input.resolution.observations) {
+			if (!("endpoint" in observation)) continue;
+			if (!endpoint
+				|| observation.endpoint.agentName !== endpoint.agentName
+				|| observation.endpoint.paneId !== endpoint.paneId) {
+				return { accepted: false, reason: "endpoint_mismatch", record: copyRecord(record) };
+			}
+		}
+
+		const resolution = input.resolution;
+		const evidence = resolution.status === "started"
+			? { kind: "reconciled_started_v2" as const, detail: resolution.detail, observations: resolution.observations }
+			: resolution.status === "completed"
+				? {
+					kind: "reconciled_completed_v2" as const,
+					result: resolution.result,
+					detail: resolution.detail,
+					observations: resolution.observations,
+					...(resolution.artifacts === undefined ? {} : { artifacts: resolution.artifacts }),
+					...(resolution.checks === undefined ? {} : { checks: resolution.checks }),
+				}
+				: { kind: "reconciled_failed_v2" as const, detail: resolution.detail, observations: resolution.observations };
+		return this.accept({
+			protocol: 2,
+			eventId: authority.eventId ?? randomUUID(),
+			runId: input.runId,
+			sourceInstanceId: authority.sourceInstanceId,
+			status: resolution.status,
+			worker: { ...record.worker },
+			observedAt: authority.observedAt ?? Date.now(),
+			source: "reconciler",
+			...(record.correlationId === undefined ? {} : { correlationId: record.correlationId }),
+			evidence,
+		} as LifecycleCandidate);
 	}
 
 	private recordRejection(reason: LifecycleRejectionReason, candidate: LifecycleCandidate): void {
@@ -281,6 +356,7 @@ export class LifecycleAcceptor {
 				if (!record) {
 						record = {
 						runId: event.runId,
+						lifecycleProtocol: event.protocol,
 						...(event.correlationId === undefined ? {} : { correlationId: event.correlationId }),
 							worker: { ...event.worker },
 							...(event.source === "provider" ? { providerInstanceId: event.sourceInstanceId } : {}),

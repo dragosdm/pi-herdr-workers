@@ -30,6 +30,7 @@ import { Text } from "@earendil-works/pi-tui";
 import { createLifecycleAcceptor, type LifecycleAcceptor } from "../lifecycle/acceptor.js";
 import {
 	LIFECYCLE_PROTOCOL_V1,
+	LIFECYCLE_PROTOCOL_V2,
 	WorkerRunReportInputSchema,
 	isWorkerRunBinding,
 	isWorkerRunReport,
@@ -37,9 +38,13 @@ import {
 	type WorkerRunBinding,
 	type WorkerRunReport,
 	type WorkerRunReportInput,
+	type WorkerRunReportInputV1,
+	type WorkerRunReportInputV2,
 } from "../lifecycle/protocol.js";
 import { registerWorkerRpcServer, type WorkerRpcService } from "../rpc/server.js";
 import { WorkerRpcServiceError, type InspectInput, type Inspection, type SendInput, type DeliveryReceipt, type SpawnInput, type SpawnProvenance } from "../rpc/protocol.js";
+import { ReconciliationServiceError } from "../reconciliation/protocol.js";
+import { registerReconciliationServer, type ReconciliationServer, type ReconciliationService } from "../reconciliation/server.js";
 import { createRunRegistry, type RunRegistry } from "../runs/registry.js";
 import {
 	RUN_QUERY_LIMITS,
@@ -99,6 +104,7 @@ interface WorkerMeta {
 	correlationId?: string;
 	requestId?: string;
 	providerInstanceId?: string;
+	lifecycleProtocol?: 1 | 2;
 }
 
 interface State {
@@ -193,6 +199,7 @@ interface HerdrWorkerTestOptions {
 
 interface CreateOpts {
 	runId: string;
+	lifecycleProtocol: 2;
 	correlationId?: string;
 	provenance?: SpawnProvenance;
 	name?: string;
@@ -224,6 +231,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	let lifecycleAcceptor: LifecycleAcceptor | undefined;
 	let runRegistry: RunRegistry | undefined;
 	let runQueryServer: RunQueryServer | undefined;
+	let reconciliationServer: ReconciliationServer | undefined;
 	let providerLifecycleSequence = 0;
 	const pendingSpawnLifecycles = new Map<string, PendingSpawnLifecycle>();
 	const inFlightEnvelopes = new Set<string>();
@@ -250,6 +258,10 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	});
 	pi.registerFlag("worker-correlation-id", {
 		description: "Herdr worker: internal caller correlation identity",
+		type: "string",
+	});
+	pi.registerFlag("worker-lifecycle-protocol", {
+		description: "Herdr worker: lifecycle/report contract selected for this assignment",
 		type: "string",
 	});
 
@@ -655,34 +667,41 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		return `Typed into ${receipt.target} (pane ${receipt.paneId}, ${receipt.kind ?? "agent"}, no inbox listener) via \`herdr agent prompt\`. Priority flag not applicable there.`;
 	}
 
-	async function sendControl(targetId: string, action: ControlEnvelope["action"], binding: { runId: string; correlationId?: string } | undefined = undefined): Promise<boolean> {
+	async function sendControl(targetId: string, action: ControlEnvelope["action"], binding: WorkerRunBinding | undefined = undefined): Promise<boolean> {
 		const target = await agentGet(targetId);
 		if (!target || !isListening(target.paneId)) return false;
 		const env: ControlEnvelope = {
 			type: "control",
 			from: await makeSender(targetId, target),
 			action,
-			...(binding === undefined ? {} : { binding: { protocol: LIFECYCLE_PROTOCOL_V1, ...binding } }),
+			...(binding === undefined ? {} : { binding }),
 			ts: Date.now(),
 		};
 		writeEnvelope(target.paneId, env);
 		return true;
 	}
 
-	async function sendWorkerReport(input: WorkerRunReportInput): Promise<WorkerRunReport> {
-		if (!isWorkerRunReportInput(input)) throw new Error("Invalid worker lifecycle report.");
+	async function sendWorkerReport(input: WorkerRunReportInput | WorkerRunReportInputV1): Promise<WorkerRunReport> {
 		const activeRun = state.activeRun;
 		if (!activeRun || !state.orchestratedBy) throw new Error("No active worker run is bound.");
+		if (!isWorkerRunReportInput(input, activeRun.protocol)) throw new Error("Invalid worker lifecycle report for the bound contract.");
 		const target = await agentGet(state.orchestratedBy);
 		if (!target || !isListening(target.paneId)) throw new Error("The orchestrator is not listening for worker lifecycle reports.");
 		const sourceSequence = activeRun.sourceSequence + 1;
 		const evidence = input.status === "message"
 			? { kind: "worker_message" as const, message: input.message }
 			: input.status === "completed"
-				? { kind: "worker_completed" as const, ...(input.result === undefined ? {} : { result: input.result }) }
+				? activeRun.protocol === LIFECYCLE_PROTOCOL_V2
+					? {
+						kind: "worker_completed_v2" as const,
+						result: (input as WorkerRunReportInputV2 & { status: "completed" }).result,
+						...((input as WorkerRunReportInputV2 & { status: "completed" }).artifacts === undefined ? {} : { artifacts: (input as WorkerRunReportInputV2 & { status: "completed" }).artifacts }),
+						...((input as WorkerRunReportInputV2 & { status: "completed" }).checks === undefined ? {} : { checks: (input as WorkerRunReportInputV2 & { status: "completed" }).checks }),
+					}
+					: { kind: "worker_completed" as const, ...(input.result === undefined ? {} : { result: input.result }) }
 				: { kind: "worker_failed" as const, error: input.error };
 		const report = {
-			protocol: LIFECYCLE_PROTOCOL_V1,
+			protocol: activeRun.protocol,
 			eventId: randomUUID(),
 			runId: activeRun.runId,
 			sourceInstanceId: activeRun.sourceInstanceId,
@@ -709,7 +728,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		if (!target || !isListening(target.paneId)) return;
 		const sourceSequence = activeRun.sourceSequence + 1;
 		const report: WorkerRunReport = {
-			protocol: LIFECYCLE_PROTOCOL_V1,
+			protocol: activeRun.protocol,
 			eventId: randomUUID(),
 			runId: activeRun.runId,
 			sourceInstanceId: activeRun.sourceInstanceId,
@@ -739,7 +758,8 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			"target_id is the herdr agent name (e.g. a worker name) or pane id. priority=true steers the target mid-task (interrupts its current turn); priority=false queues a follow-up after its current work finishes.",
 		promptSnippet: "Message another herdr-hosted agent (orchestrator ↔ worker) asynchronously",
 		promptGuidelines: [
-			"Use SendToAgent to delegate to workers or report back to your orchestrator; write self-contained messages with goal, context, constraints, and what to report back.",
+			"Use SendToAgent for questions and ordinary communication. A bound worker must use ReportWorkerRun for terminal completion or failure.",
+			"When delegating to workers, write self-contained messages with goal, context, constraints, and what to report back.",
 			"SendToAgent is fire-and-forget: do not wait or poll for a reply — end your turn and react when the '[agent]' message arrives.",
 		],
 		parameters: Type.Object({
@@ -789,7 +809,8 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		description: "Report an authoritative message, successful completion, or failure for the worker's currently bound assignment. Identity and ordering are supplied by the extension.",
 		promptSnippet: "Report progress or the explicit outcome of the current worker assignment",
 		promptGuidelines: [
-			"Use ReportWorkerRun for assignment-aware updates and final outcomes; do not claim completion until the assigned work is actually complete.",
+			"ReportWorkerRun is the only terminal reporting path for a bound assignment. Use SendToAgent only for questions and ordinary communication.",
+			"Report completed only after the assignment is actually complete, with a non-empty result and any artifact or verification references. Report failed with a concrete error when it cannot be completed.",
 		],
 		parameters: WorkerRunReportInputSchema,
 		async execute(_id, params) {
@@ -901,6 +922,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	function bindLifecycleRun(opts: CreateOpts, name: string, paneId: string): boolean {
 		return lifecycleAcceptor?.bindRun({
 			runId: opts.runId,
+			lifecycleProtocol: opts.lifecycleProtocol,
 			...(opts.correlationId === undefined ? {} : { correlationId: opts.correlationId }),
 			worker: { name, paneId },
 			...(opts.provenance?.requestId === undefined ? {} : { requestId: opts.provenance.requestId }),
@@ -912,7 +934,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		try {
 			if (!bindLifecycleRun(opts, name, paneId)) return;
 			lifecycleAcceptor?.accept({
-				protocol: LIFECYCLE_PROTOCOL_V1,
+				protocol: opts.lifecycleProtocol,
 				eventId: randomUUID(),
 				runId: opts.runId,
 				sourceInstanceId: opts.provenance?.providerInstanceId ?? rpcServer.providerInstanceId,
@@ -940,6 +962,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			const bound = paneId === undefined
 				? lifecycleAcceptor?.bindRun({
 					runId: opts.runId,
+					lifecycleProtocol: opts.lifecycleProtocol,
 					...(opts.correlationId === undefined ? {} : { correlationId: opts.correlationId }),
 					worker: { name },
 					...(opts.provenance?.requestId === undefined ? {} : { requestId: opts.provenance.requestId }),
@@ -948,7 +971,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 				: bindLifecycleRun(opts, name, paneId);
 			if (!bound) return;
 			lifecycleAcceptor?.accept({
-				protocol: LIFECYCLE_PROTOCOL_V1,
+				protocol: opts.lifecycleProtocol,
 				eventId: randomUUID(),
 				runId: opts.runId,
 				sourceInstanceId: opts.provenance?.providerInstanceId ?? rpcServer.providerInstanceId,
@@ -1004,12 +1027,13 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 					correlationId: opts.correlationId,
 					requestId: opts.provenance?.requestId,
 					providerInstanceId: opts.provenance?.providerInstanceId,
+					lifecycleProtocol: opts.lifecycleProtocol,
 				} };
 				persist();
 				bindLifecycleRun(opts, wanted, existing.paneId);
 				pendingSpawnLifecycles.set(opts.runId, { opts, name: wanted, paneId: existing.paneId, scope: "assignment_delivery" });
 				try {
-					await sendControl(wanted, "bind-run", { runId: opts.runId, ...(opts.correlationId === undefined ? {} : { correlationId: opts.correlationId }) });
+					await sendControl(wanted, "bind-run", { protocol: opts.lifecycleProtocol, runId: opts.runId, ...(opts.correlationId === undefined ? {} : { correlationId: opts.correlationId }) });
 					if (opts.initialPrompt) await send(wanted, opts.initialPrompt, false, undefined, opts.runId);
 				} catch (error) {
 					observeProviderUncertain(opts, wanted, existing.paneId, "assignment_delivery", "The re-adopted worker assignment delivery outcome is ambiguous.");
@@ -1068,6 +1092,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 
 		await new Promise((r) => setTimeout(r, 1200)); // let the shell come up
 		const piArgs = ["--orchestrated-by", me, "--worker-run-id", opts.runId];
+		piArgs.push("--worker-lifecycle-protocol", String(opts.lifecycleProtocol));
 		if (opts.correlationId) piArgs.push("--worker-correlation-id", opts.correlationId);
 		if (model) piArgs.push("--model", opts.thinking ? `${model}:${opts.thinking}` : model);
 		const role = [type, opts.purpose?.trim()].filter(Boolean).join(": ");
@@ -1094,6 +1119,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 				correlationId: opts.correlationId,
 				requestId: opts.provenance?.requestId,
 				providerInstanceId: opts.provenance?.providerInstanceId,
+				lifecycleProtocol: opts.lifecycleProtocol,
 			} };
 			persist();
 			updateUi();
@@ -1156,6 +1182,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 				registeredAt: Date.now(),
 				...(input.correlationId === undefined ? {} : { correlationId: input.correlationId }),
 				...(provenance?.requestId === undefined ? {} : { requestId: provenance.requestId }),
+				lifecycleProtocol: LIFECYCLE_PROTOCOL_V2,
 				assignment: {
 					cwd: assignment.cwd,
 					...(assignment.model === undefined ? {} : { model: assignment.model }),
@@ -1169,7 +1196,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			}
 			const pending = createQueue.then(() => {
 				signal?.throwIfAborted();
-				return createAgent({ runId, correlationId: input.correlationId, provenance, name: input.name, direction: input.direction, model: assignment.model, type: assignment.role, purpose: input.purpose, thinking: input.thinking, initialPrompt: input.initialPrompt }, ctx, cwd);
+				return createAgent({ runId, lifecycleProtocol: LIFECYCLE_PROTOCOL_V2, correlationId: input.correlationId, provenance, name: input.name, direction: input.direction, model: assignment.model, type: assignment.role, purpose: input.purpose, thinking: input.thinking, initialPrompt: input.initialPrompt }, ctx, cwd);
 			});
 			createQueue = pending.then(() => {}, () => {});
 			const result = await pending;
@@ -1438,8 +1465,8 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 							`- Your role in the team: ${[state.role.type, state.role.purpose].filter(Boolean).join(" — ")}.${state.role.type && TYPE_HINTS[state.role.type] ? ` ${TYPE_HINTS[state.role.type]}` : ""} Stay within this charter; if a request falls outside it, say so to the orchestrator instead of doing it.`,
 						]
 					: []),
-				`- Do the work, then report back with SendToAgent({ target_id: "${state.orchestratedBy}", message }): what you did, where (files/PRs), how you verified, open questions or blockers. Be concise and concrete.`,
-				`- If a brief is ambiguous or blocked, ask the orchestrator via SendToAgent rather than guessing. You have no live back-and-forth; end your turn after sending.`,
+				`- Use SendToAgent for questions and ordinary communication. If a brief is ambiguous or blocked, ask the orchestrator rather than guessing; there is no live back-and-forth.`,
+				`- Report terminal outcomes only with ReportWorkerRun. When complete, report status "completed", a non-empty result, and any artifact or verification references. If the assignment cannot be completed, report status "failed" with a concrete error.`,
 				`- Your id: ${me}.`,
 			);
 		}
@@ -1519,11 +1546,37 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 					: { reason: stopped ? "SHUTTING_DOWN" as const : "SESSION_NOT_READY" as const }),
 			}),
 		});
+		const reconciliationService: ReconciliationService = {
+			async reconcile(input, authority) {
+				const result = lifecycleAcceptor?.reconcile(input, authority, runRegistry?.getEndpoint(input.runId));
+				if (result?.accepted) return result.event;
+				const reason = result?.reason;
+				if (reason === "unbound_run") throw new ReconciliationServiceError("NOT_FOUND", "Worker run was not found.");
+				if (reason === "not_uncertain") throw new ReconciliationServiceError("NOT_UNCERTAIN", "Worker run is not uncertain.");
+				if (reason === "stale_accepted_sequence") throw new ReconciliationServiceError("STALE_ACCEPTED_SEQUENCE", "Worker run changed after inspection.");
+				if (reason === "endpoint_mismatch") throw new ReconciliationServiceError("ENDPOINT_MISMATCH", "Observation endpoint does not match the run binding.");
+				if (reason === "unsupported_lifecycle_protocol") throw new ReconciliationServiceError("UNSUPPORTED_LIFECYCLE_PROTOCOL", "Worker run does not use lifecycle contract 2.");
+				throw new Error("Lifecycle reconciliation was rejected.");
+			},
+		};
+		reconciliationServer = registerReconciliationServer({
+			events: pi.events,
+			service: reconciliationService,
+			sessionId: ctx.sessionManager.getSessionId(),
+			getProviderState: () => ({
+				available: !stopped && runRegistry !== undefined && lifecycleAcceptor !== undefined,
+				...(!stopped && runRegistry !== undefined && lifecycleAcceptor !== undefined
+					? {}
+					: { reason: stopped ? "SHUTTING_DOWN" as const : "SESSION_NOT_READY" as const }),
+			}),
+		});
 		for (const name of state.workers) {
 			const meta = state.meta?.[name];
 			if (!meta?.runId || !meta.paneId) continue;
+			const registration = runRegistry.getRegistration(meta.runId);
 			lifecycleAcceptor.bindRun({
 				runId: meta.runId,
+				lifecycleProtocol: meta.lifecycleProtocol ?? registration?.lifecycleProtocol ?? LIFECYCLE_PROTOCOL_V1,
 				...(meta.correlationId === undefined ? {} : { correlationId: meta.correlationId }),
 				worker: { name, paneId: meta.paneId },
 				...(meta.requestId === undefined ? {} : { requestId: meta.requestId }),
@@ -1550,8 +1603,9 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		}
 		const runFlag = pi.getFlag("worker-run-id");
 		const correlationFlag = pi.getFlag("worker-correlation-id");
+		const lifecycleProtocolFlag = pi.getFlag("worker-lifecycle-protocol");
 		const startupBinding = {
-			protocol: LIFECYCLE_PROTOCOL_V1,
+			protocol: lifecycleProtocolFlag === "2" ? LIFECYCLE_PROTOCOL_V2 : LIFECYCLE_PROTOCOL_V1,
 			runId: runFlag,
 			...(typeof correlationFlag === "string" ? { correlationId: correlationFlag } : {}),
 		};
@@ -1599,6 +1653,8 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		}
 		pendingSpawnLifecycles.clear();
 		stopped = true;
+		reconciliationServer?.dispose();
+		reconciliationServer = undefined;
 		runQueryServer?.dispose();
 		runQueryServer = undefined;
 		rpcServer.dispose();

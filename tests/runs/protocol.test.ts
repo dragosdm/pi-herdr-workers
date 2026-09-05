@@ -5,13 +5,16 @@ import { CAPABILITIES, CHANNELS, WorkerReferenceSchema } from "../../rpc/protoco
 import {
 	GetRunRequestSchema,
 	LegacyWorkerRunProjectionV1Schema,
+	ListRunsResultV2Schema,
 	ListRunsRequestSchema,
 	ReplayRunRequestSchema,
 	ReplayRunResultSchema,
 	RUN_QUERY_CHANNELS,
 	RUN_QUERY_LIMITS,
+	RUN_QUERY_SUPPORTED_PROTOCOLS,
 	RunQueryProbeRequestSchema,
 	WorkerRunHandleV1Schema,
+	WorkerRunHandleV2Schema,
 	WorkerRunRecordV1Schema,
 	decodeRunQueryCursor,
 	encodeRunQueryCursor,
@@ -19,6 +22,8 @@ import {
 	isValidRunQueryRequest,
 	isValidRunQueryResult,
 	isValidReplayRunResult,
+	projectAcceptedLifecycleEvent,
+	projectRunQueryRecord,
 	runQueryFailure,
 	runQueryReplyChannel,
 	runQuerySuccess,
@@ -44,6 +49,12 @@ const legacy = {
 	lifecycle: { status: "completed", acceptedSequence: 2, readiness: "confirmed" },
 	worker: { agentName: "agent-old", paneId: "pane-old" },
 };
+const strictV2 = {
+	...strict,
+	protocol: 2 as const,
+	lifecycleProtocol: 2 as const,
+	lifecycle: { ...strict.lifecycle, status: "completed" as const, readiness: "unconfirmed" as const, orchestrationGradeCompletion: true },
+};
 const acceptedEvent = {
 	protocol: 1,
 	eventId: "event-1",
@@ -59,6 +70,7 @@ const acceptedEvent = {
 };
 
 test("defines independent versioned channels and validates safe addressed requests", () => {
+	assert.deepEqual(RUN_QUERY_SUPPORTED_PROTOCOLS, [2, 1]);
 	assert.deepEqual(RUN_QUERY_CHANNELS, {
 		probe: "herdr-workers:runs:rpc:probe",
 		get: "herdr-workers:runs:rpc:get",
@@ -75,6 +87,35 @@ test("defines independent versioned channels and validates safe addressed reques
 	assert.equal(Check(ReplayRunRequestSchema, { ...addressed, runId: "run-1", afterAcceptedSequence: 0, limit: 1 }), true);
 	assert.equal(Check(ReplayRunRequestSchema, { ...addressed, runId: "run-1", afterAcceptedSequence: -1 }), false);
 	assert.equal(Check(ReplayRunRequestSchema, { ...addressed, runId: "run-1", afterAcceptedSequence: 0, limit: RUN_QUERY_LIMITS.maxPageSize + 1 }), false);
+});
+
+test("validates protocol 2 handles and explicit protocol 1 compatibility projections", () => {
+	assert.equal(Check(WorkerRunHandleV2Schema, strictV2), true);
+	assert.equal(isValidRunQueryRecord(strictV2, 2), true);
+	assert.equal(Check(ListRunsResultV2Schema, { runs: [strictV2] }), true);
+	const projectedRecord = projectRunQueryRecord(strictV2, 1);
+	assert.equal(projectedRecord.protocol, 1);
+	assert.equal("lifecycleProtocol" in projectedRecord, false);
+	assert.equal("orchestrationGradeCompletion" in projectedRecord.lifecycle, false);
+
+	const v2Completion = {
+		...acceptedEvent,
+		protocol: 2 as const,
+		status: "completed" as const,
+		source: "worker" as const,
+		evidence: {
+			kind: "worker_completed_v2" as const,
+			result: "Done",
+			artifacts: [{ path: "report.md" }],
+			checks: [{ kind: "test" as const, command: "npm test", outcome: "passed" }],
+		},
+	};
+	const projectedEvent = projectAcceptedLifecycleEvent(v2Completion, 1);
+	assert.equal(projectedEvent.protocol, 1);
+	assert.deepEqual(projectedEvent.evidence, { kind: "worker_completed", result: "Done" });
+	assert.equal(isValidReplayRunResult({ events: [v2Completion], hasMore: false }, undefined, 2), true);
+	assert.equal(isValidReplayRunResult({ events: [v2Completion], hasMore: false }, undefined, 1), false);
+	assert.equal(isValidReplayRunResult({ events: [projectedEvent], hasMore: false }, undefined, 1), true);
 });
 
 test("round trips canonical opaque cursors and rejects malformed encodings", () => {
