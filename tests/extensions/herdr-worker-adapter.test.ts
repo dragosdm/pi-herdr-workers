@@ -3,6 +3,8 @@ import test from "node:test";
 import { LIFECYCLE_JOURNAL_ENTRY } from "../../lifecycle/acceptor.js";
 import { LIFECYCLE_CHANNELS, type AcceptedLifecycleEvent } from "../../lifecycle/protocol.js";
 import { CHANNELS, replyChannel, type DeliveryReceipt, type Inspection, type RpcReply, type WorkerReference } from "../../rpc/protocol.js";
+import { RUN_QUERY_CHANNELS, runQueryReplyChannel, type RunQueryReply, type WorkerRunRecordV1 } from "../../runs/protocol.js";
+import { RUN_ENDPOINT_BINDING_ENTRY, RUN_REGISTRATION_ENTRY } from "../../runs/registry.js";
 import { FakeIsolatedEventBus } from "../support/fake-isolated-event-bus.js";
 
 process.env.HERDR_ENV = "1";
@@ -59,6 +61,7 @@ async function harness(options: {
 		sendUserMessage() {},
 		async exec(_command: string, args: string[]) {
 			execCalls.push(args);
+			timeline.push(`exec:${args[0]}:${args[1] ?? ""}`);
 			const overridden = await options.execOverride?.(args);
 			if (overridden !== undefined) {
 				if (args[0] === "agent" && args[1] === "start" && overridden.code === 0) startedAgents.add(args[2]);
@@ -102,6 +105,7 @@ async function harness(options: {
 		writeEnvelope: (paneId, envelope) => {
 			if (envelope.type === options.writeEnvelopeErrorForType) throw new Error("mailbox write failed");
 			writtenEnvelopes.push({ paneId, envelope });
+			timeline.push(`envelope:${envelope.type}`);
 		},
 		onInboxHandler: (handler) => { inboxHandler = handler; },
 	});
@@ -117,6 +121,16 @@ async function emitForReply<T>(events: FakeIsolatedEventBus, channel: typeof CHA
 		const unsubscribe = events.on(replyChannel(channel, requestId), (reply) => {
 			unsubscribe();
 			resolve(reply as RpcReply<T>);
+		});
+		events.emit(channel, payload);
+	});
+}
+
+async function emitRunQueryForReply<T>(events: FakeIsolatedEventBus, channel: (typeof RUN_QUERY_CHANNELS)[keyof typeof RUN_QUERY_CHANNELS], requestId: string, payload: unknown): Promise<RunQueryReply<T>> {
+	return await new Promise((resolve) => {
+		const unsubscribe = events.on(runQueryReplyChannel(channel, requestId), (reply) => {
+			unsubscribe();
+			resolve(reply as RunQueryReply<T>);
 		});
 		events.emit(channel, payload);
 	});
@@ -148,10 +162,11 @@ test("registers once, exposes live availability, and disposes on shutdown", asyn
 	let probe = await emitForReply<any>(h.events, CHANNELS.probe, "before", { requestId: "before", supportedProtocols: [1] });
 	assert.equal(probe.success && probe.data.reason, "SESSION_NOT_READY");
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	assert.equal(h.events.listenerCount(), 9);
 	probe = await emitForReply<any>(h.events, CHANNELS.probe, "after", { requestId: "after", supportedProtocols: [1] });
 	assert.equal(probe.success && probe.data.available, true);
 	await h.handlers.get("session_tree")![0]({}, h.ctx);
-	assert.equal(h.events.listenerCount(), 5);
+	assert.equal(h.events.listenerCount(), 9);
 	await h.handlers.get("session_shutdown")![0]();
 	assert.equal(h.events.listenerCount(), 0);
 });
@@ -175,6 +190,15 @@ test("RPC spawn validates cwd before side effects, activates team mode, and retu
 	assert.deepEqual({ ...spawned.data, runId: "<run>" }, { runId: "<run>", name: "agent-scout", paneId: "worker-pane", cwd: "/tmp", adopted: true });
 	assert.equal(h.entries.some((entry) => entry.data.teamMode === true), true);
 	assert.equal(h.entries.some((entry) => entry.data.meta?.["agent-scout"]?.runId === spawned.data.runId), true);
+	const registration = h.entries.find((entry) => entry.type === RUN_REGISTRATION_ENTRY)?.data;
+	assert.deepEqual(registration && { ...registration, runId: "<run>", registeredAt: 0 }, {
+		version: 1,
+		runId: "<run>",
+		sessionId: "session",
+		registeredAt: 0,
+		requestId: "spawn",
+		assignment: { cwd: "/tmp", model: "test/model" },
+	});
 	assert.equal(h.activeTools().includes("CreateAgentPanel"), true);
 });
 
@@ -182,11 +206,54 @@ test("CreateAgentPanel preserves parameter mapping through the shared spawn faca
 	const h = await harness({ workerCwd: "/workspace/live" });
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
 	await h.commands.get("team").handler("list", h.ctx);
-	const result = await h.tools.get("CreateAgentPanel").execute("call", { name: "scout" }, h.ctx.signal, undefined, h.ctx);
+	const result = await h.tools.get("CreateAgentPanel").execute("call", { name: "scout", type: " Research " }, h.ctx.signal, undefined, h.ctx);
 	assert.match(result.content[0].text, /Worker agent-scout ready in pane worker-pane/);
 	assert.equal(result.details.adopted, true);
 	assert.equal(result.details.cwd, "/workspace/live");
 	assert.match(result.details.runId, /^[0-9a-f-]{36}$/);
+	const registration = h.entries.find((entry) => entry.type === RUN_REGISTRATION_ENTRY)?.data;
+	assert.deepEqual(registration && { ...registration, runId: "<run>", registeredAt: 0 }, {
+		version: 1,
+		runId: "<run>",
+		sessionId: "session",
+		registeredAt: 0,
+		assignment: { cwd: "/tmp", model: "xai/grok-4.6", role: "research" },
+	});
+});
+
+test("registration and endpoint journals fence every worker creation side effect", async () => {
+	const h = await harness({ listening: true });
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	const probe = await emitForReply<any>(h.events, CHANNELS.probe, "ordering-probe", { requestId: "ordering-probe", supportedProtocols: [1] });
+	const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
+	const spawned = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, "ordering", {
+		requestId: "ordering",
+		providerInstanceId,
+		protocol: 1,
+		name: "builder",
+		type: " Research ",
+		initialPrompt: "Map the system",
+	});
+	assert.equal(spawned.success, true);
+
+	const registration = h.timeline.indexOf(`append:${RUN_REGISTRATION_ENTRY}`);
+	const endpoint = h.timeline.indexOf(`append:${RUN_ENDPOINT_BINDING_ENTRY}`);
+	const split = h.timeline.indexOf("exec:pane:split");
+	const start = h.timeline.indexOf("exec:agent:start");
+	const lifecycle = h.timeline.indexOf(`append:${LIFECYCLE_JOURNAL_ENTRY}`);
+	const assignment = h.timeline.indexOf("envelope:message");
+	assert.ok(registration >= 0);
+	assert.ok(split > registration);
+	assert.ok(endpoint > split);
+	assert.ok(start > endpoint);
+	assert.ok(lifecycle > endpoint);
+	assert.ok(assignment > lifecycle);
+	for (const [index, item] of h.timeline.entries()) {
+		if (item === "append:herdr-worker") assert.ok(index > registration);
+	}
+	const data = h.entries.find((entry) => entry.type === RUN_REGISTRATION_ENTRY)?.data;
+	assert.deepEqual(data?.assignment, { cwd: "/tmp", model: "xai/grok-4.6", role: "research" });
+	assert.equal(data?.requestId, "ordering");
 });
 
 test("re-adoption sends the run binding before its assignment prompt", async () => {
@@ -207,6 +274,12 @@ test("re-adoption sends the run binding before its assignment prompt", async () 
 	assert.equal(h.writtenEnvelopes[bindingIndex].envelope.binding.runId, spawned.data.runId);
 	assert.equal(h.writtenEnvelopes[bindingIndex].envelope.binding.correlationId, "dispatch-1");
 	assert.equal(h.writtenEnvelopes[promptIndex].envelope.runId, spawned.data.runId);
+	const registrationIndex = h.entries.findIndex((entry) => entry.type === RUN_REGISTRATION_ENTRY);
+	const endpointIndex = h.entries.findIndex((entry) => entry.type === RUN_ENDPOINT_BINDING_ENTRY);
+	const relationshipIndex = h.entries.findIndex((entry) => entry.type === "herdr-worker" && entry.data.workers?.includes("agent-scout"));
+	assert.ok(registrationIndex >= 0);
+	assert.ok(endpointIndex > registrationIndex);
+	assert.ok(relationshipIndex > endpointIndex);
 });
 
 test("new workers bind startup flags, report readiness, and gate ReportWorkerRun", async () => {
@@ -597,6 +670,155 @@ test("extension reload restores lifecycle history without replaying publication"
 	assert.equal(h.sessionEntries.filter((entry) => entry.customType === LIFECYCLE_JOURNAL_ENTRY).length, 1);
 });
 
+test("run query returns durable strict handles across provider reloads", async () => {
+	const h = await harness();
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	const workerProbe = await emitForReply<any>(h.events, CHANNELS.probe, "worker-probe", { requestId: "worker-probe", supportedProtocols: [1] });
+	const workerProviderId = workerProbe.success ? workerProbe.data.providerInstanceId : "";
+	const spawned = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, "query-spawn", {
+		requestId: "query-spawn", providerInstanceId: workerProviderId, protocol: 1, correlationId: "dispatch-query", name: "builder",
+	});
+	assert.equal(spawned.success, true);
+	if (!spawned.success) return;
+
+	const firstProbe = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.probe, "query-probe-1", { requestId: "query-probe-1", supportedProtocols: [1] });
+	assert.equal(firstProbe.success && firstProbe.data.available, true);
+	const firstProviderId = firstProbe.success ? firstProbe.data.providerInstanceId : "";
+	const firstGet = await emitRunQueryForReply<WorkerRunRecordV1>(h.events, RUN_QUERY_CHANNELS.get, "query-get-1", {
+		requestId: "query-get-1", providerInstanceId: firstProviderId, protocol: 1, runId: spawned.data.runId,
+	});
+	assert.equal(firstGet.success, true);
+	assert.deepEqual(firstGet.success && firstGet.data.lifecycle, { status: "started", acceptedSequence: 1, readiness: "unconfirmed" });
+	assert.deepEqual(firstGet.success && !("legacy" in firstGet.data) && firstGet.data.assignment, { cwd: "/tmp", model: "test/model" });
+	assert.deepEqual(firstGet.success && !("legacy" in firstGet.data) && firstGet.data.endpoint && { ...firstGet.data.endpoint, observedAt: 0 }, {
+		agentName: "agent-builder", paneId: "new-pane", observedAt: 0,
+	});
+
+	await h.handlers.get("session_shutdown")![0]();
+	h.herdrWorker(h.pi, { disableInbox: true });
+	await h.handlers.get("session_start")![1]({ reason: "startup" }, h.ctx);
+	const secondProbe = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.probe, "query-probe-2", { requestId: "query-probe-2", supportedProtocols: [1] });
+	assert.equal(secondProbe.success, true);
+	if (!secondProbe.success) return;
+	assert.notEqual(secondProbe.data.providerInstanceId, firstProviderId);
+	const secondGet = await emitRunQueryForReply<WorkerRunRecordV1>(h.events, RUN_QUERY_CHANNELS.get, "query-get-2", {
+		requestId: "query-get-2", providerInstanceId: secondProbe.data.providerInstanceId, protocol: 1, runId: spawned.data.runId,
+	});
+	assert.deepEqual(secondGet.success && secondGet.data, firstGet.success && firstGet.data);
+	assert.equal(h.events.listenerCount(), 9);
+});
+
+test("run query lists lifecycle-only history without fabricating strict facts", async () => {
+	const event = {
+		protocol: 1,
+		eventId: "legacy-event-1",
+		runId: "legacy-run-1",
+		sourceInstanceId: "worker-source-1",
+		sourceSequence: 1,
+		status: "completed",
+		worker: { name: "agent-legacy", paneId: "legacy-pane" },
+		observedAt: 1_786_000_000_000,
+		source: "worker",
+		evidence: { kind: "worker_completed", result: "Done" },
+		acceptedSequence: 1,
+	};
+	const h = await harness({ sessionEntries: [{
+		type: "custom",
+		customType: LIFECYCLE_JOURNAL_ENTRY,
+		data: { version: 1, sessionId: "session", event },
+	}] });
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	const probe = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.probe, "legacy-probe", { requestId: "legacy-probe", supportedProtocols: [1] });
+	const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
+	const listed = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.list, "legacy-list", {
+		requestId: "legacy-list", providerInstanceId, protocol: 1,
+	});
+	assert.deepEqual(listed.success && listed.data.runs, [{
+		protocol: 1,
+		legacy: true,
+		runId: "legacy-run-1",
+		sessionId: "session",
+		lifecycle: { status: "completed", acceptedSequence: 1 },
+		worker: { agentName: "agent-legacy", paneId: "legacy-pane" },
+	}]);
+	assert.doesNotMatch(JSON.stringify(listed), /assignment|registeredAt|requestId":"spawn|endpoint/);
+});
+
+test("run query replays accepted evidence without republishing it", async () => {
+	const h = await harness();
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	const workerProbe = await emitForReply<any>(h.events, CHANNELS.probe, "replay-worker-probe", { requestId: "replay-worker-probe", supportedProtocols: [1] });
+	const workerProviderId = workerProbe.success ? workerProbe.data.providerInstanceId : "";
+	const spawned = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, "replay-spawn", {
+		requestId: "replay-spawn", providerInstanceId: workerProviderId, protocol: 1, name: "builder",
+	});
+	assert.equal(spawned.success, true);
+	if (!spawned.success) return;
+	const beforeReplay = h.events.emissions.filter((item) => item.channel === LIFECYCLE_CHANNELS.lifecycle).length;
+	const queryProbe = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.probe, "replay-probe", { requestId: "replay-probe", supportedProtocols: [1] });
+	const queryProviderId = queryProbe.success ? queryProbe.data.providerInstanceId : "";
+	const replayed = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.replay, "replay-page", {
+		requestId: "replay-page", providerInstanceId: queryProviderId, protocol: 1, runId: spawned.data.runId, afterAcceptedSequence: 0, limit: 1,
+	});
+	assert.deepEqual(replayed.success && replayed.data.events.map((event: AcceptedLifecycleEvent) => [event.runId, event.acceptedSequence, event.eventId]), [
+		[spawned.data.runId, 1, h.entries.find((entry) => entry.type === LIFECYCLE_JOURNAL_ENTRY)?.data.event.eventId],
+	]);
+	assert.equal(replayed.success && replayed.data.hasMore, false);
+	assert.equal(h.events.emissions.filter((item) => item.channel === LIFECYCLE_CHANNELS.lifecycle).length, beforeReplay);
+	const empty = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.replay, "replay-empty", {
+		requestId: "replay-empty", providerInstanceId: queryProviderId, protocol: 1, runId: spawned.data.runId, afterAcceptedSequence: 1,
+	});
+	assert.deepEqual(empty.success && empty.data, { events: [], hasMore: false });
+	const missing = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.replay, "replay-missing", {
+		requestId: "replay-missing", providerInstanceId: queryProviderId, protocol: 1, runId: "run-missing", afterAcceptedSequence: 0,
+	});
+	assert.equal(missing.success ? "success" : missing.error.code, "NOT_FOUND");
+});
+
+test("live endpoint observation enriches exact matches and fails closed without durable writes", async () => {
+	const registration = {
+		type: "custom", customType: RUN_REGISTRATION_ENTRY,
+		data: { version: 1, runId: "run-observe", sessionId: "session", registeredAt: 10, assignment: { cwd: "/tmp" } },
+	};
+	const endpoint = {
+		type: "custom", customType: RUN_ENDPOINT_BINDING_ENTRY,
+		data: { version: 1, runId: "run-observe", sessionId: "session", agentName: "agent-bound", paneId: "pane-bound", observedAt: 20 },
+	};
+	const cases = [
+		{ label: "matching", live: { pane_id: "pane-bound", name: "agent-bound", agent_status: "busy" }, enriched: true },
+		{ label: "missing", live: undefined, enriched: false },
+		{ label: "renamed", live: { pane_id: "pane-bound", name: "agent-renamed", agent_status: "busy" }, enriched: false },
+		{ label: "moved", live: { pane_id: "pane-moved", name: "agent-bound", agent_status: "busy" }, enriched: false },
+		{ label: "reused", live: { pane_id: "pane-bound", name: "agent-reused", agent_status: "busy" }, enriched: false },
+	] as const;
+	for (const item of cases) {
+		const sessionEntries = [structuredClone(registration), structuredClone(endpoint)];
+		const h = await harness({
+			sessionEntries,
+			execOverride: (args) => {
+				if (args[0] !== "agent" || args[1] !== "get" || args[2] !== "agent-bound") return undefined;
+				return item.live
+					? { code: 0, stdout: JSON.stringify({ result: { agent: item.live } }), stderr: "" }
+					: { code: 1, stdout: "", stderr: "missing" };
+			},
+		});
+		await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+		const probe = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.probe, `observe-probe-${item.label}`, { requestId: `observe-probe-${item.label}`, supportedProtocols: [1] });
+		const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
+		const result = await emitRunQueryForReply<WorkerRunRecordV1>(h.events, RUN_QUERY_CHANNELS.get, `observe-get-${item.label}`, {
+			requestId: `observe-get-${item.label}`, providerInstanceId, protocol: 1, runId: "run-observe", includeEndpointObservation: true,
+		});
+		assert.equal(result.success, true, item.label);
+		if (!result.success || "legacy" in result.data) continue;
+		assert.equal(result.data.endpoint?.agentName, "agent-bound", item.label);
+		assert.equal(result.data.endpoint?.paneId, "pane-bound", item.label);
+		assert.equal(result.data.endpoint?.herdrStatus, item.enriched ? "busy" : undefined, item.label);
+		assert.equal(item.enriched ? (result.data.endpoint?.observedAt ?? 0) >= 20 : result.data.endpoint?.observedAt, item.enriched ? true : 20, item.label);
+		assert.equal(h.entries.length, 0, item.label);
+		assert.deepEqual(sessionEntries, [registration, endpoint], item.label);
+	}
+});
+
 test("RPC inspect projects worker and orchestrator facts from authorized relationships", async () => {
 	const h = await harness({ branch: teamBranch({
 		workers: ["agent-scout"],
@@ -671,5 +893,5 @@ test("reload replaces the provider instance and stale addressed requests are no-
 	await new Promise((resolve) => setImmediate(resolve));
 	unsubscribe();
 	assert.equal(replied, false);
-	assert.equal(h.events.listenerCount(), 5);
+	assert.equal(h.events.listenerCount(), 9);
 });
