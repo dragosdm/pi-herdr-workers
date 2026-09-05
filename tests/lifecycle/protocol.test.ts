@@ -3,15 +3,20 @@ import test from "node:test";
 import { Check } from "typebox/value";
 import {
 	AcceptedLifecycleEventSchema,
+	ArtifactReferenceSchema,
 	LIFECYCLE_CHANNELS,
 	LIFECYCLE_LIMITS,
+	LIFECYCLE_SUPPORTED_PROTOCOLS,
 	LIFECYCLE_SOURCES,
 	LIFECYCLE_STATUSES,
 	LifecycleCandidateSchema,
 	WorkerRunBindingSchema,
 	WorkerRunReportInputSchema,
+	WorkerRunReportInputV1Schema,
+	WorkerRunReportInputV2Schema,
 	WorkerRunReportSchema,
 	WorkerLifecycleEvidenceSchema,
+	VerificationCheckSchema,
 	isAcceptedLifecycleEvent,
 	isLifecycleCandidate,
 	isWorkerRunBinding,
@@ -35,6 +40,7 @@ test("exports canonical and projected channels for every lifecycle status", () =
 	assert.equal(LIFECYCLE_CHANNELS.lifecycle, "herdr-workers:lifecycle");
 	assert.deepEqual(LIFECYCLE_STATUSES, ["started", "message", "completed", "failed", "stopped", "uncertain"]);
 	assert.deepEqual(LIFECYCLE_SOURCES, ["provider", "worker", "reconciler", "controller"]);
+	assert.deepEqual(LIFECYCLE_SUPPORTED_PROTOCOLS, [2, 1]);
 	for (const status of LIFECYCLE_STATUSES) assert.equal(lifecycleChannel(status), `herdr-workers:${status}`);
 });
 
@@ -66,7 +72,8 @@ test("enforces safe identities and structural requirements", () => {
 	assert.equal(isLifecycleCandidate({ ...candidate, worker: { name: "" } }), false);
 	assert.equal(isLifecycleCandidate({ ...candidate, sourceSequence: 0 }), false);
 	assert.equal(isLifecycleCandidate({ ...candidate, observedAt: -1 }), false);
-	assert.equal(isLifecycleCandidate({ ...candidate, protocol: 2 }), false);
+	assert.equal(isLifecycleCandidate({ ...candidate, protocol: 2 }), true);
+	assert.equal(isLifecycleCandidate({ ...candidate, protocol: 3 }), false);
 });
 
 test("enforces UTF-8 byte budgets for bounded evidence text", () => {
@@ -145,7 +152,6 @@ test("validates structured run bindings and worker-owned reports", () => {
 test("validates only model-owned report fields with bounded content", () => {
 	const inputs = [
 		{ status: "message", message: "Working" },
-		{ status: "completed" },
 		{ status: "completed", result: "Done" },
 		{ status: "failed", error: "Blocked" },
 	] as const;
@@ -154,5 +160,45 @@ test("validates only model-owned report fields with bounded content", () => {
 		assert.equal(isWorkerRunReportInput(input), true);
 	}
 	assert.equal(isWorkerRunReportInput({ status: "message" }), false);
+	assert.equal(isWorkerRunReportInput({ status: "completed" }), false);
+	assert.equal(isWorkerRunReportInput({ status: "completed" }, 1), true);
 	assert.equal(isWorkerRunReportInput({ status: "failed", error: "😀".repeat(LIFECYCLE_LIMITS.error) }), false);
+});
+
+test("validates contract 2 structured completion and preserves contract 1 compatibility", () => {
+	const completion = {
+		status: "completed",
+		result: "Implemented the lifecycle contract.",
+		artifacts: [{ path: "reports/result.md", description: "Final report" }],
+		checks: [{ kind: "test", command: "npm test", outcome: "passed" }],
+	} as const;
+	assert.equal(Check(WorkerRunReportInputV2Schema, completion), true);
+	assert.equal(isWorkerRunReportInput(completion, 2), true);
+	assert.equal(Check(ArtifactReferenceSchema, completion.artifacts[0]), true);
+	assert.equal(Check(VerificationCheckSchema, completion.checks[0]), true);
+	assert.equal(Check(WorkerRunReportInputV1Schema, { status: "completed" }), true);
+
+	const report = {
+		...base,
+		protocol: 2,
+		status: "completed",
+		evidence: { kind: "worker_completed_v2", result: completion.result, artifacts: completion.artifacts, checks: completion.checks },
+	};
+	assert.equal(isWorkerRunReport(report), true);
+	assert.equal(isLifecycleCandidate({ ...report, worker: base.worker, source: "worker" }), true);
+	assert.equal(isWorkerRunReport({ ...report, protocol: 1 }), false);
+	assert.equal(isWorkerRunReport({ ...report, evidence: { kind: "worker_completed_v2", result: "" } }), false);
+});
+
+test("enforces contract 2 completion cardinality, byte, and path safety limits", () => {
+	const valid = { status: "completed", result: "Done" } as const;
+	assert.equal(isWorkerRunReportInput({ ...valid, artifacts: Array.from({ length: 32 }, (_, index) => ({ path: `artifact-${index}` })) }), true);
+	assert.equal(isWorkerRunReportInput({ ...valid, artifacts: Array.from({ length: 33 }, (_, index) => ({ path: `artifact-${index}` })) }), false);
+	assert.equal(isWorkerRunReportInput({ ...valid, checks: Array.from({ length: 33 }, () => ({ kind: "command", command: "true", outcome: "passed" })) }), false);
+	for (const path of ["bad\npath", "bad\u0000path", "bad\u007fpath"]) {
+		assert.equal(isWorkerRunReportInput({ ...valid, artifacts: [{ path }] }), false, JSON.stringify(path));
+	}
+	assert.equal(isWorkerRunReportInput({ ...valid, artifacts: [{ path: "é".repeat(LIFECYCLE_LIMITS.artifactPath / 2) }] }), true);
+	assert.equal(isWorkerRunReportInput({ ...valid, artifacts: [{ path: `${"é".repeat(LIFECYCLE_LIMITS.artifactPath / 2)}é` }] }), false);
+	assert.equal(isWorkerRunReportInput({ ...valid, checks: [{ kind: "test", command: "", outcome: "passed" }] }), false);
 });

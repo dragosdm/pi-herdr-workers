@@ -20,7 +20,7 @@ Subscribe to the canonical stream for complete ordered history or to selected pr
 
 ```ts
 pi.events.on("herdr-workers:lifecycle", (event) => {
-  if (event.protocol !== 1) return;
+  if (event.protocol !== 1 && event.protocol !== 2) return;
   console.log(event.runId, event.acceptedSequence, event.status);
 });
 ```
@@ -29,7 +29,7 @@ pi.events.on("herdr-workers:lifecycle", (event) => {
 
 ```ts
 type AcceptedLifecycleEvent = {
-  protocol: 1;
+  protocol: 1 | 2;
   eventId: string;
   runId: string;
   sourceInstanceId: string;
@@ -44,7 +44,9 @@ type AcceptedLifecycleEvent = {
 };
 ```
 
-All identities and evidence fields are runtime validated. IDs use `[A-Za-z0-9._-]{1,128}`. Worker names are limited to 32 characters, pane IDs to 128, messages and results to 65,536 UTF-8 bytes, errors and diagnostic details to 4,096 UTF-8 bytes. Unknown object fields are tolerated for forward compatibility, but known fields retain their protocol-1 meaning.
+All identities and evidence fields are runtime validated. IDs use `[A-Za-z0-9._-]{1,128}`. Worker names are limited to 32 characters, pane IDs to 128, messages and results to 65,536 UTF-8 bytes, errors and diagnostic details to 4,096 UTF-8 bytes. Unknown object fields are tolerated for forward compatibility, but known fields retain their selected contract meaning.
+
+Contract 1 remains readable for existing bindings and journal entries. New runs select contract 2 in their durable registration and carry that selection through startup or `bind-run`. The acceptor rejects a candidate whose `protocol` differs from its run binding rather than reinterpreting evidence across versions.
 
 ## Identity scopes
 
@@ -66,7 +68,7 @@ Worker names select team members and may be reused. Pane IDs identify live locat
 |---|---|---|
 | `started` | Provider start returned after relationship persistence, or the worker reported run-aware readiness | Pane creation, prompt receipt, or later Herdr presence alone |
 | `message` | A trusted worker-authored run report crossed the inbox and persistence boundary | Message prose does not imply progress or settlement |
-| `completed` | The worker or assignment owner explicitly reported run-aware success | Spawn success, send receipt, ordinary message, or `agent_settled` |
+| `completed` | The worker explicitly reported run-aware success; contract 2 requires a final result | Spawn success, send receipt, ordinary message, or `agent_settled` |
 | `failed` | An explicit run-aware worker failure or conclusive reconciliation | Caller timeout or an ambiguous external command result |
 | `stopped` | Reserved for a future explicit stop acknowledgement | Release, shutdown, disappearance, idle state, or `agent_settled` |
 | `uncertain` | An external side effect may exist but the available evidence cannot classify the run safely | A known failure, a stop acknowledgement, or permission to retry |
@@ -106,14 +108,21 @@ Durability follows Pi's session storage contract. `--no-session` is ephemeral, a
 ```
 
 ```json
-{ "status": "completed", "result": "Implemented and verified the requested change." }
+{
+  "status": "completed",
+  "result": "Implemented and verified the requested change.",
+  "artifacts": [{ "path": "reports/result.md", "description": "Final report" }],
+  "checks": [{ "kind": "test", "command": "npm test", "outcome": "passed" }]
+}
 ```
 
 ```json
 { "status": "failed", "error": "The required upstream API is unavailable." }
 ```
 
-Ordinary `SendToAgent` messages remain general communication and never become terminal lifecycle reports.
+For contract 2, `result` is required and non-empty. `artifacts` and `checks` are optional and each is limited to 32 entries. Artifact paths are retained exactly as authored, must be non-empty, contain no control characters, and fit within 4,096 UTF-8 bytes. Descriptions fit within 1,024 bytes. Check commands and outcomes are non-empty and fit within 4,096 bytes. Lifecycle acceptance does not resolve paths or inspect, copy, hash, upload, or promise the continued existence of referenced files.
+
+Contract 2 completion evidence uses `kind: "worker_completed_v2"`. Contract 1 `kind: "worker_completed"` history, including old evidence without a result, remains restorable and replayable but is not orchestration-grade completion. Ordinary `SendToAgent` messages remain general communication and never become terminal lifecycle reports. Bound-worker guidance reserves `ReportWorkerRun` as the only terminal completion or failure path.
 
 ## Consumer boundary
 

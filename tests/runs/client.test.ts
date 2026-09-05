@@ -39,13 +39,54 @@ const event = {
 
 test("probe installs its listener before emit and selects an available provider", async () => {
 	const events = new FakeEventBus();
+	let supportedProtocols: number[] = [];
 	events.on(RUN_QUERY_CHANNELS.probe, (payload) => {
-		const request = payload as { requestId: string };
+		const request = payload as { requestId: string; supportedProtocols: number[] };
+		supportedProtocols = request.supportedProtocols;
 		events.emit(runQueryReplyChannel(RUN_QUERY_CHANNELS.probe, request.requestId), runQuerySuccess(request.requestId, provider));
 	});
 	const selected = await createRunQueryClient({ events, createRequestId: () => "probe-1" }).probe();
 	assert.equal(selected.providerInstanceId, "query-provider");
+	assert.deepEqual(supportedProtocols, [2, 1]);
 	assert.equal(events.listenerCount(runQueryReplyChannel(RUN_QUERY_CHANNELS.probe, "probe-1")), 0);
+});
+
+test("negotiates protocol 2 and rejects malformed protocol 2 responses", async () => {
+	const providerV2 = { ...provider, protocol: 2 as const };
+	const recordV2 = {
+		...record,
+		protocol: 2 as const,
+		lifecycleProtocol: 2 as const,
+		lifecycle: { ...record.lifecycle, orchestrationGradeCompletion: false },
+	};
+	const events = new FakeEventBus();
+	events.on(RUN_QUERY_CHANNELS.probe, (payload) => {
+		const request = payload as { requestId: string };
+		events.emit(runQueryReplyChannel(RUN_QUERY_CHANNELS.probe, request.requestId), runQuerySuccess(request.requestId, providerV2, 2));
+	});
+	events.on(RUN_QUERY_CHANNELS.get, (payload) => {
+		const request = payload as { requestId: string; protocol: number };
+		assert.equal(request.protocol, 2);
+		events.emit(runQueryReplyChannel(RUN_QUERY_CHANNELS.get, request.requestId), runQuerySuccess(request.requestId, recordV2, 2));
+	});
+	const ids = ["probe-v2", "get-v2"];
+	const client = createRunQueryClient({ events, createRequestId: () => ids.shift()! });
+	const selected = await client.probe();
+	assert.equal(selected.protocol, 2);
+	assert.equal((await client.get({ runId: "run-1" }, selected)).protocol, 2);
+
+	const malformed = new FakeEventBus();
+	malformed.on(RUN_QUERY_CHANNELS.get, (payload) => {
+		const request = payload as { requestId: string };
+		malformed.emit(runQueryReplyChannel(RUN_QUERY_CHANNELS.get, request.requestId), runQuerySuccess(request.requestId, {
+			...recordV2,
+			lifecycle: { ...recordV2.lifecycle, orchestrationGradeCompletion: "yes" },
+		}, 2));
+	});
+	await assert.rejects(
+		createRunQueryClient({ events: malformed, createRequestId: () => "bad-v2" }).get({ runId: "run-1" }, providerV2),
+		RunQueryProtocolError,
+	);
 });
 
 test("probe aggregates unavailable, unsupported, and malformed responders", async () => {

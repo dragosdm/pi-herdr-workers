@@ -32,7 +32,7 @@ test("probe negotiates a query-specific available provider", async () => {
 	events.emit(RUN_QUERY_CHANNELS.probe, { requestId: "probe", supportedProtocols: [2, 1], future: true });
 	await flush();
 	assert.deepEqual(reply?.success && reply.data, {
-		protocol: 1,
+		protocol: 2,
 		provider: "herdr-runs",
 		providerInstanceId: "query-instance",
 		sessionId: "session-1",
@@ -57,7 +57,7 @@ test("validation, stale addressing, protocol, and availability gates precede ser
 	}
 	events.emit(RUN_QUERY_CHANNELS.get, { requestId: "invalid", providerInstanceId: "query-instance", protocol: 1, runId: "bad/id" });
 	events.emit(RUN_QUERY_CHANNELS.get, { requestId: "stale", providerInstanceId: "old-instance", protocol: 1, runId: "run-1" });
-	events.emit(RUN_QUERY_CHANNELS.get, { requestId: "protocol", providerInstanceId: "query-instance", protocol: 2, runId: "run-1" });
+	events.emit(RUN_QUERY_CHANNELS.get, { requestId: "protocol", providerInstanceId: "query-instance", protocol: 3, runId: "run-1" });
 	events.emit(RUN_QUERY_CHANNELS.get, { requestId: "unavailable", providerInstanceId: "query-instance", protocol: 1, runId: "run-1" });
 	await flush();
 	assert.deepEqual(replies.map((reply) => reply.success ? "success" : reply.error.code), ["INVALID_REQUEST", "UNSUPPORTED_PROTOCOL", "PROVIDER_UNAVAILABLE"]);
@@ -116,4 +116,34 @@ test("dispose removes all query subscriptions idempotently", () => {
 	server.dispose();
 	server.dispose();
 	assert.equal(events.listenerCount(), 0);
+});
+
+test("projects native records for the negotiated query protocol", async () => {
+	const native = {
+		...record,
+		protocol: 2 as const,
+		lifecycleProtocol: 2 as const,
+		lifecycle: { status: "completed" as const, acceptedSequence: 1, orchestrationGradeCompletion: true },
+	};
+	const events = new FakeEventBus();
+	registerRunQueryServer({
+		events,
+		service: service({ get: async () => native }),
+		sessionId: "session-1",
+		getProviderState: () => ({ available: true }),
+		createInstanceId: () => "query-instance",
+	});
+	const replies: RunQueryReply[] = [];
+	for (const protocol of [2, 1] as const) {
+		const id = `get-${protocol}`;
+		events.on(runQueryReplyChannel(RUN_QUERY_CHANNELS.get, id), (payload) => replies.push(payload as RunQueryReply));
+		events.emit(RUN_QUERY_CHANNELS.get, { requestId: id, providerInstanceId: "query-instance", protocol, runId: "run-1" });
+	}
+	await flush();
+	assert.equal(replies[0].protocol, 2);
+	assert.deepEqual(replies[0].success && replies[0].data, native);
+	assert.equal(replies[1].protocol, 1);
+	assert.equal(replies[1].success && (replies[1].data as any).protocol, 1);
+	assert.equal(replies[1].success && "lifecycleProtocol" in (replies[1].data as any), false);
+	assert.equal(replies[1].success && "orchestrationGradeCompletion" in (replies[1].data as any).lifecycle, false);
 });

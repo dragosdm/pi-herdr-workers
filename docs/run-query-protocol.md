@@ -4,7 +4,7 @@ The run-query protocol exposes durable, session-scoped worker assignment records
 
 ## Channels and routing
 
-Protocol 1 defines four request channels:
+Protocols 2 and 1 share four request channels:
 
 | Operation | Request channel | Default client timeout |
 |---|---|---:|
@@ -13,12 +13,12 @@ Protocol 1 defines four request channels:
 | List | `herdr-workers:runs:rpc:list` | 20 seconds |
 | Replay | `herdr-workers:runs:rpc:replay` | 20 seconds |
 
-Replies use `<request-channel>:reply:<requestId>`. Subscribe before emitting. Probe negotiates protocol 1 and returns a query-specific `providerInstanceId`; addressed calls must copy that ID and the negotiated protocol. Reload creates a new provider instance, so requests addressed to an old generation are ignored.
+Replies use `<request-channel>:reply:<requestId>`. Subscribe before emitting. Probe negotiates the highest shared protocol, preferring 2, and returns a query-specific `providerInstanceId`; addressed calls must copy that ID and the negotiated protocol. Reload creates a new provider instance, so requests addressed to an old generation are ignored.
 
 ```json
 {
   "requestId": "probe-1",
-  "supportedProtocols": [1]
+  "supportedProtocols": [2, 1]
 }
 ```
 
@@ -28,7 +28,7 @@ Replies use `<request-channel>:reply:<requestId>`. Subscribe before emitting. Pr
   "protocol": 1,
   "success": true,
   "data": {
-    "protocol": 1,
+    "protocol": 2,
     "provider": "herdr-runs",
     "providerInstanceId": "query-generation-1",
     "sessionId": "pi-session-1",
@@ -46,13 +46,13 @@ The provider becomes available after the session run registry and lifecycle acce
 
 ## Get
 
-`get` returns one strict handle when durable registration exists, or one legacy projection when only accepted lifecycle history exists.
+`get` returns one strict handle when durable registration exists, or one legacy projection when only accepted lifecycle history exists. Protocol 2 handles expose `lifecycleProtocol` and `lifecycle.orchestrationGradeCompletion`.
 
 ```json
 {
   "requestId": "get-1",
   "providerInstanceId": "query-generation-1",
-  "protocol": 1,
+  "protocol": 2,
   "runId": "run-1"
 }
 ```
@@ -61,7 +61,8 @@ A strict handle contains immutable registration and original endpoint facts. Lif
 
 ```json
 {
-  "protocol": 1,
+  "protocol": 2,
+  "lifecycleProtocol": 2,
   "runId": "run-1",
   "correlationId": "dispatch-1",
   "requestId": "spawn-1",
@@ -70,7 +71,8 @@ A strict handle contains immutable registration and original endpoint facts. Lif
   "lifecycle": {
     "status": "started",
     "acceptedSequence": 1,
-    "readiness": "unconfirmed"
+    "readiness": "unconfirmed",
+    "orchestrationGradeCompletion": false
   },
   "assignment": {
     "cwd": "/workspace/project",
@@ -85,18 +87,20 @@ A strict handle contains immutable registration and original endpoint facts. Lif
 }
 ```
 
-A lifecycle-only record is explicitly discriminated and does not invent assignment, registration, request, or endpoint facts:
+A lifecycle-only record is explicitly discriminated and does not invent assignment, registration, request, or endpoint facts. Its protocol 2 projection also exposes the lifecycle contract inferred from accepted history and the orchestration-grade marker.
 
 ```json
 {
-  "protocol": 1,
+  "protocol": 2,
   "legacy": true,
+  "lifecycleProtocol": 1,
   "runId": "legacy-run-1",
   "sessionId": "pi-session-1",
   "lifecycle": {
     "status": "completed",
     "acceptedSequence": 2,
-    "readiness": "confirmed"
+    "readiness": "confirmed",
+    "orchestrationGradeCompletion": false
   },
   "worker": {
     "agentName": "agent-legacy",
@@ -115,7 +119,7 @@ Unknown runs return `NOT_FOUND`. Set `includeEndpointObservation: true` for best
 {
   "requestId": "list-1",
   "providerInstanceId": "query-generation-1",
-  "protocol": 1,
+  "protocol": 2,
   "limit": 50
 }
 ```
@@ -141,7 +145,7 @@ The default limit is 50 and the maximum is 100. `nextCursor` is an opaque encodi
 {
   "events": [
     {
-      "protocol": 1,
+      "protocol": 2,
       "eventId": "event-2",
       "runId": "run-1",
       "sourceInstanceId": "worker-generation-1",
@@ -151,7 +155,12 @@ The default limit is 50 and the maximum is 100. `nextCursor` is an opaque encodi
       "worker": { "name": "agent-scout", "paneId": "pane-1" },
       "observedAt": 1788351000200,
       "source": "worker",
-      "evidence": { "kind": "worker_completed", "result": "Done" }
+      "evidence": {
+        "kind": "worker_completed_v2",
+        "result": "Done",
+        "artifacts": [{ "path": "reports/result.md" }],
+        "checks": [{ "kind": "test", "command": "npm test", "outcome": "passed" }]
+      }
     }
   ],
   "hasMore": false
@@ -159,6 +168,8 @@ The default limit is 50 and the maximum is 100. `nextCursor` is an opaque encodi
 ```
 
 The default replay limit is 50 and the maximum is 100. `hasMore` means another request with the last returned `acceptedSequence` can continue the same run. Registered runs with no accepted evidence return an empty page; a run absent from both registration and lifecycle authority returns `NOT_FOUND`.
+
+Protocol 2 returns native contract 1 or contract 2 accepted events and preserves structured completion evidence. Protocol 1 is an explicit compatibility projection: it omits lifecycle-contract and orchestration-grade fields, and projects a contract 2 completion to readable `worker_completed` evidence containing its result. Artifact and check fields are intentionally absent from that projection, so a protocol 1 response can never acquire an orchestration-grade marker.
 
 ## Restart recovery
 
@@ -168,6 +179,6 @@ To avoid a snapshot/publication race, subscribe to `herdr-workers:lifecycle` bef
 
 Safe IDs use `[A-Za-z0-9._-]{1,128}`. Known string fields have both character and UTF-8 byte limits: session, model, role, pane, and status fields allow 128 bytes; agent names allow 32; CWD allows 4,096; error messages allow 1,024. Unknown fields remain additive, but malformed known fields, nested lifecycle data, endpoint data, cursors, page limits, accepted events, mixed-run replay pages, and non-increasing replay sequences are rejected.
 
-Both server and client validate successful results. Service failures are sanitized to fixed errors. Protocol 1 uses `INVALID_REQUEST`, `UNSUPPORTED_PROTOCOL`, `PROVIDER_UNAVAILABLE`, `NOT_FOUND`, and `INTERNAL_ERROR`.
+Both server and client validate successful results against the negotiated version. Service failures are sanitized to fixed errors. Both query protocols use `INVALID_REQUEST`, `UNSUPPORTED_PROTOCOL`, `PROVIDER_UNAVAILABLE`, `NOT_FOUND`, and `INTERNAL_ERROR`.
 
 Timeout and abort bound only the caller's wait. The client removes reply listeners after success, failure, timeout, abort, and synchronous event-bus errors.

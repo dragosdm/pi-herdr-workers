@@ -142,14 +142,14 @@ function teamBranch(data: any): any[] {
 
 function workerReport(runId: string, overrides: Record<string, unknown> = {}) {
 	return {
-		protocol: 1,
+		protocol: 2,
 		eventId: "worker-event-1",
 		runId,
 		sourceInstanceId: "worker-source-1",
 		sourceSequence: 1,
 		observedAt: 1_786_000_000_000,
 		status: "completed",
-		evidence: { kind: "worker_completed", result: "Done" },
+		evidence: { kind: "worker_completed_v2", result: "Done" },
 		...overrides,
 	};
 }
@@ -197,6 +197,7 @@ test("RPC spawn validates cwd before side effects, activates team mode, and retu
 		sessionId: "session",
 		registeredAt: 0,
 		requestId: "spawn",
+		lifecycleProtocol: 2,
 		assignment: { cwd: "/tmp", model: "test/model" },
 	});
 	assert.equal(h.activeTools().includes("CreateAgentPanel"), true);
@@ -217,6 +218,7 @@ test("CreateAgentPanel preserves parameter mapping through the shared spawn faca
 		runId: "<run>",
 		sessionId: "session",
 		registeredAt: 0,
+		lifecycleProtocol: 2,
 		assignment: { cwd: "/tmp", model: "xai/grok-4.6", role: "research" },
 	});
 });
@@ -272,6 +274,7 @@ test("re-adoption sends the run binding before its assignment prompt", async () 
 	assert.ok(bindingIndex >= 0);
 	assert.ok(promptIndex > bindingIndex);
 	assert.equal(h.writtenEnvelopes[bindingIndex].envelope.binding.runId, spawned.data.runId);
+	assert.equal(h.writtenEnvelopes[bindingIndex].envelope.binding.protocol, 2);
 	assert.equal(h.writtenEnvelopes[bindingIndex].envelope.binding.correlationId, "dispatch-1");
 	assert.equal(h.writtenEnvelopes[promptIndex].envelope.runId, spawned.data.runId);
 	const registrationIndex = h.entries.findIndex((entry) => entry.type === RUN_REGISTRATION_ENTRY);
@@ -286,7 +289,7 @@ test("new workers bind startup flags, report readiness, and gate ReportWorkerRun
 	const h = await harness({
 		listening: true,
 		selfName: "agent-child",
-		flags: { "orchestrated-by": "boss", "worker-run-id": "run-child", "worker-correlation-id": "dispatch-child" },
+		flags: { "orchestrated-by": "boss", "worker-run-id": "run-child", "worker-correlation-id": "dispatch-child", "worker-lifecycle-protocol": "2" },
 	});
 	assert.equal(h.activeTools().includes("ReportWorkerRun"), false);
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
@@ -295,18 +298,46 @@ test("new workers bind startup flags, report readiness, and gate ReportWorkerRun
 	assert.equal(ready.paneId, "boss-pane");
 	assert.equal(ready.envelope.type, "lifecycle");
 	assert.equal(ready.envelope.report.runId, "run-child");
+	assert.equal(ready.envelope.report.protocol, 2);
 	assert.equal(ready.envelope.report.sourceSequence, 1);
 	assert.deepEqual(ready.envelope.report.evidence, { kind: "worker_ready", readiness: "confirmed" });
 
 	const messageResult = await h.tools.get("ReportWorkerRun").execute("report-1", { status: "message", message: "Still working" });
-	const completedResult = await h.tools.get("ReportWorkerRun").execute("report-2", { status: "completed", result: "Implemented" });
+	await assert.rejects(
+		h.tools.get("ReportWorkerRun").execute("report-invalid", { status: "completed" }),
+		/bound contract/,
+	);
+	const completedResult = await h.tools.get("ReportWorkerRun").execute("report-2", {
+		status: "completed",
+		result: "Implemented",
+		artifacts: [{ path: "reports/result.md", description: "Final report" }],
+		checks: [{ kind: "test", command: "npm test", outcome: "passed" }],
+	});
 	assert.equal(messageResult.details.runId, "run-child");
 	assert.equal(completedResult.details.status, "completed");
 	const reports = h.writtenEnvelopes.map(({ envelope }) => envelope.report).filter(Boolean);
 	assert.deepEqual(reports.map((report) => report.sourceSequence), [1, 2, 3]);
 	assert.deepEqual(reports[1].evidence, { kind: "worker_message", message: "Still working" });
-	assert.deepEqual(reports[2].evidence, { kind: "worker_completed", result: "Implemented" });
+	assert.deepEqual(reports[2].evidence, {
+		kind: "worker_completed_v2",
+		result: "Implemented",
+		artifacts: [{ path: "reports/result.md", description: "Final report" }],
+		checks: [{ kind: "test", command: "npm test", outcome: "passed" }],
+	});
 	assert.equal(h.entries.some((entry) => entry.data.activeRun?.sourceSequence === 3), true);
+});
+
+test("bound worker prompt reserves terminal reporting for ReportWorkerRun", async () => {
+	const h = await harness({
+		listening: true,
+		selfName: "agent-child",
+		flags: { "orchestrated-by": "boss", "worker-run-id": "run-child", "worker-lifecycle-protocol": "2" },
+	});
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	const prompt = await h.handlers.get("before_agent_start")![0]({ systemPrompt: "base" });
+	assert.match(prompt.systemPrompt, /Use SendToAgent for questions and ordinary communication/);
+	assert.match(prompt.systemPrompt, /Report terminal outcomes only with ReportWorkerRun/);
+	assert.match(prompt.systemPrompt, /non-empty result/);
 });
 
 test("re-adopted workers apply a trusted run binding before reporting ready", async () => {
@@ -322,7 +353,7 @@ test("re-adopted workers apply a trusted run binding before reporting ready", as
 		type: "control",
 		from: { id: "boss", paneId: "boss-pane", name: "boss", role: "orchestrator" },
 		action: "bind-run",
-		binding: { protocol: 1, runId: "run-adopted", correlationId: "dispatch-adopted" },
+		binding: { protocol: 2, runId: "run-adopted", correlationId: "dispatch-adopted" },
 		ts: Date.now(),
 	}, "bind-run.json");
 	await new Promise((resolve) => setImmediate(resolve));
@@ -335,7 +366,7 @@ test("re-adopted workers apply a trusted run binding before reporting ready", as
 test("parent accepts trusted lifecycle reports only after custom-message persistence", async () => {
 	const runId = "run-parent";
 	const h = await harness({
-		branch: teamBranch({ workers: ["agent-scout"], meta: { "agent-scout": { paneId: "worker-pane", runId, correlationId: "dispatch-parent" } } }),
+		branch: teamBranch({ workers: ["agent-scout"], meta: { "agent-scout": { paneId: "worker-pane", runId, correlationId: "dispatch-parent", lifecycleProtocol: 2 } } }),
 		agents: [{ pane_id: "worker-pane", tab_id: "tab-1", name: "agent-scout", agent: "pi" }],
 	});
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
@@ -369,7 +400,7 @@ test("parent accepts trusted lifecycle reports only after custom-message persist
 test("parent rejects untrusted and pane-mismatched lifecycle senders", async () => {
 	const runId = "run-trusted";
 	const h = await harness({
-		branch: teamBranch({ workers: ["agent-scout"], meta: { "agent-scout": { paneId: "worker-pane", runId } } }),
+		branch: teamBranch({ workers: ["agent-scout"], meta: { "agent-scout": { paneId: "worker-pane", runId, lifecycleProtocol: 2 } } }),
 		agents: [{ pane_id: "worker-pane", tab_id: "tab-1", name: "agent-scout", agent: "pi" }],
 	});
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
@@ -398,7 +429,7 @@ test("reload accepts a persisted trusted report that was not yet journaled", asy
 		},
 	}];
 	const h = await harness({
-		branch: teamBranch({ workers: ["agent-scout"], meta: { "agent-scout": { paneId: "worker-pane", runId } } }),
+		branch: teamBranch({ workers: ["agent-scout"], meta: { "agent-scout": { paneId: "worker-pane", runId, lifecycleProtocol: 2 } } }),
 		sessionEntries,
 	});
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
@@ -480,6 +511,7 @@ test("RPC direction and thinking reach the canonical creation sequence", async (
 	assert.ok(start);
 	assert.equal(start.includes("test/model:high"), true);
 	assert.equal(start.includes("--worker-run-id"), true);
+	assert.equal(start[start.indexOf("--worker-lifecycle-protocol") + 1], "2");
 	assert.equal(start[start.indexOf("--worker-run-id") + 1], spawned.success ? spawned.data.runId : undefined);
 });
 

@@ -9,6 +9,7 @@ import {
 	lifecycleChannel,
 	type AcceptedLifecycleEvent,
 	type LifecycleCandidate,
+	type LifecycleProtocol,
 	type LifecycleStatus,
 	type WorkerLifecycleEvidence,
 } from "./protocol.js";
@@ -31,6 +32,7 @@ export interface LifecycleRejectionEntry {
 
 export interface RunBinding {
 	runId: string;
+	lifecycleProtocol: LifecycleProtocol;
 	correlationId?: string;
 	worker: { name: string; paneId?: string };
 	requestId?: string;
@@ -50,6 +52,7 @@ export type LifecycleRejectionReason =
 	| "invalid_candidate"
 	| "unbound_run"
 	| "binding_mismatch"
+	| "protocol_mismatch"
 	| "duplicate"
 	| "stale_source"
 	| "invalid_transition"
@@ -92,6 +95,7 @@ function sameEvidence(left: WorkerLifecycleEvidence | undefined, right: WorkerLi
 
 function validBinding(binding: RunBinding): boolean {
 	return Check(LifecycleRunIdSchema, binding.runId)
+		&& (binding.lifecycleProtocol === 1 || binding.lifecycleProtocol === 2)
 		&& (binding.correlationId === undefined || Check(LifecycleCorrelationIdSchema, binding.correlationId))
 		&& typeof binding.worker.name === "string"
 		&& binding.worker.name.length > 0
@@ -106,7 +110,8 @@ function sameBinding(record: RunLifecycleRecord, candidate: Pick<LifecycleCandid
 }
 
 function compatibleBinding(record: RunLifecycleRecord, binding: RunBinding): boolean {
-	return record.correlationId === binding.correlationId
+	return record.lifecycleProtocol === binding.lifecycleProtocol
+		&& record.correlationId === binding.correlationId
 		&& record.worker.name === binding.worker.name
 		&& (record.worker.paneId === undefined || binding.worker.paneId === undefined || record.worker.paneId === binding.worker.paneId);
 }
@@ -217,6 +222,7 @@ export class LifecycleAcceptor {
 		const candidate = value;
 		const record = this.records.get(candidate.runId);
 		if (!record) return { accepted: false, reason: "unbound_run" };
+		if (candidate.protocol !== record.lifecycleProtocol) return { accepted: false, reason: "protocol_mismatch", record: copyRecord(record) };
 		if (!sameBinding(record, candidate)) return { accepted: false, reason: "binding_mismatch", record: copyRecord(record) };
 		if (candidate.source === "provider" && record.providerInstanceId !== undefined && candidate.sourceInstanceId !== record.providerInstanceId) {
 			return { accepted: false, reason: "binding_mismatch", record: copyRecord(record) };
@@ -281,6 +287,7 @@ export class LifecycleAcceptor {
 				if (!record) {
 						record = {
 						runId: event.runId,
+						lifecycleProtocol: event.protocol,
 						...(event.correlationId === undefined ? {} : { correlationId: event.correlationId }),
 							worker: { ...event.worker },
 							...(event.source === "provider" ? { providerInstanceId: event.sourceInstanceId } : {}),

@@ -32,8 +32,8 @@ test("queries deterministic mixed strict and legacy pages from durable authoriti
 	registry.bindEndpoint({ version: 1, runId: "run-b", sessionId: "session-1", agentName: "agent-b", paneId: "pane-run-b", observedAt: 2 });
 
 	const acceptor = createLifecycleAcceptor({ sessionId: "session-1", getEntries: () => entries, appendEntry: () => {}, emit: () => {} });
-	acceptor.bindRun({ runId: "run-a", worker: { name: "agent-a", paneId: "pane-run-a" } });
-	acceptor.bindRun({ runId: "run-b", worker: { name: "agent-b", paneId: "pane-run-b" } });
+	acceptor.bindRun({ runId: "run-a", lifecycleProtocol: 1, worker: { name: "agent-a", paneId: "pane-run-a" } });
+	acceptor.bindRun({ runId: "run-b", lifecycleProtocol: 1, worker: { name: "agent-b", paneId: "pane-run-b" } });
 	assert.equal(acceptor.accept(candidate("run-a", "agent-a", "completed")).accepted, true);
 	assert.equal(acceptor.accept(candidate("run-b", "agent-b")).accepted, true);
 
@@ -75,7 +75,7 @@ test("queries deterministic mixed strict and legacy pages from durable authoriti
 
 	const strict = await client.get({ runId: "run-b" }, provider);
 	assert.equal("legacy" in strict, false);
-	assert.deepEqual(strict.lifecycle, { status: "started", acceptedSequence: 1, readiness: "unconfirmed" });
+	assert.deepEqual(strict.lifecycle, { status: "started", acceptedSequence: 1, readiness: "unconfirmed", orchestrationGradeCompletion: false });
 	assert.deepEqual("legacy" in strict ? undefined : strict.endpoint, { agentName: "agent-b", paneId: "pane-run-b", observedAt: 2 });
 	await assert.rejects(client.get({ runId: "run-missing" }, provider), (error: any) => error.code === "NOT_FOUND");
 });
@@ -84,10 +84,10 @@ test("registration-only and lifecycle projections are defensively cloned", () =>
 	const registry = createRunRegistry({ sessionId: "session-1", getEntries: () => [], appendEntry: () => {} });
 	registry.register({ version: 1, runId: "run-only", sessionId: "session-1", registeredAt: 1, assignment: { cwd: "/tmp" } });
 	const acceptor = createLifecycleAcceptor({ sessionId: "session-1", getEntries: () => [], appendEntry: () => {}, emit: () => {} });
-	acceptor.bindRun({ runId: "run-legacy", worker: { name: "agent-old" } });
+	acceptor.bindRun({ runId: "run-legacy", lifecycleProtocol: 1, worker: { name: "agent-old" } });
 	assert.equal(acceptor.accept(candidate("run-legacy", "agent-old")).accepted, false);
 	const registered = registry.projectRun("run-only")!;
-	assert.deepEqual(registered.lifecycle, { status: "registered", acceptedSequence: 0 });
+	assert.deepEqual(registered.lifecycle, { status: "registered", acceptedSequence: 0, orchestrationGradeCompletion: false });
 	if (!("legacy" in registered)) registered.assignment.cwd = "/changed";
 	assert.equal((registry.projectRun("run-only") as any).assignment.cwd, "/tmp");
 
@@ -109,7 +109,7 @@ test("subscribe, list, and replay closes the concurrent acceptance race after se
 		appendEntry: () => {},
 		emit: (channel, payload) => events.emit(channel, payload),
 	});
-	acceptor.bindRun({ runId: "run-race", worker: { name: "agent-race", paneId: "pane-run-race" } });
+	acceptor.bindRun({ runId: "run-race", lifecycleProtocol: 1, worker: { name: "agent-race", paneId: "pane-run-race" } });
 	assert.equal(acceptor.accept(candidate("run-race", "agent-race")).accepted, true);
 
 	const received: AcceptedLifecycleEvent[] = [];

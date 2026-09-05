@@ -12,6 +12,7 @@ import { FakeIsolatedEventBus } from "../support/fake-isolated-event-bus.js";
 
 const binding = {
 	runId: "run-1",
+	lifecycleProtocol: 1 as const,
 	correlationId: "dispatch-1",
 	worker: { name: "agent-scout", paneId: "pane-1" },
 	requestId: "request-1",
@@ -401,4 +402,37 @@ test("restored replay retains only contiguous current-session history without pu
 	]);
 	assert.deepEqual(restored.acceptor.replayRun(binding.runId, 0, 10)?.events.map((event) => event.acceptedSequence), [1, 2]);
 	assert.equal(restored.emissions.length, 0);
+});
+
+test("binds lifecycle versions and restores contract 2 completion evidence exactly", () => {
+	const h = setup();
+	const v2Binding = { ...binding, runId: "run-v2", lifecycleProtocol: 2 as const };
+	assert.equal(h.acceptor.bindRun(v2Binding), true);
+	assert.equal(h.acceptor.accept(candidate({ runId: "run-v2", worker: v2Binding.worker })).accepted, false);
+	assert.equal(h.acceptor.accept({
+		...candidate({ runId: "run-v2", worker: v2Binding.worker }),
+		protocol: 2,
+		eventId: "event-v2-completed",
+		sourceInstanceId: "worker-v2",
+		source: "worker",
+		status: "completed",
+		evidence: {
+			kind: "worker_completed_v2",
+			result: "Implemented and verified",
+			artifacts: [{ path: "reports/result.md", description: "Final report" }],
+			checks: [{ kind: "test", command: "npm test", outcome: "passed" }],
+		},
+	}).accepted, true);
+	assert.deepEqual(h.acceptor.getRun("run-v2")?.terminalEvidence, {
+		kind: "worker_completed_v2",
+		result: "Implemented and verified",
+		artifacts: [{ path: "reports/result.md", description: "Final report" }],
+		checks: [{ kind: "test", command: "npm test", outcome: "passed" }],
+	});
+
+	const restored = setup([{ type: "custom", customType: LIFECYCLE_JOURNAL_ENTRY, data: h.journal[0] }]);
+	assert.equal(restored.acceptor.getRun("run-v2")?.lifecycleProtocol, 2);
+	assert.deepEqual(restored.acceptor.replayRun("run-v2", 0, 10)?.events, [h.journal[0].event]);
+	assert.equal(restored.acceptor.bindRun(v2Binding), true);
+	assert.equal(restored.acceptor.bindRun({ ...v2Binding, lifecycleProtocol: 1 }), false);
 });

@@ -52,7 +52,7 @@ Workers are named `agent-<name>` (or `agent-<type>` / `agent-N`). First worker o
 
 ### `ReportWorkerRun` and lifecycle events
 
-Each worker assignment has a provider-generated `runId`, separate from an RPC `requestId`, optional caller `correlationId`, worker name, and pane identity. A bound worker can use `ReportWorkerRun` for typed `message`, `completed`, or `failed` reports. The extension supplies trusted identity and ordering fields; ordinary `SendToAgent` prose is never interpreted as an outcome.
+Each worker assignment has a provider-generated `runId`, separate from an RPC `requestId`, optional caller `correlationId`, worker name, and pane identity. New runs durably select lifecycle/report contract 2. A bound worker uses `ReportWorkerRun` for typed `message`, `completed`, or `failed` reports; completion requires a non-empty result and may include bounded artifact references and command/test checks. The extension supplies trusted identity and ordering fields. `SendToAgent` is for questions and ordinary communication, and its prose is never interpreted as a terminal outcome.
 
 Accepted observations are journaled in the parent session before publication on `herdr-workers:lifecycle` and the matching `herdr-workers:<status>` channel. Provider-observed start, worker readiness, explicit outcomes, and scoped uncertainty carry different evidence. Release and extension shutdown do not mean the worker stopped. See `docs/lifecycle-events.md` for the contract, durability, deduplication, and consumer boundaries.
 
@@ -64,7 +64,7 @@ The event bus is process-local, requests are not durable, and callers should use
 
 ### Durable run discovery
 
-Each spawn is registered before Herdr side effects. A separate run-query protocol lets extensions probe `herdr-workers:runs:rpc:probe`, fetch one run with `get`, page through current-session runs with `list`, and recover accepted evidence with bounded `replay`. Strict handles combine immutable assignment and original endpoint facts with lifecycle state from accepted durable evidence. Optional live endpoint observation enriches only an exact original name-and-pane match and never rewrites durable identity. Older lifecycle-only runs remain visible as explicit legacy projections without fabricated registration or assignment fields. Consumers subscribe first, then list and replay, deduplicating by `(runId, acceptedSequence)`. See `docs/run-query-protocol.md` for schemas, pagination, routing, endpoint trust, and recovery behavior.
+Each spawn is registered before Herdr side effects. A separate run-query protocol lets extensions probe `herdr-workers:runs:rpc:probe`, fetch one run with `get`, page through current-session runs with `list`, and recover accepted evidence with bounded `replay`. Query protocol 2 is preferred and exposes the selected lifecycle contract, structured completion, and an `orchestrationGradeCompletion` marker. Protocol 1 remains an explicit readable compatibility projection without that marker. Strict handles combine immutable assignment and original endpoint facts with lifecycle state from accepted durable evidence. Optional live endpoint observation enriches only an exact original name-and-pane match and never rewrites durable identity. Older lifecycle-only runs remain visible as explicit legacy projections without fabricated registration or assignment fields. Consumers subscribe first, then list and replay, deduplicating by `(runId, acceptedSequence)`. See `docs/run-query-protocol.md` for schemas, pagination, routing, endpoint trust, and recovery behavior.
 
 ---
 
