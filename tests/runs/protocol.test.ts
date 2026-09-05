@@ -6,6 +6,8 @@ import {
 	GetRunRequestSchema,
 	LegacyWorkerRunProjectionV1Schema,
 	ListRunsRequestSchema,
+	ReplayRunRequestSchema,
+	ReplayRunResultSchema,
 	RUN_QUERY_CHANNELS,
 	RUN_QUERY_LIMITS,
 	RunQueryProbeRequestSchema,
@@ -15,6 +17,8 @@ import {
 	encodeRunQueryCursor,
 	isValidRunQueryRecord,
 	isValidRunQueryRequest,
+	isValidRunQueryResult,
+	isValidReplayRunResult,
 	runQueryFailure,
 	runQueryReplyChannel,
 	runQuerySuccess,
@@ -40,12 +44,26 @@ const legacy = {
 	lifecycle: { status: "completed", acceptedSequence: 2, readiness: "confirmed" },
 	worker: { agentName: "agent-old", paneId: "pane-old" },
 };
+const acceptedEvent = {
+	protocol: 1,
+	eventId: "event-1",
+	runId: "run-1",
+	sourceInstanceId: "provider-1",
+	sourceSequence: 1,
+	acceptedSequence: 1,
+	status: "started",
+	worker: { name: "agent-scout", paneId: "pane-1" },
+	observedAt: 1_786_000_000_000,
+	source: "provider",
+	evidence: { kind: "agent_start_returned", readiness: "unconfirmed" },
+};
 
 test("defines independent versioned channels and validates safe addressed requests", () => {
 	assert.deepEqual(RUN_QUERY_CHANNELS, {
 		probe: "herdr-workers:runs:rpc:probe",
 		get: "herdr-workers:runs:rpc:get",
 		list: "herdr-workers:runs:rpc:list",
+		replay: "herdr-workers:runs:rpc:replay",
 	});
 	assert.equal(Check(RunQueryProbeRequestSchema, { requestId: "probe-1", supportedProtocols: [2, 1] }), true);
 	assert.equal(Check(RunQueryProbeRequestSchema, { requestId: "bad/id", supportedProtocols: [1] }), false);
@@ -54,6 +72,9 @@ test("defines independent versioned channels and validates safe addressed reques
 	assert.equal(Check(ListRunsRequestSchema, { ...addressed, limit: RUN_QUERY_LIMITS.maxPageSize }), true);
 	assert.equal(Check(ListRunsRequestSchema, { ...addressed, limit: RUN_QUERY_LIMITS.maxPageSize + 1 }), false);
 	assert.equal(Check(ListRunsRequestSchema, { ...addressed, limit: 0 }), false);
+	assert.equal(Check(ReplayRunRequestSchema, { ...addressed, runId: "run-1", afterAcceptedSequence: 0, limit: 1 }), true);
+	assert.equal(Check(ReplayRunRequestSchema, { ...addressed, runId: "run-1", afterAcceptedSequence: -1 }), false);
+	assert.equal(Check(ReplayRunRequestSchema, { ...addressed, runId: "run-1", afterAcceptedSequence: 0, limit: RUN_QUERY_LIMITS.maxPageSize + 1 }), false);
 });
 
 test("round trips canonical opaque cursors and rejects malformed encodings", () => {
@@ -89,6 +110,17 @@ test("rejects malformed nested lifecycle and endpoint fields", () => {
 		{ ...legacy, worker: {} },
 	];
 	for (const value of malformed) assert.equal(isValidRunQueryRecord(value), false);
+});
+
+test("validates bounded accepted lifecycle replay results", () => {
+	assert.equal(Check(ReplayRunResultSchema, { events: [acceptedEvent], hasMore: false, future: true }), true);
+	assert.equal(isValidRunQueryResult("replay", { events: [acceptedEvent], hasMore: false }), true);
+	assert.equal(isValidRunQueryResult("replay", { events: [{ ...acceptedEvent, acceptedSequence: 0 }], hasMore: false }), false);
+	assert.equal(isValidRunQueryResult("replay", { events: [acceptedEvent, { ...acceptedEvent, eventId: "event-2" }], hasMore: false }), false);
+	assert.equal(isValidReplayRunResult({ events: [acceptedEvent], hasMore: false }, { runId: "run-other", afterAcceptedSequence: 0 }), false);
+	assert.equal(isValidReplayRunResult({ events: [acceptedEvent], hasMore: false }, { runId: "run-1", afterAcceptedSequence: 1 }), false);
+	assert.equal(isValidRunQueryResult("replay", { events: [{ ...acceptedEvent, evidence: { kind: "worker_message", message: "é".repeat(32_769) }, status: "message", source: "worker" }], hasMore: false }), false);
+	assert.equal(isValidRunQueryResult("replay", { events: [], hasMore: "no" }), false);
 });
 
 test("enforces UTF-8 byte budgets in projected text fields", () => {

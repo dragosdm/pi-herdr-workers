@@ -119,3 +119,35 @@ test("returns defensive clones for registrations, endpoints, and lists", () => {
 	assert.deepEqual(h.registry.getRegistration(registration.runId), registration);
 	assert.deepEqual(h.registry.getEndpoint(registration.runId), endpoint);
 });
+
+test("enriches only an exactly matching endpoint observation without persisting it", () => {
+	const h = setup();
+	h.registry.register(registration);
+	h.registry.bindEndpoint(endpoint);
+	const appendCount = h.appended.length;
+	const matching = h.registry.projectRun(registration.runId, undefined, {
+		agentName: endpoint.agentName,
+		paneId: endpoint.paneId,
+		observedAt: endpoint.observedAt + 100,
+		herdrStatus: "idle",
+	});
+	assert.deepEqual(matching && !("legacy" in matching) && matching.endpoint, {
+		agentName: endpoint.agentName,
+		paneId: endpoint.paneId,
+		observedAt: endpoint.observedAt + 100,
+		herdrStatus: "idle",
+	});
+	for (const observation of [
+		{ agentName: "agent-renamed", paneId: endpoint.paneId, observedAt: endpoint.observedAt + 200, herdrStatus: "busy" },
+		{ agentName: endpoint.agentName, paneId: "pane-moved", observedAt: endpoint.observedAt + 200, herdrStatus: "busy" },
+	]) {
+		const projected = h.registry.projectRun(registration.runId, undefined, observation);
+		assert.deepEqual(projected && !("legacy" in projected) && projected.endpoint, {
+			agentName: endpoint.agentName,
+			paneId: endpoint.paneId,
+			observedAt: endpoint.observedAt,
+		});
+	}
+	assert.equal(h.appended.length, appendCount);
+	assert.deepEqual(h.registry.getEndpoint(registration.runId), endpoint);
+});

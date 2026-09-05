@@ -17,6 +17,7 @@ function service(overrides: Partial<RunQueryService> = {}): RunQueryService {
 	return {
 		get: async () => structuredClone(record),
 		list: async () => ({ runs: [structuredClone(record)] }),
+		replay: async () => ({ events: [], hasMore: false }),
 		...overrides,
 	};
 }
@@ -78,6 +79,7 @@ test("projects known service inputs, validates outputs, and sanitizes failures",
 				throw new Error("secret query state");
 			},
 			list: async (input) => { inputs.push(input); return { runs: [record] }; },
+			replay: async (input) => { inputs.push(input); return { events: [], hasMore: false }; },
 		}),
 		sessionId: "session-1",
 		getProviderState: () => ({ available: true }),
@@ -88,6 +90,7 @@ test("projects known service inputs, validates outputs, and sanitizes failures",
 		{ channel: RUN_QUERY_CHANNELS.get, id: "malformed", payload: { runId: "run-malformed" } },
 		{ channel: RUN_QUERY_CHANNELS.get, id: "private", payload: { runId: "run-private" } },
 		{ channel: RUN_QUERY_CHANNELS.list, id: "list", payload: { cursor: encodeRunQueryCursor("run-0"), limit: 2, future: "ignored" } },
+		{ channel: RUN_QUERY_CHANNELS.replay, id: "replay", payload: { runId: "run-1", afterAcceptedSequence: 3, limit: 2, future: "ignored" } },
 	] as const;
 	const replies: RunQueryReply[] = [];
 	for (const request of requests) {
@@ -100,15 +103,16 @@ test("projects known service inputs, validates outputs, and sanitizes failures",
 		{ runId: "run-malformed" },
 		{ runId: "run-private" },
 		{ cursor: encodeRunQueryCursor("run-0"), limit: 2 },
+		{ runId: "run-1", afterAcceptedSequence: 3, limit: 2 },
 	]);
-	assert.deepEqual(replies.map((reply) => reply.success ? "success" : reply.error.code), ["NOT_FOUND", "INTERNAL_ERROR", "INTERNAL_ERROR", "success"]);
+	assert.deepEqual(replies.map((reply) => reply.success ? "success" : reply.error.code), ["NOT_FOUND", "INTERNAL_ERROR", "INTERNAL_ERROR", "success", "success"]);
 	assert.doesNotMatch(JSON.stringify(replies), /secret|query state/);
 });
 
 test("dispose removes all query subscriptions idempotently", () => {
 	const events = new FakeEventBus();
 	const server = registerRunQueryServer({ events, service: service(), sessionId: "session-1", getProviderState: () => ({ available: true }) });
-	assert.equal(events.listenerCount(), 3);
+	assert.equal(events.listenerCount(), 4);
 	server.dispose();
 	server.dispose();
 	assert.equal(events.listenerCount(), 0);

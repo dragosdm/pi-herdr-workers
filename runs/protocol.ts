@@ -1,6 +1,7 @@
 import { Buffer } from "node:buffer";
 import { Type, type Static, type TSchema } from "typebox";
 import { Check } from "typebox/value";
+import { AcceptedLifecycleEventSchema, isAcceptedLifecycleEvent, type AcceptedLifecycleEvent } from "../lifecycle/protocol.js";
 
 export const RUN_QUERY_PROTOCOL_V1 = 1 as const;
 export const RUN_QUERY_SUPPORTED_PROTOCOLS = [RUN_QUERY_PROTOCOL_V1] as const;
@@ -9,6 +10,7 @@ export const RUN_QUERY_CHANNELS = {
 	probe: "herdr-workers:runs:rpc:probe",
 	get: "herdr-workers:runs:rpc:get",
 	list: "herdr-workers:runs:rpc:list",
+	replay: "herdr-workers:runs:rpc:replay",
 } as const;
 
 export type RunQueryOperation = keyof typeof RUN_QUERY_CHANNELS;
@@ -79,13 +81,21 @@ export const ListRunsRequestSchema = Type.Object({
 	cursor: Type.Optional(RunQueryCursorSchema),
 	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: RUN_QUERY_LIMITS.maxPageSize })),
 });
+export const ReplayRunRequestSchema = Type.Object({
+	...AddressedRequestProperties,
+	runId: RunQueryRunIdSchema,
+	afterAcceptedSequence: Type.Integer({ minimum: 0 }),
+	limit: Type.Optional(Type.Integer({ minimum: 1, maximum: RUN_QUERY_LIMITS.maxPageSize })),
+});
 
 export type RunQueryProbeRequest = Static<typeof RunQueryProbeRequestSchema>;
 export type GetRunRequest = Static<typeof GetRunRequestSchema>;
 export type ListRunsRequest = Static<typeof ListRunsRequestSchema>;
-export type RunQueryAddressedRequest = GetRunRequest | ListRunsRequest;
+export type ReplayRunRequest = Static<typeof ReplayRunRequestSchema>;
+export type RunQueryAddressedRequest = GetRunRequest | ListRunsRequest | ReplayRunRequest;
 export interface GetRunInput { runId: string; includeEndpointObservation?: boolean }
 export interface ListRunsInput { cursor?: string; limit?: number }
+export interface ReplayRunInput { runId: string; afterAcceptedSequence: number; limit?: number }
 
 const AvailabilityReasonSchema = Type.Union(RUN_QUERY_AVAILABILITY_REASONS.map((reason) => Type.Literal(reason)));
 const ProbeDataProperties = {
@@ -155,6 +165,10 @@ export const ListRunsResultSchema = Type.Object({
 	runs: Type.Array(WorkerRunRecordV1Schema, { maxItems: RUN_QUERY_LIMITS.maxPageSize }),
 	nextCursor: Type.Optional(RunQueryCursorSchema),
 });
+export const ReplayRunResultSchema = Type.Object({
+	events: Type.Array(AcceptedLifecycleEventSchema, { maxItems: RUN_QUERY_LIMITS.maxPageSize }),
+	hasMore: Type.Boolean(),
+});
 
 export type RunQueryProbeData = Static<typeof RunQueryProbeDataSchema>;
 export type WorkerRunStatus = Static<typeof WorkerRunStatusSchema>;
@@ -162,11 +176,13 @@ export type WorkerRunHandleV1 = Static<typeof WorkerRunHandleV1Schema>;
 export type LegacyWorkerRunProjectionV1 = Static<typeof LegacyWorkerRunProjectionV1Schema>;
 export type WorkerRunRecordV1 = Static<typeof WorkerRunRecordV1Schema>;
 export type ListRunsResult = Static<typeof ListRunsResultSchema>;
+export interface ReplayRunResult { events: AcceptedLifecycleEvent[]; hasMore: boolean }
 
 export const RUN_QUERY_RESULT_SCHEMAS = {
 	probe: RunQueryProbeDataSchema,
 	get: WorkerRunRecordV1Schema,
 	list: ListRunsResultSchema,
+	replay: ReplayRunResultSchema,
 } as const;
 
 export interface RunQueryError { code: RunQueryErrorCode; message: string }
@@ -187,6 +203,7 @@ export const RUN_QUERY_REQUEST_SCHEMAS: Record<RunQueryRequestChannel, TSchema> 
 	[RUN_QUERY_CHANNELS.probe]: RunQueryProbeRequestSchema,
 	[RUN_QUERY_CHANNELS.get]: GetRunRequestSchema,
 	[RUN_QUERY_CHANNELS.list]: ListRunsRequestSchema,
+	[RUN_QUERY_CHANNELS.replay]: ReplayRunRequestSchema,
 };
 
 export function encodeRunQueryCursor(runId: string): string {
@@ -235,15 +252,33 @@ export function isValidRunQueryRecord(value: unknown): value is WorkerRunRecordV
 				&& withinUtf8Limit(record.endpoint.herdrStatus, RUN_QUERY_LIMITS.herdrStatus)));
 }
 
+export function isValidReplayRunResult(value: unknown, input?: ReplayRunInput): value is ReplayRunResult {
+	if (!Check(ReplayRunResultSchema, value)) return false;
+	const events = (value as ReplayRunResult).events;
+	let runId: string | undefined;
+	let acceptedSequence = input?.afterAcceptedSequence ?? 0;
+	for (const event of events) {
+		if (!isAcceptedLifecycleEvent(event)) return false;
+		runId ??= event.runId;
+		if (event.runId !== runId || (input && event.runId !== input.runId) || event.acceptedSequence <= acceptedSequence) return false;
+		acceptedSequence = event.acceptedSequence;
+	}
+	const limit = input?.limit ?? RUN_QUERY_LIMITS.defaultPageSize;
+	return events.length <= limit;
+}
+
 export function isValidRunQueryResult(operation: RunQueryOperation, value: unknown): boolean {
 	if (!Check(RUN_QUERY_RESULT_SCHEMAS[operation], value)) return false;
 	if (operation === "probe") {
 		return withinUtf8Limit((value as RunQueryProbeData).sessionId, RUN_QUERY_LIMITS.sessionId);
 	}
 	if (operation === "get") return isValidRunQueryRecord(value);
-	const result = value as ListRunsResult;
-	return result.runs.every(isValidRunQueryRecord)
-		&& (result.nextCursor === undefined || decodeRunQueryCursor(result.nextCursor) !== undefined);
+	if (operation === "list") {
+		const result = value as ListRunsResult;
+		return result.runs.every(isValidRunQueryRecord)
+			&& (result.nextCursor === undefined || decodeRunQueryCursor(result.nextCursor) !== undefined);
+	}
+	return isValidReplayRunResult(value);
 }
 
 export function isRunQueryReplyEnvelope(value: unknown): value is RunQueryReply {

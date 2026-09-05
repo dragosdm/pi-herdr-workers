@@ -58,6 +58,13 @@ export interface RunRegistryOptions {
 	appendEntry: (customType: string, data: RunRegistrationV1 | RunEndpointBindingV1) => void;
 }
 
+export interface LiveEndpointObservation {
+	agentName: string;
+	paneId: string;
+	observedAt: number;
+	herdrStatus?: string;
+}
+
 function clone<T>(value: T): T {
 	return structuredClone(value);
 }
@@ -126,10 +133,15 @@ export class RunRegistry {
 		return [...this.registrations.values()].map(clone);
 	}
 
-	projectRun(runId: string, lifecycle?: RunLifecycleRecord): WorkerRunRecordV1 | undefined {
+	projectRun(runId: string, lifecycle?: RunLifecycleRecord, observation?: LiveEndpointObservation): WorkerRunRecordV1 | undefined {
 		const registration = this.registrations.get(runId);
 		if (registration) {
 			const endpoint = this.endpoints.get(runId);
+			const matchingObservation = endpoint !== undefined
+				&& observation?.agentName === endpoint.agentName
+				&& observation.paneId === endpoint.paneId
+				? observation
+				: undefined;
 			return clone({
 				protocol: 1,
 				runId: registration.runId,
@@ -143,7 +155,8 @@ export class RunRegistry {
 					endpoint: {
 						agentName: endpoint.agentName,
 						paneId: endpoint.paneId,
-						observedAt: endpoint.observedAt,
+						observedAt: matchingObservation?.observedAt ?? endpoint.observedAt,
+						...(matchingObservation?.herdrStatus === undefined ? {} : { herdrStatus: matchingObservation.herdrStatus }),
 					},
 				}),
 			});

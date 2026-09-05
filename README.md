@@ -64,7 +64,7 @@ The event bus is process-local, requests are not durable, and callers should use
 
 ### Durable run discovery
 
-Each spawn is registered before Herdr side effects. A separate run-query protocol lets extensions probe `herdr-workers:runs:rpc:probe`, fetch one run with `get`, or page through current-session runs with `list`. Strict handles combine immutable assignment and original endpoint facts with lifecycle state from accepted durable evidence. Older lifecycle-only runs remain visible as explicit legacy projections without fabricated registration or assignment fields. See `docs/run-query-protocol.md` for schemas, pagination, routing, and recovery behavior.
+Each spawn is registered before Herdr side effects. A separate run-query protocol lets extensions probe `herdr-workers:runs:rpc:probe`, fetch one run with `get`, page through current-session runs with `list`, and recover accepted evidence with bounded `replay`. Strict handles combine immutable assignment and original endpoint facts with lifecycle state from accepted durable evidence. Optional live endpoint observation enriches only an exact original name-and-pane match and never rewrites durable identity. Older lifecycle-only runs remain visible as explicit legacy projections without fabricated registration or assignment fields. Consumers subscribe first, then list and replay, deduplicating by `(runId, acceptedSequence)`. See `docs/run-query-protocol.md` for schemas, pagination, routing, endpoint trust, and recovery behavior.
 
 ---
 

@@ -21,6 +21,7 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
@@ -46,6 +47,7 @@ import {
 	decodeRunQueryCursor,
 	encodeRunQueryCursor,
 	type ListRunsResult,
+	type ReplayRunResult,
 } from "../runs/protocol.js";
 import { registerRunQueryServer, type RunQueryServer, type RunQueryService } from "../runs/server.js";
 
@@ -1461,9 +1463,26 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			emit: (channel, payload) => pi.events.emit(channel, payload),
 		});
 		const queryService: RunQueryService = {
-			async get(input) {
-				const record = runRegistry?.projectRun(input.runId, lifecycleAcceptor?.getRun(input.runId));
+			async get(input, signal) {
+				const lifecycle = lifecycleAcceptor?.getRun(input.runId);
+				let record = runRegistry?.projectRun(input.runId, lifecycle);
 				if (!record) throw new RunQueryServiceError("NOT_FOUND", "Worker run was not found.");
+				if (input.includeEndpointObservation && !("legacy" in record) && record.endpoint) {
+					const live = await agentGet(record.endpoint.agentName, signal);
+					if (live?.name === record.endpoint.agentName && live.paneId === record.endpoint.paneId) {
+						const herdrStatus = typeof live.status === "string"
+							&& live.status.length > 0
+							&& Buffer.byteLength(live.status, "utf8") <= RUN_QUERY_LIMITS.herdrStatus
+							? live.status
+							: undefined;
+						record = runRegistry?.projectRun(input.runId, lifecycle, {
+							agentName: live.name,
+							paneId: live.paneId,
+							observedAt: Date.now(),
+							...(herdrStatus === undefined ? {} : { herdrStatus }),
+						}) ?? record;
+					}
+				}
 				return record;
 			},
 			async list(input): Promise<ListRunsResult> {
@@ -1480,6 +1499,13 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 					runs,
 					...(hasMore && runs.length > 0 ? { nextCursor: encodeRunQueryCursor(runs[runs.length - 1].runId) } : {}),
 				};
+			},
+			async replay(input): Promise<ReplayRunResult> {
+				const limit = input.limit ?? RUN_QUERY_LIMITS.defaultPageSize;
+				const replay = lifecycleAcceptor?.replayRun(input.runId, input.afterAcceptedSequence, limit);
+				if (replay) return replay;
+				if (runRegistry?.getRegistration(input.runId)) return { events: [], hasMore: false };
+				throw new RunQueryServiceError("NOT_FOUND", "Worker run was not found.");
 			},
 		};
 		runQueryServer = registerRunQueryServer({

@@ -4,13 +4,14 @@ The run-query protocol exposes durable, session-scoped worker assignment records
 
 ## Channels and routing
 
-Protocol 1 defines three request channels:
+Protocol 1 defines four request channels:
 
 | Operation | Request channel | Default client timeout |
 |---|---|---:|
 | Probe | `herdr-workers:runs:rpc:probe` | 2 seconds |
 | Get | `herdr-workers:runs:rpc:get` | 20 seconds |
 | List | `herdr-workers:runs:rpc:list` | 20 seconds |
+| Replay | `herdr-workers:runs:rpc:replay` | 20 seconds |
 
 Replies use `<request-channel>:reply:<requestId>`. Subscribe before emitting. Probe negotiates protocol 1 and returns a query-specific `providerInstanceId`; addressed calls must copy that ID and the negotiated protocol. Reload creates a new provider instance, so requests addressed to an old generation are ignored.
 
@@ -104,7 +105,7 @@ A lifecycle-only record is explicitly discriminated and does not invent assignme
 }
 ```
 
-Unknown runs return `NOT_FOUND`. The optional `includeEndpointObservation` request field is reserved for best-effort response-time enrichment; it does not change durable availability or stored identity.
+Unknown runs return `NOT_FOUND`. Set `includeEndpointObservation: true` for best-effort response-time enrichment. The provider resolves only the registered `agentName` and enriches the response only when the live name and pane both equal the original binding. A match refreshes `endpoint.observedAt` and may add `endpoint.herdrStatus`. A missing, renamed, moved, or reused endpoint leaves the durable endpoint unchanged. Legacy records are never enriched, and observation appends no registry, team, or lifecycle entries.
 
 ## List
 
@@ -121,9 +122,51 @@ Unknown runs return `NOT_FOUND`. The optional `includeEndpointObservation` reque
 
 The default limit is 50 and the maximum is 100. `nextCursor` is an opaque encoding of the page's last `runId`; pass it unchanged to continue. A cursor is exclusive. Restart from the beginning to discover runs added later whose IDs sort before an old cursor.
 
+## Replay
+
+`replay` reads accepted current-session lifecycle evidence for one run. The accepted-sequence cursor is exclusive, results preserve ascending canonical order and the original event identity fields, and replay never republishes lifecycle channels.
+
+```json
+{
+  "requestId": "replay-1",
+  "providerInstanceId": "query-generation-1",
+  "protocol": 1,
+  "runId": "run-1",
+  "afterAcceptedSequence": 1,
+  "limit": 50
+}
+```
+
+```json
+{
+  "events": [
+    {
+      "protocol": 1,
+      "eventId": "event-2",
+      "runId": "run-1",
+      "sourceInstanceId": "worker-generation-1",
+      "sourceSequence": 1,
+      "acceptedSequence": 2,
+      "status": "completed",
+      "worker": { "name": "agent-scout", "paneId": "pane-1" },
+      "observedAt": 1788351000200,
+      "source": "worker",
+      "evidence": { "kind": "worker_completed", "result": "Done" }
+    }
+  ],
+  "hasMore": false
+}
+```
+
+The default replay limit is 50 and the maximum is 100. `hasMore` means another request with the last returned `acceptedSequence` can continue the same run. Registered runs with no accepted evidence return an empty page; a run absent from both registration and lifecycle authority returns `NOT_FOUND`.
+
+## Restart recovery
+
+To avoid a snapshot/publication race, subscribe to `herdr-workers:lifecycle` before querying. Probe the run-query provider, page through `list`, then call `replay` for each tracked run after the record's `lifecycle.acceptedSequence`. Merge concurrent live and replayed events by `(runId, acceptedSequence)`. The same event may appear through both paths, but canonical sequence deduplication produces one ordered consumer state.
+
 ## Validation and errors
 
-Safe IDs use `[A-Za-z0-9._-]{1,128}`. Known string fields have both character and UTF-8 byte limits: session, model, role, pane, and status fields allow 128 bytes; agent names allow 32; CWD allows 4,096; error messages allow 1,024. Unknown fields remain additive, but malformed known fields, nested lifecycle data, endpoint data, cursors, and page limits are rejected.
+Safe IDs use `[A-Za-z0-9._-]{1,128}`. Known string fields have both character and UTF-8 byte limits: session, model, role, pane, and status fields allow 128 bytes; agent names allow 32; CWD allows 4,096; error messages allow 1,024. Unknown fields remain additive, but malformed known fields, nested lifecycle data, endpoint data, cursors, page limits, accepted events, mixed-run replay pages, and non-increasing replay sequences are rejected.
 
 Both server and client validate successful results. Service failures are sanitized to fixed errors. Protocol 1 uses `INVALID_REQUEST`, `UNSUPPORTED_PROTOCOL`, `PROVIDER_UNAVAILABLE`, `NOT_FOUND`, and `INTERNAL_ERROR`.
 

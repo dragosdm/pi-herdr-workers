@@ -91,6 +91,8 @@ validate candidate and trusted run binding
 
 Restoration scans `SessionManager.getEntries()` for the current session, including entries outside the active `/tree` branch. It reconstructs run bindings, accepted order, event IDs, source sequences, readiness, and terminal evidence without republishing historical events. Repeated `eventId` values, non-increasing source sequences, and duplicate restored entries are ignored. Delivery is therefore at least once at the inbox boundary and idempotent at lifecycle acceptance, not globally exactly once.
 
+Consumers that restart or miss publication can recover accepted evidence through `herdr-workers:runs:rpc:replay`. Subscribe to the canonical lifecycle channel first, list durable run records, replay each run after its listed `acceptedSequence`, and deduplicate live and replayed observations by `(runId, acceptedSequence)`. See `docs/run-query-protocol.md` for routing, bounds, and the complete recovery algorithm.
+
 Worker-originated reports use the existing atomic filesystem inbox. The parent first verifies the configured peer and pane/run binding, injects a `herdr-worker.lifecycle-report` custom message, and waits until that message exists in session persistence. Only then does it append and publish the lifecycle observation and remove the inbox file.
 
 Durability follows Pi's session storage contract. `--no-session` is ephemeral, and lifecycle entries are not a distributed transaction with Herdr pane operations.

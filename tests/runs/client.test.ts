@@ -31,6 +31,11 @@ const record = {
 	lifecycle: { status: "registered" as const, acceptedSequence: 0 },
 	assignment: { cwd: "/tmp" },
 };
+const event = {
+	protocol: 1 as const, eventId: "event-1", runId: "run-1", sourceInstanceId: "provider-1", sourceSequence: 1,
+	acceptedSequence: 1, status: "started" as const, worker: { name: "agent-scout", paneId: "pane-1" }, observedAt: 1,
+	source: "provider" as const, evidence: { kind: "agent_start_returned" as const, readiness: "unconfirmed" as const },
+};
 
 test("probe installs its listener before emit and selects an available provider", async () => {
 	const events = new FakeEventBus();
@@ -90,24 +95,26 @@ test("concurrent get calls correlate replies and validate successful records", a
 	assert.equal(events.listenerCount(), 0);
 });
 
-test("get and list forward addressed inputs and validate server results", async () => {
+test("get, list, and replay forward addressed inputs and validate server results", async () => {
 	const events = new FakeEventBus();
 	const requests: unknown[] = [];
-	for (const channel of [RUN_QUERY_CHANNELS.get, RUN_QUERY_CHANNELS.list]) {
+	for (const channel of [RUN_QUERY_CHANNELS.get, RUN_QUERY_CHANNELS.list, RUN_QUERY_CHANNELS.replay]) {
 		events.on(channel, (payload) => {
 			requests.push(payload);
 			const request = payload as { requestId: string };
-			const data = channel === RUN_QUERY_CHANNELS.get ? record : { runs: [record] };
+			const data = channel === RUN_QUERY_CHANNELS.get ? record : channel === RUN_QUERY_CHANNELS.list ? { runs: [record] } : { events: [event], hasMore: false };
 			events.emit(runQueryReplyChannel(channel, request.requestId), runQuerySuccess(request.requestId, data));
 		});
 	}
-	const ids = ["get-1", "list-1"];
+	const ids = ["get-1", "list-1", "replay-1"];
 	const client = createRunQueryClient({ events, createRequestId: () => ids.shift()! });
 	await client.get({ runId: "run-1", includeEndpointObservation: false }, provider);
 	await client.list({ limit: 10 }, provider);
+	await client.replay({ runId: "run-1", afterAcceptedSequence: 0, limit: 10 }, provider);
 	assert.deepEqual(requests, [
 		{ runId: "run-1", includeEndpointObservation: false, requestId: "get-1", providerInstanceId: "query-provider", protocol: 1 },
 		{ limit: 10, requestId: "list-1", providerInstanceId: "query-provider", protocol: 1 },
+		{ runId: "run-1", afterAcceptedSequence: 0, limit: 10, requestId: "replay-1", providerInstanceId: "query-provider", protocol: 1 },
 	]);
 
 	const malformed = new FakeEventBus();
@@ -120,6 +127,19 @@ test("get and list forward addressed inputs and validate server results", async 
 		assert.doesNotMatch(error.message, /lifecycle|acceptedSequence/);
 		return true;
 	});
+});
+
+test("replay rejects malformed accepted events and cleans up its listener", async () => {
+	const events = new FakeEventBus();
+	events.on(RUN_QUERY_CHANNELS.replay, (payload) => {
+		const request = payload as { requestId: string };
+		events.emit(runQueryReplyChannel(RUN_QUERY_CHANNELS.replay, request.requestId), runQuerySuccess(request.requestId, {
+			events: [{ ...event, acceptedSequence: 0 }], hasMore: false,
+		}));
+	});
+	const client = createRunQueryClient({ events, createRequestId: () => "bad-replay" });
+	await assert.rejects(client.replay({ runId: "run-1", afterAcceptedSequence: 0 }, provider), RunQueryProtocolError);
+	assert.equal(events.listenerCount(), 1);
 });
 
 test("failure, timeout, abort, and synchronous emit errors clean up listeners", async () => {

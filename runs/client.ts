@@ -6,11 +6,14 @@ import {
 	RUN_QUERY_PROTOCOL_V1,
 	RUN_QUERY_RESULT_SCHEMAS,
 	isRunQueryReplyEnvelope,
+	isValidReplayRunResult,
 	isValidRunQueryResult,
 	runQueryReplyChannel,
 	type GetRunInput,
 	type ListRunsInput,
 	type ListRunsResult,
+	type ReplayRunInput,
+	type ReplayRunResult,
 	type RunQueryAddressedRequest,
 	type RunQueryProbeData,
 	type RunQueryReply,
@@ -21,7 +24,7 @@ import {
 export interface RunQueryCallOptions { timeoutMs?: number; signal?: AbortSignal }
 export interface RunQueryClientOptions { events: RpcEventBus; createRequestId?: () => string }
 
-const RUN_QUERY_DEFAULT_TIMEOUTS = { probe: 2_000, get: 20_000, list: 20_000 } as const;
+const RUN_QUERY_DEFAULT_TIMEOUTS = { probe: 2_000, get: 20_000, list: 20_000, replay: 20_000 } as const;
 
 export class RunQueryTimeoutError extends Error {
 	constructor() { super("Run query request timed out."); this.name = "RunQueryTimeoutError"; }
@@ -117,7 +120,13 @@ export class RunQueryClient {
 		return this.operation("list", input, provider, RUN_QUERY_RESULT_SCHEMAS.list, options);
 	}
 
-	private operation<T>(operation: "get" | "list", input: object, provider: RunQueryProbeData, resultSchema: TSchema, options: RunQueryCallOptions = {}): Promise<T> {
+	async replay(input: ReplayRunInput, provider: RunQueryProbeData, options?: RunQueryCallOptions): Promise<ReplayRunResult> {
+		const result = await this.operation<ReplayRunResult>("replay", input, provider, RUN_QUERY_RESULT_SCHEMAS.replay, options);
+		if (!isValidReplayRunResult(result, input)) throw new RunQueryProtocolError();
+		return result;
+	}
+
+	private operation<T>(operation: "get" | "list" | "replay", input: object, provider: RunQueryProbeData, resultSchema: TSchema, options: RunQueryCallOptions = {}): Promise<T> {
 		const requestId = this.createRequestId();
 		const request = {
 			...input,
@@ -143,7 +152,7 @@ export class RunQueryClient {
 					finish(() => reject(new RunQueryResponseError(payload.error.code, payload.error.message)));
 					return;
 				}
-				const operation = channel === RUN_QUERY_CHANNELS.get ? "get" : "list";
+				const operation = channel === RUN_QUERY_CHANNELS.get ? "get" : channel === RUN_QUERY_CHANNELS.list ? "list" : "replay";
 				if (!isValidRunQueryResult(operation, payload.data)) {
 					finish(() => reject(new RunQueryProtocolError()));
 					return;

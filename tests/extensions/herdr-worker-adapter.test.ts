@@ -162,11 +162,11 @@ test("registers once, exposes live availability, and disposes on shutdown", asyn
 	let probe = await emitForReply<any>(h.events, CHANNELS.probe, "before", { requestId: "before", supportedProtocols: [1] });
 	assert.equal(probe.success && probe.data.reason, "SESSION_NOT_READY");
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
-	assert.equal(h.events.listenerCount(), 8);
+	assert.equal(h.events.listenerCount(), 9);
 	probe = await emitForReply<any>(h.events, CHANNELS.probe, "after", { requestId: "after", supportedProtocols: [1] });
 	assert.equal(probe.success && probe.data.available, true);
 	await h.handlers.get("session_tree")![0]({}, h.ctx);
-	assert.equal(h.events.listenerCount(), 8);
+	assert.equal(h.events.listenerCount(), 9);
 	await h.handlers.get("session_shutdown")![0]();
 	assert.equal(h.events.listenerCount(), 0);
 });
@@ -705,7 +705,7 @@ test("run query returns durable strict handles across provider reloads", async (
 		requestId: "query-get-2", providerInstanceId: secondProbe.data.providerInstanceId, protocol: 1, runId: spawned.data.runId,
 	});
 	assert.deepEqual(secondGet.success && secondGet.data, firstGet.success && firstGet.data);
-	assert.equal(h.events.listenerCount(), 8);
+	assert.equal(h.events.listenerCount(), 9);
 });
 
 test("run query lists lifecycle-only history without fabricating strict facts", async () => {
@@ -742,6 +742,81 @@ test("run query lists lifecycle-only history without fabricating strict facts", 
 		worker: { agentName: "agent-legacy", paneId: "legacy-pane" },
 	}]);
 	assert.doesNotMatch(JSON.stringify(listed), /assignment|registeredAt|requestId":"spawn|endpoint/);
+});
+
+test("run query replays accepted evidence without republishing it", async () => {
+	const h = await harness();
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	const workerProbe = await emitForReply<any>(h.events, CHANNELS.probe, "replay-worker-probe", { requestId: "replay-worker-probe", supportedProtocols: [1] });
+	const workerProviderId = workerProbe.success ? workerProbe.data.providerInstanceId : "";
+	const spawned = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, "replay-spawn", {
+		requestId: "replay-spawn", providerInstanceId: workerProviderId, protocol: 1, name: "builder",
+	});
+	assert.equal(spawned.success, true);
+	if (!spawned.success) return;
+	const beforeReplay = h.events.emissions.filter((item) => item.channel === LIFECYCLE_CHANNELS.lifecycle).length;
+	const queryProbe = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.probe, "replay-probe", { requestId: "replay-probe", supportedProtocols: [1] });
+	const queryProviderId = queryProbe.success ? queryProbe.data.providerInstanceId : "";
+	const replayed = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.replay, "replay-page", {
+		requestId: "replay-page", providerInstanceId: queryProviderId, protocol: 1, runId: spawned.data.runId, afterAcceptedSequence: 0, limit: 1,
+	});
+	assert.deepEqual(replayed.success && replayed.data.events.map((event: AcceptedLifecycleEvent) => [event.runId, event.acceptedSequence, event.eventId]), [
+		[spawned.data.runId, 1, h.entries.find((entry) => entry.type === LIFECYCLE_JOURNAL_ENTRY)?.data.event.eventId],
+	]);
+	assert.equal(replayed.success && replayed.data.hasMore, false);
+	assert.equal(h.events.emissions.filter((item) => item.channel === LIFECYCLE_CHANNELS.lifecycle).length, beforeReplay);
+	const empty = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.replay, "replay-empty", {
+		requestId: "replay-empty", providerInstanceId: queryProviderId, protocol: 1, runId: spawned.data.runId, afterAcceptedSequence: 1,
+	});
+	assert.deepEqual(empty.success && empty.data, { events: [], hasMore: false });
+	const missing = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.replay, "replay-missing", {
+		requestId: "replay-missing", providerInstanceId: queryProviderId, protocol: 1, runId: "run-missing", afterAcceptedSequence: 0,
+	});
+	assert.equal(missing.success ? "success" : missing.error.code, "NOT_FOUND");
+});
+
+test("live endpoint observation enriches exact matches and fails closed without durable writes", async () => {
+	const registration = {
+		type: "custom", customType: RUN_REGISTRATION_ENTRY,
+		data: { version: 1, runId: "run-observe", sessionId: "session", registeredAt: 10, assignment: { cwd: "/tmp" } },
+	};
+	const endpoint = {
+		type: "custom", customType: RUN_ENDPOINT_BINDING_ENTRY,
+		data: { version: 1, runId: "run-observe", sessionId: "session", agentName: "agent-bound", paneId: "pane-bound", observedAt: 20 },
+	};
+	const cases = [
+		{ label: "matching", live: { pane_id: "pane-bound", name: "agent-bound", agent_status: "busy" }, enriched: true },
+		{ label: "missing", live: undefined, enriched: false },
+		{ label: "renamed", live: { pane_id: "pane-bound", name: "agent-renamed", agent_status: "busy" }, enriched: false },
+		{ label: "moved", live: { pane_id: "pane-moved", name: "agent-bound", agent_status: "busy" }, enriched: false },
+		{ label: "reused", live: { pane_id: "pane-bound", name: "agent-reused", agent_status: "busy" }, enriched: false },
+	] as const;
+	for (const item of cases) {
+		const sessionEntries = [structuredClone(registration), structuredClone(endpoint)];
+		const h = await harness({
+			sessionEntries,
+			execOverride: (args) => {
+				if (args[0] !== "agent" || args[1] !== "get" || args[2] !== "agent-bound") return undefined;
+				return item.live
+					? { code: 0, stdout: JSON.stringify({ result: { agent: item.live } }), stderr: "" }
+					: { code: 1, stdout: "", stderr: "missing" };
+			},
+		});
+		await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+		const probe = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.probe, `observe-probe-${item.label}`, { requestId: `observe-probe-${item.label}`, supportedProtocols: [1] });
+		const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
+		const result = await emitRunQueryForReply<WorkerRunRecordV1>(h.events, RUN_QUERY_CHANNELS.get, `observe-get-${item.label}`, {
+			requestId: `observe-get-${item.label}`, providerInstanceId, protocol: 1, runId: "run-observe", includeEndpointObservation: true,
+		});
+		assert.equal(result.success, true, item.label);
+		if (!result.success || "legacy" in result.data) continue;
+		assert.equal(result.data.endpoint?.agentName, "agent-bound", item.label);
+		assert.equal(result.data.endpoint?.paneId, "pane-bound", item.label);
+		assert.equal(result.data.endpoint?.herdrStatus, item.enriched ? "busy" : undefined, item.label);
+		assert.equal(item.enriched ? (result.data.endpoint?.observedAt ?? 0) >= 20 : result.data.endpoint?.observedAt, item.enriched ? true : 20, item.label);
+		assert.equal(h.entries.length, 0, item.label);
+		assert.deepEqual(sessionEntries, [registration, endpoint], item.label);
+	}
 });
 
 test("RPC inspect projects worker and orchestrator facts from authorized relationships", async () => {
@@ -818,5 +893,5 @@ test("reload replaces the provider instance and stale addressed requests are no-
 	await new Promise((resolve) => setImmediate(resolve));
 	unsubscribe();
 	assert.equal(replied, false);
-	assert.equal(h.events.listenerCount(), 8);
+	assert.equal(h.events.listenerCount(), 9);
 });

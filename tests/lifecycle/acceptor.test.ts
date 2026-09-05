@@ -360,3 +360,45 @@ test("lists current records in run order as defensive clones", () => {
 	assert.equal(h.acceptor.getRun("run-1")?.eventIds.has("mutated"), false);
 	assert.equal(h.acceptor.getRun("run-1")?.sourceSequences.has("mutated"), false);
 });
+
+test("replays cloned accepted history after an exclusive cursor with exact bounds", () => {
+	const h = setup();
+	h.acceptor.bindRun(binding);
+	assert.equal(h.acceptor.accept(candidate()).accepted, true);
+	assert.equal(h.acceptor.accept(candidate({
+		eventId: "event-message", sourceInstanceId: "worker-1", sourceSequence: 1, source: "worker",
+		status: "message", evidence: { kind: "worker_message", message: "Working" },
+	})).accepted, true);
+	assert.equal(h.acceptor.accept(candidate({
+		eventId: "event-completed", sourceInstanceId: "worker-1", sourceSequence: 2, source: "worker",
+		status: "completed", evidence: { kind: "worker_completed", result: "Done" },
+	})).accepted, true);
+
+	assert.deepEqual(h.acceptor.replayRun(binding.runId, 0, 2)?.events.map((event) => event.acceptedSequence), [1, 2]);
+	assert.equal(h.acceptor.replayRun(binding.runId, 0, 2)?.hasMore, true);
+	const terminal = h.acceptor.replayRun(binding.runId, 2, 2);
+	assert.deepEqual(terminal?.events.map((event) => [event.eventId, event.sourceInstanceId, event.acceptedSequence]), [["event-completed", "worker-1", 3]]);
+	assert.equal(terminal?.hasMore, false);
+	assert.deepEqual(h.acceptor.replayRun(binding.runId, 3, 2), { events: [], hasMore: false });
+	assert.equal(h.acceptor.replayRun("missing", 0, 1), undefined);
+	terminal!.events[0].worker.name = "changed";
+	assert.equal(h.acceptor.replayRun(binding.runId, 2, 1)?.events[0].worker.name, "agent-scout");
+});
+
+test("restored replay retains only contiguous current-session history without publication", () => {
+	const first = setup();
+	first.acceptor.bindRun(binding);
+	assert.equal(first.acceptor.accept(candidate()).accepted, true);
+	const event1 = first.journal[0].event;
+	const event2 = { ...event1, eventId: "event-2", acceptedSequence: 2, sourceInstanceId: "worker-1", sourceSequence: 1,
+		source: "worker" as const, status: "message" as const, evidence: { kind: "worker_message" as const, message: "Restored" } };
+	const event4 = { ...event2, eventId: "event-4", acceptedSequence: 4, sourceSequence: 2 };
+	const restored = setup([
+		{ type: "custom", customType: LIFECYCLE_JOURNAL_ENTRY, data: { version: 1, sessionId: "session-1", event: event4 } },
+		{ type: "custom", customType: LIFECYCLE_JOURNAL_ENTRY, data: { version: 1, sessionId: "other-session", event: event2 } },
+		{ type: "custom", customType: LIFECYCLE_JOURNAL_ENTRY, data: { version: 1, sessionId: "session-1", event: event2 } },
+		{ type: "custom", customType: LIFECYCLE_JOURNAL_ENTRY, data: { version: 1, sessionId: "session-1", event: event1 } },
+	]);
+	assert.deepEqual(restored.acceptor.replayRun(binding.runId, 0, 10)?.events.map((event) => event.acceptedSequence), [1, 2]);
+	assert.equal(restored.emissions.length, 0);
+});

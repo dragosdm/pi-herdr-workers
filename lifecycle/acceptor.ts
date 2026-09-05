@@ -160,6 +160,7 @@ function safeEmit(emit: LifecycleAcceptorOptions["emit"], channel: string, event
 
 export class LifecycleAcceptor {
 	private readonly records = new Map<string, RunLifecycleRecord>();
+	private readonly acceptedEvents = new Map<string, AcceptedLifecycleEvent[]>();
 
 	constructor(private readonly options: LifecycleAcceptorOptions) {
 		this.restore();
@@ -200,6 +201,17 @@ export class LifecycleAcceptor {
 			.map(copyRecord);
 	}
 
+	replayRun(runId: string, afterAcceptedSequence: number, limit: number): { events: AcceptedLifecycleEvent[]; hasMore: boolean } | undefined {
+		if (!Number.isInteger(afterAcceptedSequence) || afterAcceptedSequence < 0) throw new RangeError("Invalid accepted sequence cursor.");
+		if (!Number.isInteger(limit) || limit < 1) throw new RangeError("Invalid replay limit.");
+		if (!this.records.has(runId)) return undefined;
+		const matching = (this.acceptedEvents.get(runId) ?? []).filter((event) => event.acceptedSequence > afterAcceptedSequence);
+		return {
+			events: matching.slice(0, limit).map((event) => structuredClone(event)),
+			hasMore: matching.length > limit,
+		};
+	}
+
 	accept(value: unknown): LifecycleAcceptanceResult {
 		if (!isLifecycleCandidate(value)) return { accepted: false, reason: "invalid_candidate" };
 		const candidate = value;
@@ -227,6 +239,7 @@ export class LifecycleAcceptor {
 			event,
 		});
 		applyAccepted(record, event);
+		this.rememberAccepted(event);
 		safeEmit(this.options.emit, LIFECYCLE_CHANNELS.lifecycle, event);
 		safeEmit(this.options.emit, lifecycleChannel(event.status), event);
 		return { accepted: true, event, record: copyRecord(record) };
@@ -242,6 +255,12 @@ export class LifecycleAcceptor {
 				candidate,
 			});
 		} catch {}
+	}
+
+	private rememberAccepted(event: AcceptedLifecycleEvent): void {
+		const events = this.acceptedEvents.get(event.runId) ?? [];
+		events.push(structuredClone(event));
+		this.acceptedEvents.set(event.runId, events);
 	}
 
 	private restore(): void {
@@ -276,6 +295,7 @@ export class LifecycleAcceptor {
 				if (event.sourceSequence !== undefined && priorSourceSequence !== undefined && event.sourceSequence <= priorSourceSequence) continue;
 				if (transitionReason(record, event)) continue;
 				applyAccepted(record, event);
+				this.rememberAccepted(event);
 			}
 		}
 	}

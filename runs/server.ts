@@ -8,12 +8,15 @@ import {
 	extractRunQueryRequestId,
 	isValidRunQueryRequest,
 	isValidRunQueryResult,
+	isValidReplayRunResult,
 	runQueryFailure,
 	runQueryReplyChannel,
 	runQuerySuccess,
 	type GetRunInput,
 	type ListRunsInput,
 	type ListRunsResult,
+	type ReplayRunInput,
+	type ReplayRunResult,
 	type RunQueryAvailabilityReason,
 	type RunQueryProbeRequest,
 	type RunQueryRequestChannel,
@@ -23,6 +26,7 @@ import {
 export interface RunQueryService {
 	get(input: GetRunInput, signal?: AbortSignal): Promise<WorkerRunRecordV1>;
 	list(input: ListRunsInput, signal?: AbortSignal): Promise<ListRunsResult>;
+	replay(input: ReplayRunInput, signal?: AbortSignal): Promise<ReplayRunResult>;
 }
 
 export interface RunQueryProviderState { available: boolean; reason?: RunQueryAvailabilityReason }
@@ -99,12 +103,24 @@ export function registerRunQueryServer(options: RunQueryServerOptions): RunQuery
 					runId: request.runId as string,
 					...(request.includeEndpointObservation === undefined ? {} : { includeEndpointObservation: request.includeEndpointObservation as boolean }),
 				})
-				: await options.service.list({
+				: channel === RUN_QUERY_CHANNELS.list
+					? await options.service.list({
 					...(request.cursor === undefined ? {} : { cursor: request.cursor as string }),
 					...(request.limit === undefined ? {} : { limit: request.limit as number }),
-				});
-			const operation = channel === RUN_QUERY_CHANNELS.get ? "get" : "list";
-			emit(channel, requestId, isValidRunQueryResult(operation, data)
+					})
+					: await options.service.replay({
+						runId: request.runId as string,
+						afterAcceptedSequence: request.afterAcceptedSequence as number,
+						...(request.limit === undefined ? {} : { limit: request.limit as number }),
+					});
+			const operation = channel === RUN_QUERY_CHANNELS.get ? "get" : channel === RUN_QUERY_CHANNELS.list ? "list" : "replay";
+			const valid = isValidRunQueryResult(operation, data)
+				&& (operation !== "replay" || isValidReplayRunResult(data, {
+					runId: request.runId as string,
+					afterAcceptedSequence: request.afterAcceptedSequence as number,
+					...(request.limit === undefined ? {} : { limit: request.limit as number }),
+				}));
+			emit(channel, requestId, valid
 				? runQuerySuccess(requestId, data)
 				: runQueryFailure(requestId, "INTERNAL_ERROR", FIXED_MESSAGES.INTERNAL_ERROR));
 		} catch (error) {
