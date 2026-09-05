@@ -3,6 +3,7 @@ import test from "node:test";
 import { LIFECYCLE_JOURNAL_ENTRY } from "../../lifecycle/acceptor.js";
 import { LIFECYCLE_CHANNELS, type AcceptedLifecycleEvent } from "../../lifecycle/protocol.js";
 import { CHANNELS, replyChannel, type DeliveryReceipt, type Inspection, type RpcReply, type WorkerReference } from "../../rpc/protocol.js";
+import { RUN_ENDPOINT_BINDING_ENTRY, RUN_REGISTRATION_ENTRY } from "../../runs/registry.js";
 import { FakeIsolatedEventBus } from "../support/fake-isolated-event-bus.js";
 
 process.env.HERDR_ENV = "1";
@@ -59,6 +60,7 @@ async function harness(options: {
 		sendUserMessage() {},
 		async exec(_command: string, args: string[]) {
 			execCalls.push(args);
+			timeline.push(`exec:${args[0]}:${args[1] ?? ""}`);
 			const overridden = await options.execOverride?.(args);
 			if (overridden !== undefined) {
 				if (args[0] === "agent" && args[1] === "start" && overridden.code === 0) startedAgents.add(args[2]);
@@ -102,6 +104,7 @@ async function harness(options: {
 		writeEnvelope: (paneId, envelope) => {
 			if (envelope.type === options.writeEnvelopeErrorForType) throw new Error("mailbox write failed");
 			writtenEnvelopes.push({ paneId, envelope });
+			timeline.push(`envelope:${envelope.type}`);
 		},
 		onInboxHandler: (handler) => { inboxHandler = handler; },
 	});
@@ -175,6 +178,15 @@ test("RPC spawn validates cwd before side effects, activates team mode, and retu
 	assert.deepEqual({ ...spawned.data, runId: "<run>" }, { runId: "<run>", name: "agent-scout", paneId: "worker-pane", cwd: "/tmp", adopted: true });
 	assert.equal(h.entries.some((entry) => entry.data.teamMode === true), true);
 	assert.equal(h.entries.some((entry) => entry.data.meta?.["agent-scout"]?.runId === spawned.data.runId), true);
+	const registration = h.entries.find((entry) => entry.type === RUN_REGISTRATION_ENTRY)?.data;
+	assert.deepEqual(registration && { ...registration, runId: "<run>", registeredAt: 0 }, {
+		version: 1,
+		runId: "<run>",
+		sessionId: "session",
+		registeredAt: 0,
+		requestId: "spawn",
+		assignment: { cwd: "/tmp", model: "test/model" },
+	});
 	assert.equal(h.activeTools().includes("CreateAgentPanel"), true);
 });
 
@@ -182,11 +194,54 @@ test("CreateAgentPanel preserves parameter mapping through the shared spawn faca
 	const h = await harness({ workerCwd: "/workspace/live" });
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
 	await h.commands.get("team").handler("list", h.ctx);
-	const result = await h.tools.get("CreateAgentPanel").execute("call", { name: "scout" }, h.ctx.signal, undefined, h.ctx);
+	const result = await h.tools.get("CreateAgentPanel").execute("call", { name: "scout", type: " Research " }, h.ctx.signal, undefined, h.ctx);
 	assert.match(result.content[0].text, /Worker agent-scout ready in pane worker-pane/);
 	assert.equal(result.details.adopted, true);
 	assert.equal(result.details.cwd, "/workspace/live");
 	assert.match(result.details.runId, /^[0-9a-f-]{36}$/);
+	const registration = h.entries.find((entry) => entry.type === RUN_REGISTRATION_ENTRY)?.data;
+	assert.deepEqual(registration && { ...registration, runId: "<run>", registeredAt: 0 }, {
+		version: 1,
+		runId: "<run>",
+		sessionId: "session",
+		registeredAt: 0,
+		assignment: { cwd: "/tmp", model: "xai/grok-4.6", role: "research" },
+	});
+});
+
+test("registration and endpoint journals fence every worker creation side effect", async () => {
+	const h = await harness({ listening: true });
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	const probe = await emitForReply<any>(h.events, CHANNELS.probe, "ordering-probe", { requestId: "ordering-probe", supportedProtocols: [1] });
+	const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
+	const spawned = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, "ordering", {
+		requestId: "ordering",
+		providerInstanceId,
+		protocol: 1,
+		name: "builder",
+		type: " Research ",
+		initialPrompt: "Map the system",
+	});
+	assert.equal(spawned.success, true);
+
+	const registration = h.timeline.indexOf(`append:${RUN_REGISTRATION_ENTRY}`);
+	const endpoint = h.timeline.indexOf(`append:${RUN_ENDPOINT_BINDING_ENTRY}`);
+	const split = h.timeline.indexOf("exec:pane:split");
+	const start = h.timeline.indexOf("exec:agent:start");
+	const lifecycle = h.timeline.indexOf(`append:${LIFECYCLE_JOURNAL_ENTRY}`);
+	const assignment = h.timeline.indexOf("envelope:message");
+	assert.ok(registration >= 0);
+	assert.ok(split > registration);
+	assert.ok(endpoint > split);
+	assert.ok(start > endpoint);
+	assert.ok(lifecycle > endpoint);
+	assert.ok(assignment > lifecycle);
+	for (const [index, item] of h.timeline.entries()) {
+		if (item === "append:herdr-worker") assert.ok(index > registration);
+	}
+	const data = h.entries.find((entry) => entry.type === RUN_REGISTRATION_ENTRY)?.data;
+	assert.deepEqual(data?.assignment, { cwd: "/tmp", model: "xai/grok-4.6", role: "research" });
+	assert.equal(data?.requestId, "ordering");
 });
 
 test("re-adoption sends the run binding before its assignment prompt", async () => {
@@ -207,6 +262,12 @@ test("re-adoption sends the run binding before its assignment prompt", async () 
 	assert.equal(h.writtenEnvelopes[bindingIndex].envelope.binding.runId, spawned.data.runId);
 	assert.equal(h.writtenEnvelopes[bindingIndex].envelope.binding.correlationId, "dispatch-1");
 	assert.equal(h.writtenEnvelopes[promptIndex].envelope.runId, spawned.data.runId);
+	const registrationIndex = h.entries.findIndex((entry) => entry.type === RUN_REGISTRATION_ENTRY);
+	const endpointIndex = h.entries.findIndex((entry) => entry.type === RUN_ENDPOINT_BINDING_ENTRY);
+	const relationshipIndex = h.entries.findIndex((entry) => entry.type === "herdr-worker" && entry.data.workers?.includes("agent-scout"));
+	assert.ok(registrationIndex >= 0);
+	assert.ok(endpointIndex > registrationIndex);
+	assert.ok(relationshipIndex > endpointIndex);
 });
 
 test("new workers bind startup flags, report readiness, and gate ReportWorkerRun", async () => {

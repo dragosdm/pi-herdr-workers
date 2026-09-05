@@ -39,6 +39,7 @@ import {
 } from "../lifecycle/protocol.js";
 import { registerWorkerRpcServer, type WorkerRpcService } from "../rpc/server.js";
 import { WorkerRpcServiceError, type InspectInput, type Inspection, type SendInput, type DeliveryReceipt, type SpawnInput, type SpawnProvenance } from "../rpc/protocol.js";
+import { createRunRegistry, type RunRegistry } from "../runs/registry.js";
 
 // ───────────────────────── herdr env ─────────────────────────
 
@@ -211,6 +212,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	const lifetime = new AbortController();
 	let createQueue = Promise.resolve();
 	let lifecycleAcceptor: LifecycleAcceptor | undefined;
+	let runRegistry: RunRegistry | undefined;
 	let providerLifecycleSequence = 0;
 	const pendingSpawnLifecycles = new Map<string, PendingSpawnLifecycle>();
 	const inFlightEnvelopes = new Set<string>();
@@ -955,9 +957,9 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	async function createAgent(opts: CreateOpts, ctx: ExtensionContext, cwd: string): Promise<CreateResult> {
 		if (!HERDR_ENV || !SELF_PANE) throw new Error("Not running inside herdr.");
 		const dir: Direction = opts.direction ?? "right";
-		const type = opts.type?.trim().toLowerCase() || undefined;
+		const type = opts.type;
 		const requested = (opts.name?.trim() || type || "").toLowerCase();
-		const model = opts.model?.trim() || (type && TYPE_MODELS[type]) || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
+		const model = opts.model;
 
 		await refreshSelf();
 		// Give ourselves an addressable name if we don't have one.
@@ -974,6 +976,14 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			const wanted = requested.startsWith(WORKER_PREFIX) ? requested : `${WORKER_PREFIX}${requested}`;
 			const existing = await agentGet(wanted);
 			if (existing && existing.paneId !== SELF_PANE && existing.tabId === SELF_TAB && !state.workers.includes(wanted)) {
+				runRegistry?.bindEndpoint({
+					version: 1,
+					runId: opts.runId,
+					sessionId: ctx.sessionManager.getSessionId(),
+					agentName: wanted,
+					paneId: existing.paneId,
+					observedAt: Date.now(),
+				});
 				await adopt(wanted);
 				const priorMeta = state.meta?.[wanted];
 				state.meta = { ...(state.meta ?? {}), [wanted]: {
@@ -1018,6 +1028,20 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			observeProviderUncertain(opts, name, undefined, "pane_creation", "Pane creation returned without a pane identity, so external effects cannot be excluded.");
 			pendingSpawnLifecycles.delete(opts.runId);
 			throw new Error(`pane split returned no pane id: ${JSON.stringify(split)}`);
+		}
+		try {
+			runRegistry?.bindEndpoint({
+				version: 1,
+				runId: opts.runId,
+				sessionId: ctx.sessionManager.getSessionId(),
+				agentName: name,
+				paneId,
+				observedAt: Date.now(),
+			});
+		} catch (error) {
+			observeProviderUncertain(opts, name, paneId, "pane_creation", "A pane was created but its endpoint binding could not be persisted.");
+			pendingSpawnLifecycles.delete(opts.runId);
+			throw error;
 		}
 		pendingSpawnLifecycles.set(opts.runId, { opts, name, paneId, scope: "agent_start" });
 		try {
@@ -1099,14 +1123,34 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	}
 
 	type SpawnOptions = SpawnInput;
+	function resolveAssignment(input: SpawnOptions, ctx: ExtensionContext, cwd: string) {
+		const role = input.type?.trim().toLowerCase() || undefined;
+		const model = input.model?.trim() || (role && TYPE_MODELS[role]) || (ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined);
+		return { cwd, model, role };
+	}
+
 	async function spawnWorker(input: SpawnOptions, signal?: AbortSignal, provenance?: SpawnProvenance): Promise<CreateResult> {
 			const ctx = ctxRef;
-			if (!ctx) throw new Error("Session is not ready.");
+			if (!ctx || !runRegistry) throw new Error("Session is not ready.");
 			const cwd = validateSpawnCwd(input.cwd ?? ctx.cwd);
 			const requested = (input.name?.trim() || input.type?.trim() || "").toLowerCase();
 			if (requested && (!NAME_RE.test(requested) || RESERVED.has(requested))) throw new Error(`Invalid worker name "${requested}" (use [a-z][a-z0-9_-]{0,31}; not ${[...RESERVED].join("/")})`);
 			signal?.throwIfAborted();
 			const runId = randomUUID();
+			const assignment = resolveAssignment(input, ctx, cwd);
+			runRegistry.register({
+				version: 1,
+				runId,
+				sessionId: ctx.sessionManager.getSessionId(),
+				registeredAt: Date.now(),
+				...(input.correlationId === undefined ? {} : { correlationId: input.correlationId }),
+				...(provenance?.requestId === undefined ? {} : { requestId: provenance.requestId }),
+				assignment: {
+					cwd: assignment.cwd,
+					...(assignment.model === undefined ? {} : { model: assignment.model }),
+					...(assignment.role === undefined ? {} : { role: assignment.role }),
+				},
+			});
 			if (!state.orchestratedBy && !state.teamMode) {
 				state.teamMode = true;
 				persist();
@@ -1114,7 +1158,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			}
 			const pending = createQueue.then(() => {
 				signal?.throwIfAborted();
-				return createAgent({ runId, correlationId: input.correlationId, provenance, name: input.name, direction: input.direction, model: input.model, type: input.type, purpose: input.purpose, thinking: input.thinking, initialPrompt: input.initialPrompt }, ctx, cwd);
+				return createAgent({ runId, correlationId: input.correlationId, provenance, name: input.name, direction: input.direction, model: assignment.model, type: assignment.role, purpose: input.purpose, thinking: input.thinking, initialPrompt: input.initialPrompt }, ctx, cwd);
 			});
 			createQueue = pending.then(() => {}, () => {});
 			const result = await pending;
@@ -1396,6 +1440,11 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	pi.on("session_start", async (event, ctx) => {
 		ctxRef = ctx;
 		restore(ctx);
+		runRegistry = createRunRegistry({
+			sessionId: ctx.sessionManager.getSessionId(),
+			getEntries: () => ctx.sessionManager.getEntries(),
+			appendEntry: (customType, data) => pi.appendEntry(customType, data),
+		});
 		lifecycleAcceptor = createLifecycleAcceptor({
 			sessionId: ctx.sessionManager.getSessionId(),
 			getEntries: () => ctx.sessionManager.getEntries(),
@@ -1486,6 +1535,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		lifetime.abort();
 		if (wasListening) stopListening();
 		if (ctxRef?.hasUI) ctxRef.ui.setStatus(STATUS_KEY, undefined);
+		runRegistry = undefined;
 		lifecycleAcceptor = undefined;
 		ctxRef = undefined;
 	});
