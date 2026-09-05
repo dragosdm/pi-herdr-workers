@@ -62,6 +62,10 @@ Extensions loaded in the same Pi process can probe `herdr-workers:rpc:probe` and
 
 The event bus is process-local, requests are not durable, and callers should use bounded waits and fall back when no provider is available. A spawn reply identifies the run and closes the request; a send receipt confirms transport acceptance; lifecycle observations record evidence; only explicit run-aware `completed` or `failed` reports state an assignment outcome. The registered stop channel is reserved: stop is not advertised and returns `UNSUPPORTED_OPERATION`; it does not release a worker, close a pane, or send Ctrl-C. See `docs/rpc-protocol.md` for the import-free JSON contract, limits, routing, errors, and raw `pi.events` usage.
 
+### Durable run discovery
+
+Each spawn is registered before Herdr side effects. A separate run-query protocol lets extensions probe `herdr-workers:runs:rpc:probe`, fetch one run with `get`, or page through current-session runs with `list`. Strict handles combine immutable assignment and original endpoint facts with lifecycle state from accepted durable evidence. Older lifecycle-only runs remain visible as explicit legacy projections without fabricated registration or assignment fields. See `docs/run-query-protocol.md` for schemas, pagination, routing, and recovery behavior.
+
 ---
 
 ## `/split-handoff` and `/split-fork`
@@ -148,6 +152,7 @@ MonitorStop monitorId="1"
 ```text
 extensions/herdr-worker.ts   /team, CreateAgentPanel, SendToAgent, ReportWorkerRun
 lifecycle/                   worker lifecycle protocol, acceptance, persistence, publication
+runs/                        durable run registry and run-query protocol
 extensions/split-handoff.ts  /split-handoff, /split-fork, /splits
 loop/                        /loop + Monitor* (Herdr-backed)
 ```

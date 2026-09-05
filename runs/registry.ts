@@ -1,6 +1,8 @@
 import { isDeepStrictEqual } from "node:util";
 import { Type, type Static } from "typebox";
 import { Check } from "typebox/value";
+import type { RunLifecycleRecord } from "../lifecycle/acceptor.js";
+import type { WorkerRunRecordV1, WorkerRunStatus } from "./protocol.js";
 
 export const RUN_REGISTRATION_ENTRY = "herdr-worker.run-registration.v1";
 export const RUN_ENDPOINT_BINDING_ENTRY = "herdr-worker.run-endpoint-bound.v1";
@@ -124,6 +126,53 @@ export class RunRegistry {
 		return [...this.registrations.values()].map(clone);
 	}
 
+	projectRun(runId: string, lifecycle?: RunLifecycleRecord): WorkerRunRecordV1 | undefined {
+		const registration = this.registrations.get(runId);
+		if (registration) {
+			const endpoint = this.endpoints.get(runId);
+			return clone({
+				protocol: 1,
+				runId: registration.runId,
+				...(registration.correlationId === undefined ? {} : { correlationId: registration.correlationId }),
+				...(registration.requestId === undefined ? {} : { requestId: registration.requestId }),
+				sessionId: registration.sessionId,
+				registeredAt: registration.registeredAt,
+				lifecycle: lifecycleView(lifecycle),
+				assignment: clone(registration.assignment),
+				...(endpoint === undefined ? {} : {
+					endpoint: {
+						agentName: endpoint.agentName,
+						paneId: endpoint.paneId,
+						observedAt: endpoint.observedAt,
+					},
+				}),
+			});
+		}
+		if (!lifecycle || lifecycle.acceptedSequence === 0) return undefined;
+		return clone({
+			protocol: 1,
+			legacy: true,
+			runId: lifecycle.runId,
+			...(lifecycle.correlationId === undefined ? {} : { correlationId: lifecycle.correlationId }),
+			sessionId: this.options.sessionId,
+			lifecycle: lifecycleView(lifecycle),
+			worker: {
+				agentName: lifecycle.worker.name,
+				...(lifecycle.worker.paneId === undefined ? {} : { paneId: lifecycle.worker.paneId }),
+			},
+		});
+	}
+
+	listRunRecords(lifecycleRecords: readonly RunLifecycleRecord[]): WorkerRunRecordV1[] {
+		const lifecycleByRun = new Map(lifecycleRecords.map((record) => [record.runId, record]));
+		const runIds = new Set(this.registrations.keys());
+		for (const record of lifecycleRecords) if (record.acceptedSequence > 0) runIds.add(record.runId);
+		return [...runIds]
+			.sort()
+			.map((runId) => this.projectRun(runId, lifecycleByRun.get(runId)))
+			.filter((record): record is WorkerRunRecordV1 => record !== undefined);
+	}
+
 	private restore(): void {
 		for (const entry of this.options.getEntries()) {
 			if (entry.type !== "custom") continue;
@@ -140,6 +189,18 @@ export class RunRegistry {
 			}
 		}
 	}
+}
+
+function lifecycleView(record?: RunLifecycleRecord): WorkerRunRecordV1["lifecycle"] {
+	let status: WorkerRunStatus = "registered";
+	if (record?.status === "started" || record?.status === "completed" || record?.status === "failed" || record?.status === "uncertain") {
+		status = record.status;
+	}
+	return {
+		status,
+		acceptedSequence: record?.acceptedSequence ?? 0,
+		...(record?.readiness === undefined ? {} : { readiness: record.readiness }),
+	};
 }
 
 export function createRunRegistry(options: RunRegistryOptions): RunRegistry {

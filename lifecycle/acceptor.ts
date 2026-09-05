@@ -194,6 +194,12 @@ export class LifecycleAcceptor {
 		return record ? copyRecord(record) : undefined;
 	}
 
+	listRuns(): RunLifecycleRecord[] {
+		return [...this.records.values()]
+			.sort((left, right) => left.runId < right.runId ? -1 : left.runId > right.runId ? 1 : 0)
+			.map(copyRecord);
+	}
+
 	accept(value: unknown): LifecycleAcceptanceResult {
 		if (!isLifecycleCandidate(value)) return { accepted: false, reason: "invalid_candidate" };
 		const candidate = value;

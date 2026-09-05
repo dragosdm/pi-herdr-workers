@@ -345,3 +345,18 @@ test("isolates subscriber failures and preserves later delivery", async () => {
 	await new Promise((resolve) => setImmediate(resolve));
 	assert.deepEqual(delivered, ["canonical", "started"]);
 });
+
+test("lists current records in run order as defensive clones", () => {
+	const h = setup();
+	h.acceptor.bindRun({ ...binding, runId: "run-z", worker: { name: "agent-z" } });
+	h.acceptor.bindRun(binding);
+	assert.equal(h.acceptor.accept(candidate()).accepted, true);
+	const listed = h.acceptor.listRuns();
+	assert.deepEqual(listed.map((record) => record.runId), ["run-1", "run-z"]);
+	listed[0].worker.name = "changed";
+	listed[0].eventIds.add("mutated");
+	listed[0].sourceSequences.set("mutated", 99);
+	assert.equal(h.acceptor.getRun("run-1")?.worker.name, "agent-scout");
+	assert.equal(h.acceptor.getRun("run-1")?.eventIds.has("mutated"), false);
+	assert.equal(h.acceptor.getRun("run-1")?.sourceSequences.has("mutated"), false);
+});

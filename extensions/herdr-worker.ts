@@ -40,6 +40,14 @@ import {
 import { registerWorkerRpcServer, type WorkerRpcService } from "../rpc/server.js";
 import { WorkerRpcServiceError, type InspectInput, type Inspection, type SendInput, type DeliveryReceipt, type SpawnInput, type SpawnProvenance } from "../rpc/protocol.js";
 import { createRunRegistry, type RunRegistry } from "../runs/registry.js";
+import {
+	RUN_QUERY_LIMITS,
+	RunQueryServiceError,
+	decodeRunQueryCursor,
+	encodeRunQueryCursor,
+	type ListRunsResult,
+} from "../runs/protocol.js";
+import { registerRunQueryServer, type RunQueryServer, type RunQueryService } from "../runs/server.js";
 
 // ───────────────────────── herdr env ─────────────────────────
 
@@ -213,6 +221,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	let createQueue = Promise.resolve();
 	let lifecycleAcceptor: LifecycleAcceptor | undefined;
 	let runRegistry: RunRegistry | undefined;
+	let runQueryServer: RunQueryServer | undefined;
 	let providerLifecycleSequence = 0;
 	const pendingSpawnLifecycles = new Map<string, PendingSpawnLifecycle>();
 	const inFlightEnvelopes = new Set<string>();
@@ -1451,6 +1460,39 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			appendEntry: (customType, data) => pi.appendEntry(customType, data),
 			emit: (channel, payload) => pi.events.emit(channel, payload),
 		});
+		const queryService: RunQueryService = {
+			async get(input) {
+				const record = runRegistry?.projectRun(input.runId, lifecycleAcceptor?.getRun(input.runId));
+				if (!record) throw new RunQueryServiceError("NOT_FOUND", "Worker run was not found.");
+				return record;
+			},
+			async list(input): Promise<ListRunsResult> {
+				const records = runRegistry?.listRunRecords(lifecycleAcceptor?.listRuns() ?? []) ?? [];
+				const afterRunId = input.cursor === undefined ? undefined : decodeRunQueryCursor(input.cursor);
+				const start = afterRunId === undefined
+					? 0
+					: records.findIndex((record) => record.runId > afterRunId);
+				const normalizedStart = start < 0 ? records.length : start;
+				const limit = input.limit ?? RUN_QUERY_LIMITS.defaultPageSize;
+				const runs = records.slice(normalizedStart, normalizedStart + limit);
+				const hasMore = normalizedStart + runs.length < records.length;
+				return {
+					runs,
+					...(hasMore && runs.length > 0 ? { nextCursor: encodeRunQueryCursor(runs[runs.length - 1].runId) } : {}),
+				};
+			},
+		};
+		runQueryServer = registerRunQueryServer({
+			events: pi.events,
+			service: queryService,
+			sessionId: ctx.sessionManager.getSessionId(),
+			getProviderState: () => ({
+				available: !stopped && runRegistry !== undefined && lifecycleAcceptor !== undefined,
+				...(!stopped && runRegistry !== undefined && lifecycleAcceptor !== undefined
+					? {}
+					: { reason: stopped ? "SHUTTING_DOWN" as const : "SESSION_NOT_READY" as const }),
+			}),
+		});
 		for (const name of state.workers) {
 			const meta = state.meta?.[name];
 			if (!meta?.runId || !meta.paneId) continue;
@@ -1531,6 +1573,8 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		}
 		pendingSpawnLifecycles.clear();
 		stopped = true;
+		runQueryServer?.dispose();
+		runQueryServer = undefined;
 		rpcServer.dispose();
 		lifetime.abort();
 		if (wasListening) stopListening();
