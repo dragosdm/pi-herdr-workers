@@ -43,6 +43,8 @@ import {
 } from "../lifecycle/protocol.js";
 import { registerWorkerRpcServer, type WorkerRpcService } from "../rpc/server.js";
 import { WorkerRpcServiceError, type InspectInput, type Inspection, type SendInput, type DeliveryReceipt, type SpawnInput, type SpawnProvenance } from "../rpc/protocol.js";
+import { ReconciliationServiceError } from "../reconciliation/protocol.js";
+import { registerReconciliationServer, type ReconciliationServer, type ReconciliationService } from "../reconciliation/server.js";
 import { createRunRegistry, type RunRegistry } from "../runs/registry.js";
 import {
 	RUN_QUERY_LIMITS,
@@ -229,6 +231,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	let lifecycleAcceptor: LifecycleAcceptor | undefined;
 	let runRegistry: RunRegistry | undefined;
 	let runQueryServer: RunQueryServer | undefined;
+	let reconciliationServer: ReconciliationServer | undefined;
 	let providerLifecycleSequence = 0;
 	const pendingSpawnLifecycles = new Map<string, PendingSpawnLifecycle>();
 	const inFlightEnvelopes = new Set<string>();
@@ -1543,6 +1546,30 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 					: { reason: stopped ? "SHUTTING_DOWN" as const : "SESSION_NOT_READY" as const }),
 			}),
 		});
+		const reconciliationService: ReconciliationService = {
+			async reconcile(input, authority) {
+				const result = lifecycleAcceptor?.reconcile(input, authority, runRegistry?.getEndpoint(input.runId));
+				if (result?.accepted) return result.event;
+				const reason = result?.reason;
+				if (reason === "unbound_run") throw new ReconciliationServiceError("NOT_FOUND", "Worker run was not found.");
+				if (reason === "not_uncertain") throw new ReconciliationServiceError("NOT_UNCERTAIN", "Worker run is not uncertain.");
+				if (reason === "stale_accepted_sequence") throw new ReconciliationServiceError("STALE_ACCEPTED_SEQUENCE", "Worker run changed after inspection.");
+				if (reason === "endpoint_mismatch") throw new ReconciliationServiceError("ENDPOINT_MISMATCH", "Observation endpoint does not match the run binding.");
+				if (reason === "unsupported_lifecycle_protocol") throw new ReconciliationServiceError("UNSUPPORTED_LIFECYCLE_PROTOCOL", "Worker run does not use lifecycle contract 2.");
+				throw new Error("Lifecycle reconciliation was rejected.");
+			},
+		};
+		reconciliationServer = registerReconciliationServer({
+			events: pi.events,
+			service: reconciliationService,
+			sessionId: ctx.sessionManager.getSessionId(),
+			getProviderState: () => ({
+				available: !stopped && runRegistry !== undefined && lifecycleAcceptor !== undefined,
+				...(!stopped && runRegistry !== undefined && lifecycleAcceptor !== undefined
+					? {}
+					: { reason: stopped ? "SHUTTING_DOWN" as const : "SESSION_NOT_READY" as const }),
+			}),
+		});
 		for (const name of state.workers) {
 			const meta = state.meta?.[name];
 			if (!meta?.runId || !meta.paneId) continue;
@@ -1626,6 +1653,8 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		}
 		pendingSpawnLifecycles.clear();
 		stopped = true;
+		reconciliationServer?.dispose();
+		reconciliationServer = undefined;
 		runQueryServer?.dispose();
 		runQueryServer = undefined;
 		rpcServer.dispose();

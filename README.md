@@ -56,6 +56,8 @@ Each worker assignment has a provider-generated `runId`, separate from an RPC `r
 
 Accepted observations are journaled in the parent session before publication on `herdr-workers:lifecycle` and the matching `herdr-workers:<status>` channel. Provider-observed start, worker readiness, explicit outcomes, and scoped uncertainty carry different evidence. Release and extension shutdown do not mean the worker stopped. See `docs/lifecycle-events.md` for the contract, durability, deduplication, and consumer boundaries.
 
+Uncertain contract 2 runs can be resolved through the separate process-local reconciliation provider. Reconciliation compares the caller's inspected accepted sequence, requires bounded evidence, verifies endpoint-bearing observations against the immutable binding, and records `started`, structured `completed`, or `failed` on the original run. It never retries or creates, sends to, stops, releases, or rebinds a worker. See `docs/reconciliation-protocol.md`.
+
 ### Inter-extension RPC
 
 Extensions loaded in the same Pi process can probe `herdr-workers:rpc:probe` and call the worker provider directly, without a model turn. Probe first, negotiate protocol 1, select one available provider instance, and use its request-specific reply channels. The fixed capabilities are `spawn`, `send`, `steer`, and team-scoped `inspect`; existing `/team`, `CreateAgentPanel`, and `SendToAgent` behavior is unchanged.
@@ -134,6 +136,7 @@ MonitorStop monitorId="1"
 - Loops and monitor handles are **operational facts**: `/tree` does not undo an external launch or resurrect a deleted controller. New session IDs do not inherit active controllers or monitor handles. In explicit shared-store mode, the shared file remains authoritative.
 - Pending loop wakes are journaled before delivery and acknowledged only after their custom message is present in SessionManager. Team messages retain their mailbox file until that same persistence boundary. `message_end` is too early: pi invokes that hook before saving the message.
 - Worker lifecycle observations are appended as `herdr-worker.lifecycle.v1` before local publication and restored from all entries in the current session. Duplicate inbox delivery and reload do not republish a new accepted observation; `/tree` does not erase operational lifecycle history.
+- An uncertain writer remains unsafe to replace automatically. The orchestration consumer owns explicit resource claims and quarantine, reconciles the same `runId`, releases the claim only under its phase policy after durable resolution, and treats retry as a separate explicit decision. The worker provider does not infer exclusivity from `cwd`.
 - Restoring state never creates panes, restarts commands, or re-sends an already recorded wake. A dynamic iteration awaiting `LoopUpdate` stays awaiting an update after reload; interrupted external work is not blindly repeated. Inspect it and provide the update, or pause/resume it explicitly from `/loop` when safe. A reached fire cap cannot be resumed; renewal requires a new authorized controller.
 - Timers, subscriptions, in-flight requests, sampled process status and UI contexts are runtime resources, not replayed state. Shutdown aborts/cleans them without killing worker or monitor panes. Headless pi instances do not claim a pane's team mailbox.
 - Status items are compact counts, next-wake/awaiting-update state and unverified/unavailable monitors. Detailed rosters remain in `/team list`, `LoopList`, and `MonitorList`.
@@ -153,6 +156,7 @@ MonitorStop monitorId="1"
 extensions/herdr-worker.ts   /team, CreateAgentPanel, SendToAgent, ReportWorkerRun
 lifecycle/                   worker lifecycle protocol, acceptance, persistence, publication
 runs/                        durable run registry and run-query protocol
+reconciliation/              guarded uncertain-run reconciliation protocol
 extensions/split-handoff.ts  /split-handoff, /split-fork, /splits
 loop/                        /loop + Monitor* (Herdr-backed)
 ```

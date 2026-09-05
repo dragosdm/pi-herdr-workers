@@ -1,4 +1,6 @@
+import { randomUUID } from "node:crypto";
 import { Check } from "typebox/value";
+import { isReconcileRunInput, type ReconcileRunInput } from "../reconciliation/protocol.js";
 import {
 	LIFECYCLE_CHANNELS,
 	LifecycleCorrelationIdSchema,
@@ -58,11 +60,26 @@ export type LifecycleRejectionReason =
 	| "invalid_transition"
 	| "terminal_duplicate"
 	| "terminal_conflict"
-	| "unsupported_stopped";
+	| "unsupported_stopped"
+	| "not_uncertain"
+	| "stale_accepted_sequence"
+	| "endpoint_mismatch"
+	| "unsupported_lifecycle_protocol";
 
 export type LifecycleAcceptanceResult =
 	| { accepted: true; event: AcceptedLifecycleEvent; record: RunLifecycleRecord }
 	| { accepted: false; reason: LifecycleRejectionReason; record?: RunLifecycleRecord };
+
+export interface ReconciliationAuthority {
+	sourceInstanceId: string;
+	eventId?: string;
+	observedAt?: number;
+}
+
+export interface ReconciliationEndpoint {
+	agentName: string;
+	paneId: string;
+}
 
 interface SessionEntry {
 	type?: unknown;
@@ -249,6 +266,58 @@ export class LifecycleAcceptor {
 		safeEmit(this.options.emit, LIFECYCLE_CHANNELS.lifecycle, event);
 		safeEmit(this.options.emit, lifecycleChannel(event.status), event);
 		return { accepted: true, event, record: copyRecord(record) };
+	}
+
+	reconcile(value: unknown, authority: ReconciliationAuthority, endpoint?: ReconciliationEndpoint): LifecycleAcceptanceResult {
+		if (!isReconcileRunInput(value) || !Check(LifecycleSourceInstanceIdSchema, authority.sourceInstanceId)) {
+			return { accepted: false, reason: "invalid_candidate" };
+		}
+		const input = value as ReconcileRunInput;
+		const record = this.records.get(input.runId);
+		if (!record) return { accepted: false, reason: "unbound_run" };
+		if (record.lifecycleProtocol !== 2) {
+			return { accepted: false, reason: "unsupported_lifecycle_protocol", record: copyRecord(record) };
+		}
+		if (record.acceptedSequence !== input.expectedAcceptedSequence) {
+			return { accepted: false, reason: "stale_accepted_sequence", record: copyRecord(record) };
+		}
+		if (record.status !== "uncertain") {
+			return { accepted: false, reason: "not_uncertain", record: copyRecord(record) };
+		}
+		for (const observation of input.resolution.observations) {
+			if (!("endpoint" in observation)) continue;
+			if (!endpoint
+				|| observation.endpoint.agentName !== endpoint.agentName
+				|| observation.endpoint.paneId !== endpoint.paneId) {
+				return { accepted: false, reason: "endpoint_mismatch", record: copyRecord(record) };
+			}
+		}
+
+		const resolution = input.resolution;
+		const evidence = resolution.status === "started"
+			? { kind: "reconciled_started_v2" as const, detail: resolution.detail, observations: resolution.observations }
+			: resolution.status === "completed"
+				? {
+					kind: "reconciled_completed_v2" as const,
+					result: resolution.result,
+					detail: resolution.detail,
+					observations: resolution.observations,
+					...(resolution.artifacts === undefined ? {} : { artifacts: resolution.artifacts }),
+					...(resolution.checks === undefined ? {} : { checks: resolution.checks }),
+				}
+				: { kind: "reconciled_failed_v2" as const, detail: resolution.detail, observations: resolution.observations };
+		return this.accept({
+			protocol: 2,
+			eventId: authority.eventId ?? randomUUID(),
+			runId: input.runId,
+			sourceInstanceId: authority.sourceInstanceId,
+			status: resolution.status,
+			worker: { ...record.worker },
+			observedAt: authority.observedAt ?? Date.now(),
+			source: "reconciler",
+			...(record.correlationId === undefined ? {} : { correlationId: record.correlationId }),
+			evidence,
+		} as LifecycleCandidate);
 	}
 
 	private recordRejection(reason: LifecycleRejectionReason, candidate: LifecycleCandidate): void {

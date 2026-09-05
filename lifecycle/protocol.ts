@@ -36,6 +36,7 @@ export const LIFECYCLE_LIMITS = {
 	checkCommand: 4_096,
 	checkOutcome: 4_096,
 	completionItems: 32,
+	reconciliationObservations: 32,
 } as const;
 
 const SafeIdSchema = Type.String({ minLength: 1, maxLength: LIFECYCLE_LIMITS.id, pattern: "^[A-Za-z0-9._-]+$" });
@@ -68,6 +69,29 @@ export const VerificationCheckSchema = Type.Object({
 export type ArtifactReference = Static<typeof ArtifactReferenceSchema>;
 export type VerificationCheck = Static<typeof VerificationCheckSchema>;
 
+export const ReconciliationObservationSchema = Type.Union([
+	Type.Object({
+		source: Type.Union([Type.Literal("journal"), Type.Literal("git"), Type.Literal("filesystem")]),
+		detail: bounded(LIFECYCLE_LIMITS.detail),
+		observedAt: Type.Integer({ minimum: 0 }),
+	}),
+	Type.Object({
+		source: Type.Union([Type.Literal("herdr"), Type.Literal("worker")]),
+		endpoint: Type.Object({
+			agentName: bounded(LIFECYCLE_LIMITS.workerName),
+			paneId: bounded(LIFECYCLE_LIMITS.paneId),
+		}),
+		detail: bounded(LIFECYCLE_LIMITS.detail),
+		observedAt: Type.Integer({ minimum: 0 }),
+	}),
+]);
+export type ReconciliationObservation = Static<typeof ReconciliationObservationSchema>;
+
+const ReconciliationObservationsSchema = Type.Array(ReconciliationObservationSchema, {
+	minItems: 1,
+	maxItems: LIFECYCLE_LIMITS.reconciliationObservations,
+});
+
 export const ProviderStartedEvidenceSchema = Type.Object({
 	kind: Type.Literal("agent_start_returned"),
 	readiness: Type.Literal("unconfirmed"),
@@ -79,6 +103,11 @@ export const WorkerReadyEvidenceSchema = Type.Object({
 export const ReconciledStartedEvidenceSchema = Type.Object({
 	kind: Type.Literal("reconciled_started"),
 	detail: bounded(LIFECYCLE_LIMITS.detail),
+});
+export const ReconciledStartedEvidenceV2Schema = Type.Object({
+	kind: Type.Literal("reconciled_started_v2"),
+	detail: bounded(LIFECYCLE_LIMITS.detail),
+	observations: ReconciliationObservationsSchema,
 });
 export const WorkerMessageEvidenceSchema = Type.Object({
 	kind: Type.Literal("worker_message"),
@@ -102,6 +131,19 @@ export const ReconciledFailureEvidenceSchema = Type.Object({
 	kind: Type.Literal("reconciled_failure"),
 	detail: bounded(LIFECYCLE_LIMITS.detail),
 });
+export const ReconciledCompletedEvidenceV2Schema = Type.Object({
+	kind: Type.Literal("reconciled_completed_v2"),
+	result: bounded(LIFECYCLE_LIMITS.result),
+	detail: bounded(LIFECYCLE_LIMITS.detail),
+	observations: ReconciliationObservationsSchema,
+	artifacts: Type.Optional(Type.Array(ArtifactReferenceSchema, { maxItems: LIFECYCLE_LIMITS.completionItems })),
+	checks: Type.Optional(Type.Array(VerificationCheckSchema, { maxItems: LIFECYCLE_LIMITS.completionItems })),
+});
+export const ReconciledFailedEvidenceV2Schema = Type.Object({
+	kind: Type.Literal("reconciled_failed_v2"),
+	detail: bounded(LIFECYCLE_LIMITS.detail),
+	observations: ReconciliationObservationsSchema,
+});
 export const StopAcknowledgedEvidenceSchema = Type.Object({
 	kind: Type.Literal("stop_acknowledged"),
 	stopRequestId: SafeIdSchema,
@@ -122,11 +164,14 @@ export const WorkerLifecycleEvidenceSchema = Type.Union([
 	ProviderStartedEvidenceSchema,
 	WorkerReadyEvidenceSchema,
 	ReconciledStartedEvidenceSchema,
+	ReconciledStartedEvidenceV2Schema,
 	WorkerMessageEvidenceSchema,
 	WorkerCompletedEvidenceSchema,
 	WorkerCompletedEvidenceV2Schema,
 	WorkerFailedEvidenceSchema,
 	ReconciledFailureEvidenceSchema,
+	ReconciledCompletedEvidenceV2Schema,
+	ReconciledFailedEvidenceV2Schema,
 	StopAcknowledgedEvidenceSchema,
 	UncertainEvidenceSchema,
 ]);
@@ -229,6 +274,9 @@ const CandidateVariants = [
 	Type.Object({ protocol: Type.Literal(LIFECYCLE_PROTOCOL_V1), ...CandidateBase, source: Type.Union([Type.Literal("worker"), Type.Literal("controller")]), status: Type.Literal("completed"), evidence: WorkerCompletedEvidenceSchema }),
 	...commonCandidateVariants(LIFECYCLE_PROTOCOL_V2),
 	Type.Object({ protocol: Type.Literal(LIFECYCLE_PROTOCOL_V2), ...CandidateBase, source: Type.Literal("worker"), status: Type.Literal("completed"), evidence: WorkerCompletedEvidenceV2Schema }),
+	Type.Object({ protocol: Type.Literal(LIFECYCLE_PROTOCOL_V2), ...CandidateBase, source: Type.Literal("reconciler"), status: Type.Literal("started"), evidence: ReconciledStartedEvidenceV2Schema }),
+	Type.Object({ protocol: Type.Literal(LIFECYCLE_PROTOCOL_V2), ...CandidateBase, source: Type.Literal("reconciler"), status: Type.Literal("completed"), evidence: ReconciledCompletedEvidenceV2Schema }),
+	Type.Object({ protocol: Type.Literal(LIFECYCLE_PROTOCOL_V2), ...CandidateBase, source: Type.Literal("reconciler"), status: Type.Literal("failed"), evidence: ReconciledFailedEvidenceV2Schema }),
 ] as const;
 
 export const LifecycleCandidateSchema = Type.Union([...CandidateVariants]);
@@ -249,7 +297,11 @@ function evidenceWithinUtf8Limits(evidence: WorkerLifecycleEvidence): boolean {
 		case "worker_message": return withinUtf8Limit(evidence.message, LIFECYCLE_LIMITS.message);
 		case "worker_completed": return evidence.result === undefined || withinUtf8Limit(evidence.result, LIFECYCLE_LIMITS.result);
 		case "worker_completed_v2": return completionEvidenceWithinUtf8Limits(evidence);
+		case "reconciled_completed_v2": return completionEvidenceWithinUtf8Limits(evidence)
+			&& reconciliationEvidenceWithinUtf8Limits(evidence);
 		case "worker_failed": return withinUtf8Limit(evidence.error, LIFECYCLE_LIMITS.error);
+		case "reconciled_started_v2":
+		case "reconciled_failed_v2": return reconciliationEvidenceWithinUtf8Limits(evidence);
 		case "reconciled_failure":
 		case "reconciled_started":
 		case "uncertain": return withinUtf8Limit(evidence.detail, LIFECYCLE_LIMITS.detail);
@@ -257,12 +309,23 @@ function evidenceWithinUtf8Limits(evidence: WorkerLifecycleEvidence): boolean {
 	}
 }
 
-function completionEvidenceWithinUtf8Limits(evidence: Static<typeof WorkerCompletedEvidenceV2Schema>): boolean {
+function completionEvidenceWithinUtf8Limits(evidence: Static<typeof WorkerCompletedEvidenceV2Schema> | Static<typeof ReconciledCompletedEvidenceV2Schema>): boolean {
 	return withinUtf8Limit(evidence.result, LIFECYCLE_LIMITS.result)
 		&& (evidence.artifacts ?? []).every((artifact) => withinUtf8Limit(artifact.path, LIFECYCLE_LIMITS.artifactPath)
 			&& (artifact.description === undefined || withinUtf8Limit(artifact.description, LIFECYCLE_LIMITS.artifactDescription)))
 		&& (evidence.checks ?? []).every((check) => withinUtf8Limit(check.command, LIFECYCLE_LIMITS.checkCommand)
 			&& withinUtf8Limit(check.outcome, LIFECYCLE_LIMITS.checkOutcome));
+}
+
+function reconciliationEvidenceWithinUtf8Limits(evidence: {
+	detail: string;
+	observations: ReconciliationObservation[];
+}): boolean {
+	return withinUtf8Limit(evidence.detail, LIFECYCLE_LIMITS.detail)
+		&& evidence.observations.every((observation) => withinUtf8Limit(observation.detail, LIFECYCLE_LIMITS.detail)
+			&& (!("endpoint" in observation)
+				|| (withinUtf8Limit(observation.endpoint.agentName, LIFECYCLE_LIMITS.workerName)
+					&& withinUtf8Limit(observation.endpoint.paneId, LIFECYCLE_LIMITS.paneId))));
 }
 
 function checkLifecycle<T>(schema: TSchema, value: unknown): value is T {

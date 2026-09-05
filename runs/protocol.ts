@@ -407,7 +407,7 @@ export function projectRunQueryRecord(record: WorkerRunRecord, protocol: RunQuer
 
 export function projectAcceptedLifecycleEvent(event: AcceptedLifecycleEvent, protocol: RunQueryProtocol): AcceptedLifecycleEvent {
 	if (protocol === RUN_QUERY_PROTOCOL_V2 || event.protocol === LIFECYCLE_PROTOCOL_V1) return structuredClone(event);
-	if (event.status === "completed" && event.evidence.kind === "worker_completed_v2") {
+	if (event.status === "completed" && (event.evidence.kind === "worker_completed_v2" || event.evidence.kind === "reconciled_completed_v2")) {
 		return {
 			...structuredClone(event),
 			protocol: LIFECYCLE_PROTOCOL_V1,

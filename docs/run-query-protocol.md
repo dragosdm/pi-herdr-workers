@@ -169,7 +169,9 @@ The default limit is 50 and the maximum is 100. `nextCursor` is an opaque encodi
 
 The default replay limit is 50 and the maximum is 100. `hasMore` means another request with the last returned `acceptedSequence` can continue the same run. Registered runs with no accepted evidence return an empty page; a run absent from both registration and lifecycle authority returns `NOT_FOUND`.
 
-Protocol 2 returns native contract 1 or contract 2 accepted events and preserves structured completion evidence. Protocol 1 is an explicit compatibility projection: it omits lifecycle-contract and orchestration-grade fields, and projects a contract 2 completion to readable `worker_completed` evidence containing its result. Artifact and check fields are intentionally absent from that projection, so a protocol 1 response can never acquire an orchestration-grade marker.
+Protocol 2 returns native contract 1 or contract 2 accepted events and preserves structured worker or reconciliation completion evidence. Protocol 1 is an explicit compatibility projection: it omits lifecycle-contract and orchestration-grade fields, and projects `worker_completed_v2` or `reconciled_completed_v2` to readable `worker_completed` evidence containing its result. Artifact, check, reconciliation-detail, and observation fields are intentionally absent from that projection, so a protocol 1 response can never acquire an orchestration-grade marker.
+
+An accepted reconciliation appears in `get`, `list`, and `replay` like every other canonical lifecycle event. It advances `acceptedSequence` on the same run and remains available after provider reload without being republished. Endpoint sampling remains response-only and cannot create or alter a reconciliation result.
 
 ## Restart recovery
 

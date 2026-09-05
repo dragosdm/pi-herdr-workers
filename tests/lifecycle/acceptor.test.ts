@@ -436,3 +436,94 @@ test("binds lifecycle versions and restores contract 2 completion evidence exact
 	assert.equal(restored.acceptor.bindRun(v2Binding), true);
 	assert.equal(restored.acceptor.bindRun({ ...v2Binding, lifecycleProtocol: 1 }), false);
 });
+
+test("reconciles only an unchanged uncertain contract 2 run with exact endpoint evidence", () => {
+	const h = setup();
+	const v2Binding = { ...binding, runId: "run-reconcile", lifecycleProtocol: 2 as const };
+	h.acceptor.bindRun(v2Binding);
+	assert.equal(h.acceptor.accept({
+		...candidate({ runId: v2Binding.runId, worker: v2Binding.worker }),
+		protocol: 2,
+		eventId: "event-uncertain-v2",
+		status: "uncertain",
+		evidence: { kind: "uncertain", scope: "assignment_delivery", detail: "Delivery acknowledgement was interrupted" },
+	}).accepted, true);
+
+	const input = {
+		runId: v2Binding.runId,
+		expectedAcceptedSequence: 1,
+		resolution: {
+			status: "started" as const,
+			detail: "The bound worker is still active.",
+			observations: [{
+				source: "herdr" as const,
+				endpoint: { agentName: v2Binding.worker.name, paneId: v2Binding.worker.paneId },
+				detail: "Herdr reports the original pane is active.",
+				observedAt: 1_786_000_000_100,
+			}],
+		},
+	};
+	const mismatch = h.acceptor.reconcile(input, { sourceInstanceId: "reconciler-1" }, { agentName: v2Binding.worker.name, paneId: "pane-other" });
+	assert.deepEqual(mismatch.accepted ? undefined : mismatch.reason, "endpoint_mismatch");
+	assert.equal(h.acceptor.getRun(v2Binding.runId)?.status, "uncertain");
+	assert.equal(h.journal.length, 1);
+
+	const stale = h.acceptor.reconcile({ ...input, expectedAcceptedSequence: 2 }, { sourceInstanceId: "reconciler-1" }, {
+		agentName: v2Binding.worker.name,
+		paneId: v2Binding.worker.paneId,
+	});
+	assert.deepEqual(stale.accepted ? undefined : stale.reason, "stale_accepted_sequence");
+
+	const reconciled = h.acceptor.reconcile(input, {
+		sourceInstanceId: "reconciler-1",
+		eventId: "event-reconciled-v2",
+		observedAt: 1_786_000_000_200,
+	}, { agentName: v2Binding.worker.name, paneId: v2Binding.worker.paneId });
+	assert.equal(reconciled.accepted, true);
+	if (!reconciled.accepted) return;
+	assert.equal(reconciled.event.acceptedSequence, 2);
+	assert.equal(reconciled.event.source, "reconciler");
+	assert.equal(reconciled.event.evidence.kind, "reconciled_started_v2");
+	assert.deepEqual(h.timeline.slice(-3), [
+		`append:${LIFECYCLE_JOURNAL_ENTRY}`,
+		`emit:${LIFECYCLE_CHANNELS.lifecycle}`,
+		`emit:${LIFECYCLE_CHANNELS.started}`,
+	]);
+	assert.equal(h.acceptor.getRun(v2Binding.runId)?.status, "started");
+	const repeated = h.acceptor.reconcile({ ...input, expectedAcceptedSequence: 2 }, { sourceInstanceId: "reconciler-1" }, {
+		agentName: v2Binding.worker.name,
+		paneId: v2Binding.worker.paneId,
+	});
+	assert.deepEqual(repeated.accepted ? undefined : repeated.reason, "not_uncertain");
+});
+
+test("reconciled completion is durable structured terminal evidence", () => {
+	const h = setup();
+	const v2Binding = { ...binding, runId: "run-reconciled-completion", lifecycleProtocol: 2 as const };
+	h.acceptor.bindRun(v2Binding);
+	h.acceptor.accept({
+		...candidate({ runId: v2Binding.runId, worker: v2Binding.worker }),
+		protocol: 2,
+		eventId: "event-uncertain-completion",
+		status: "uncertain",
+		evidence: { kind: "uncertain", scope: "agent_start", detail: "Start result was ambiguous" },
+	});
+	const completed = h.acceptor.reconcile({
+		runId: v2Binding.runId,
+		expectedAcceptedSequence: 1,
+		resolution: {
+			status: "completed",
+			result: "The requested implementation is complete.",
+			detail: "Git and test evidence establish the result.",
+			observations: [{ source: "git", detail: "Expected commit and clean worktree are present.", observedAt: 10 }],
+			artifacts: [{ path: "reports/result.md" }],
+			checks: [{ kind: "test", command: "npm test", outcome: "passed" }],
+		},
+	}, { sourceInstanceId: "reconciler-completion", eventId: "event-reconciled-completion", observedAt: 11 });
+	assert.equal(completed.accepted, true);
+	assert.equal(h.acceptor.getRun(v2Binding.runId)?.terminalEvidence?.kind, "reconciled_completed_v2");
+
+	const restored = setup(h.journal.map((data) => ({ type: "custom", customType: LIFECYCLE_JOURNAL_ENTRY, data })));
+	assert.deepEqual(restored.acceptor.replayRun(v2Binding.runId, 1, 10)?.events, [h.journal[1].event]);
+	assert.deepEqual(restored.acceptor.getRun(v2Binding.runId)?.terminalEvidence, h.journal[1].event.evidence);
+});

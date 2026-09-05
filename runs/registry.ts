@@ -219,7 +219,8 @@ function lifecycleView(record: RunLifecycleRecord | undefined, lifecycleProtocol
 		acceptedSequence: record?.acceptedSequence ?? 0,
 		orchestrationGradeCompletion: status === "completed"
 			&& lifecycleProtocol === LIFECYCLE_PROTOCOL_V2
-			&& record?.terminalEvidence?.kind === "worker_completed_v2",
+			&& (record?.terminalEvidence?.kind === "worker_completed_v2"
+				|| record?.terminalEvidence?.kind === "reconciled_completed_v2"),
 		...(record?.readiness === undefined ? {} : { readiness: record.readiness }),
 	};
 }

@@ -3,6 +3,7 @@ import test from "node:test";
 import { LIFECYCLE_JOURNAL_ENTRY } from "../../lifecycle/acceptor.js";
 import { LIFECYCLE_CHANNELS, type AcceptedLifecycleEvent } from "../../lifecycle/protocol.js";
 import { CHANNELS, replyChannel, type DeliveryReceipt, type Inspection, type RpcReply, type WorkerReference } from "../../rpc/protocol.js";
+import { RECONCILIATION_CHANNELS, reconciliationReplyChannel, type ReconciliationReply } from "../../reconciliation/protocol.js";
 import { RUN_QUERY_CHANNELS, runQueryReplyChannel, type RunQueryReply, type WorkerRunRecordV1 } from "../../runs/protocol.js";
 import { RUN_ENDPOINT_BINDING_ENTRY, RUN_REGISTRATION_ENTRY } from "../../runs/registry.js";
 import { FakeIsolatedEventBus } from "../support/fake-isolated-event-bus.js";
@@ -136,6 +137,16 @@ async function emitRunQueryForReply<T>(events: FakeIsolatedEventBus, channel: (t
 	});
 }
 
+async function emitReconciliationForReply<T>(events: FakeIsolatedEventBus, channel: (typeof RECONCILIATION_CHANNELS)[keyof typeof RECONCILIATION_CHANNELS], requestId: string, payload: unknown): Promise<ReconciliationReply<T>> {
+	return await new Promise((resolve) => {
+		const unsubscribe = events.on(reconciliationReplyChannel(channel, requestId), (reply) => {
+			unsubscribe();
+			resolve(reply as ReconciliationReply<T>);
+		});
+		events.emit(channel, payload);
+	});
+}
+
 function teamBranch(data: any): any[] {
 	return [{ type: "custom", customType: "herdr-worker", data: { version: 1, sessionId: "session", workers: [], ...data } }];
 }
@@ -162,11 +173,11 @@ test("registers once, exposes live availability, and disposes on shutdown", asyn
 	let probe = await emitForReply<any>(h.events, CHANNELS.probe, "before", { requestId: "before", supportedProtocols: [1] });
 	assert.equal(probe.success && probe.data.reason, "SESSION_NOT_READY");
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
-	assert.equal(h.events.listenerCount(), 9);
+	assert.equal(h.events.listenerCount(), 11);
 	probe = await emitForReply<any>(h.events, CHANNELS.probe, "after", { requestId: "after", supportedProtocols: [1] });
 	assert.equal(probe.success && probe.data.available, true);
 	await h.handlers.get("session_tree")![0]({}, h.ctx);
-	assert.equal(h.events.listenerCount(), 9);
+	assert.equal(h.events.listenerCount(), 11);
 	await h.handlers.get("session_shutdown")![0]();
 	assert.equal(h.events.listenerCount(), 0);
 });
@@ -635,6 +646,76 @@ test("post-start assignment failure retains started evidence and records uncerta
 	assert.deepEqual(lifecycle.map((event) => event.acceptedSequence), [1, 2]);
 });
 
+test("reconciliation resolves the original uncertain run without worker side effects and survives reload", async () => {
+	const h = await harness({ listening: true, writeEnvelopeErrorForType: "message" });
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	const workerProbe = await emitForReply<any>(h.events, CHANNELS.probe, "reconcile-worker-probe", { requestId: "reconcile-worker-probe", supportedProtocols: [1] });
+	const workerProviderId = workerProbe.success ? workerProbe.data.providerInstanceId : "";
+	const spawned = await emitForReply<WorkerReference>(h.events, CHANNELS.spawn, "reconcile-spawn", {
+		requestId: "reconcile-spawn", providerInstanceId: workerProviderId, protocol: 1, name: "builder", initialPrompt: "Do the work",
+	});
+	assert.equal(spawned.success, false);
+	const registration = h.entries.find((entry) => entry.type === RUN_REGISTRATION_ENTRY)?.data;
+	const runId = registration.runId as string;
+	const endpointEntriesBefore = h.entries.filter((entry) => entry.type === RUN_ENDPOINT_BINDING_ENTRY).length;
+	const execCallsBefore = h.execCalls.length;
+
+	const probe = await emitReconciliationForReply<any>(h.events, RECONCILIATION_CHANNELS.probe, "reconciliation-probe", {
+		requestId: "reconciliation-probe", supportedProtocols: [1],
+	});
+	assert.equal(probe.success && probe.data.available, true);
+	const providerInstanceId = probe.success ? probe.data.providerInstanceId : "";
+	const completed = await emitReconciliationForReply<AcceptedLifecycleEvent>(h.events, RECONCILIATION_CHANNELS.reconcile, "reconciliation-complete", {
+		requestId: "reconciliation-complete",
+		providerInstanceId,
+		protocol: 1,
+		runId,
+		expectedAcceptedSequence: 2,
+		resolution: {
+			status: "completed",
+			result: "Recovered the completed implementation.",
+			detail: "Git and tests establish completion on the original run.",
+			observations: [{ source: "git", detail: "Expected changes are present in the worktree.", observedAt: 1_786_000_000_100 }],
+			artifacts: [{ path: "reports/result.md" }],
+			checks: [{ kind: "test", command: "npm test", outcome: "passed" }],
+		},
+	});
+	assert.equal(completed.success, true);
+	if (!completed.success) return;
+	assert.equal(completed.data.runId, runId);
+	assert.equal(completed.data.acceptedSequence, 3);
+	assert.equal(completed.data.evidence.kind, "reconciled_completed_v2");
+	assert.equal(h.execCalls.length, execCallsBefore);
+	assert.equal(h.entries.filter((entry) => entry.type === RUN_ENDPOINT_BINDING_ENTRY).length, endpointEntriesBefore);
+	assert.equal(h.entries.filter((entry) => entry.type === RUN_REGISTRATION_ENTRY).length, 1);
+
+	const stale = await emitReconciliationForReply(h.events, RECONCILIATION_CHANNELS.reconcile, "reconciliation-stale", {
+		requestId: "reconciliation-stale",
+		providerInstanceId,
+		protocol: 1,
+		runId,
+		expectedAcceptedSequence: 2,
+		resolution: { status: "started", detail: "Still active", observations: [{ source: "journal", detail: "Old snapshot", observedAt: 1 }] },
+	});
+	assert.equal(stale.success ? "success" : stale.error.code, "STALE_ACCEPTED_SEQUENCE");
+
+	await h.handlers.get("session_shutdown")![0]();
+	h.herdrWorker(h.pi, { disableInbox: true });
+	await h.handlers.get("session_start")![1]({ reason: "startup" }, h.ctx);
+	const queryProbe = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.probe, "reconciled-query-probe", { requestId: "reconciled-query-probe", supportedProtocols: [2, 1] });
+	const queryProviderId = queryProbe.success ? queryProbe.data.providerInstanceId : "";
+	const record = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.get, "reconciled-query-get", {
+		requestId: "reconciled-query-get", providerInstanceId: queryProviderId, protocol: 2, runId,
+	});
+	assert.equal(record.success && record.data.lifecycle.status, "completed");
+	assert.equal(record.success && record.data.lifecycle.acceptedSequence, 3);
+	assert.equal(record.success && record.data.lifecycle.orchestrationGradeCompletion, true);
+	const replay = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.replay, "reconciled-query-replay", {
+		requestId: "reconciled-query-replay", providerInstanceId: queryProviderId, protocol: 2, runId, afterAcceptedSequence: 2,
+	});
+	assert.deepEqual(replay.success && replay.data.events, [completed.data]);
+});
+
 test("shutdown during creation records uncertainty without claiming a stop", async () => {
 	let releaseStart!: () => void;
 	let markStartEntered!: () => void;
@@ -737,7 +818,7 @@ test("run query returns durable strict handles across provider reloads", async (
 		requestId: "query-get-2", providerInstanceId: secondProbe.data.providerInstanceId, protocol: 1, runId: spawned.data.runId,
 	});
 	assert.deepEqual(secondGet.success && secondGet.data, firstGet.success && firstGet.data);
-	assert.equal(h.events.listenerCount(), 9);
+	assert.equal(h.events.listenerCount(), 11);
 });
 
 test("run query lists lifecycle-only history without fabricating strict facts", async () => {
@@ -925,5 +1006,5 @@ test("reload replaces the provider instance and stale addressed requests are no-
 	await new Promise((resolve) => setImmediate(resolve));
 	unsubscribe();
 	assert.equal(replied, false);
-	assert.equal(h.events.listenerCount(), 9);
+	assert.equal(h.events.listenerCount(), 11);
 });

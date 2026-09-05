@@ -77,6 +77,16 @@ The provider classifies ambiguous pane split, agent start, assignment delivery, 
 
 Pure validation failures occur before worker side effects and remain RPC or tool failures; they do not invent a worker terminal event. One missing inspection result also does not create a lifecycle outcome.
 
+## Reconciliation evidence
+
+Reconciliation is a separate trusted provider operation for contract 2 runs. It can resolve only a currently `uncertain` run and requires the caller's inspected `expectedAcceptedSequence` to still equal the canonical sequence. A race returns `STALE_ACCEPTED_SEQUENCE`; the caller must refresh durable state and inspect again instead of overwriting newer worker evidence.
+
+Every resolution carries a non-empty bounded observation list. Journal, Git, and filesystem observations are durable-state claims. Herdr and worker observations additionally carry `{ agentName, paneId }`, which must exactly equal the immutable endpoint binding. A missing endpoint is allowed for non-endpoint evidence and rejected for endpoint-bearing claims.
+
+Accepted reconciliation evidence is discriminated as `reconciled_started_v2`, `reconciled_completed_v2`, or `reconciled_failed_v2`. Completion includes a required result and may include the same artifact and verification shapes as worker completion. The acceptor appends, folds, remembers, and publishes reconciliation through the ordinary canonical path, preserving the original `runId`, registration, endpoint, and accepted ordering. Reconciliation does not spawn, retry, send, stop, release, or rebind a worker.
+
+The generic provider does not infer exclusive resources from `cwd`. An orchestration consumer owns explicit resource claims and quarantine policy. It must retain an uncertain writer's claim, reconcile the same run, durably consume and approve the result before release, and make retry a separate explicit decision. See `docs/reconciliation-protocol.md`.
+
 ## Durability and ordering
 
 The parent acceptor performs this sequence:
@@ -122,7 +132,7 @@ Durability follows Pi's session storage contract. `--no-session` is ephemeral, a
 
 For contract 2, `result` is required and non-empty. `artifacts` and `checks` are optional and each is limited to 32 entries. Artifact paths are retained exactly as authored, must be non-empty, contain no control characters, and fit within 4,096 UTF-8 bytes. Descriptions fit within 1,024 bytes. Check commands and outcomes are non-empty and fit within 4,096 bytes. Lifecycle acceptance does not resolve paths or inspect, copy, hash, upload, or promise the continued existence of referenced files.
 
-Contract 2 completion evidence uses `kind: "worker_completed_v2"`. Contract 1 `kind: "worker_completed"` history, including old evidence without a result, remains restorable and replayable but is not orchestration-grade completion. Ordinary `SendToAgent` messages remain general communication and never become terminal lifecycle reports. Bound-worker guidance reserves `ReportWorkerRun` as the only terminal completion or failure path.
+Contract 2 worker completion evidence uses `kind: "worker_completed_v2"`; trusted recovered completion uses `kind: "reconciled_completed_v2"`. Contract 1 `kind: "worker_completed"` history, including old evidence without a result, remains restorable and replayable but is not orchestration-grade completion. Ordinary `SendToAgent` messages remain general communication and never become terminal lifecycle reports. Bound-worker guidance reserves `ReportWorkerRun` as the only worker-authored terminal completion or failure path.
 
 ## Consumer boundary
 
