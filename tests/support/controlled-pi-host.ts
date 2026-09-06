@@ -43,6 +43,8 @@ export async function createControlledPiHost(options: ControlledPiHostOptions) {
 	const warnings: string[] = [];
 	let activeTools: string[] = [];
 	let shutdown = false;
+	let sendError: Error | undefined;
+	let onSend: ((delivery: QueuedMessage) => void) | undefined;
 	let persistenceMode = options.persistenceMode ?? "explicit";
 	const agents = [
 		{ pane_id: "self-pane", tab_id: "tab-1", name: "orchestrator", agent: "pi", cwd: options.cwd },
@@ -99,8 +101,14 @@ export async function createControlledPiHost(options: ControlledPiHostOptions) {
 		sendMessage(message: ControlledMessage, messageOptions: QueuedMessage["options"]) {
 			const delivery = structuredClone({ message, options: messageOptions });
 			sentMessages.push(delivery);
-			queued.push(delivery);
 			timeline.push(`send:${message.customType}`);
+			onSend?.(delivery);
+			if (sendError) {
+				const error = sendError;
+				sendError = undefined;
+				throw error;
+			}
+			queued.push(delivery);
 		},
 		sendUserMessage() { throw new Error("Unexpected user message in controlled host"); },
 		async exec(command: string, args: string[]) {
@@ -112,6 +120,11 @@ export async function createControlledPiHost(options: ControlledPiHostOptions) {
 			}
 			if (args[0] === "agent" && args[1] === "list") {
 				return { code: 0, stdout: JSON.stringify({ result: { agents } }), stderr: "" };
+			}
+			if (args[0] === "agent" && args[1] === "prompt") {
+				assert.ok(agents.some((agent) => agent.pane_id === args[2]));
+				assert.equal(args.length, 4);
+				return { code: 0, stdout: "{}", stderr: "" };
 			}
 			throw new Error(`Unexpected Herdr call: ${args.join(" ")}`);
 		},
@@ -132,7 +145,10 @@ export async function createControlledPiHost(options: ControlledPiHostOptions) {
 	workerExtension(pi, { createMailbox: options.createMailbox });
 	return {
 		events, entries, queued, sentMessages, execCalls, warnings, timeline, ctx, tools,
-		 hook, append, write, reopen,
+		hook, append, write, reopen,
+		setPeerPane(paneId: string) { agents[1].pane_id = paneId; },
+		failNextSend(error: Error) { sendError = error; },
+		observeSend(callback: (delivery: QueuedMessage) => void) { onSend = callback; },
 		consume(): QueuedMessage {
 			const delivery = queued.shift();
 			assert.ok(delivery, "expected a queued custom message");

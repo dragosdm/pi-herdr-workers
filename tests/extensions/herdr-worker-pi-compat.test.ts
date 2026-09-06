@@ -175,6 +175,84 @@ const bodies: Record<PiMailboxCaseId, (t: TestContext) => Promise<void>> = {
 		assert.equal(fs.readFileSync(file, "utf8"), bytes, f.diagnostic);
 		assert.deepEqual(f.reopen(), [], `${f.diagnostic}: no mailbox copy and no recovered custom entry`);
 	},
+	async "pi-send-rejection-in-flight"(t) {
+		const f = await piCompatFixture(t);
+		const original = f.session.sendCustomMessage;
+		const fault = f.injectSendRejection(new Error("Targeted sendCustomMessage rejection"));
+		const { envelopeId, envelope } = await f.publish();
+		await f.waitFor(() => f.errors.length === 1, "void bridge extension error callback");
+		assert.equal(f.errors[0].event, "send_message", f.diagnostic);
+		assert.equal(f.errors[0].error, "Targeted sendCustomMessage rejection", f.diagnostic);
+		assert.equal(fault.calls.length, 1, f.diagnostic);
+		assert.deepEqual(fault.calls[0][0].details, { envelopeId, from: envelope.from }, f.diagnostic);
+		assert.deepEqual(fault.calls[0][1], { triggerTurn: true, deliverAs: "followUp" }, f.diagnostic);
+		fault.restore();
+		assert.equal(f.session.sendCustomMessage, original, f.diagnostic);
+		for (let i = 0; i < 3; i++) {
+			await f.session.extensionRunner.emit({ type: "agent_settled" });
+			await f.transport.drainInbox();
+		}
+		assert.deepEqual(f.deliveries, [envelopeId], `${f.diagnostic}: retained in-flight state blocks retries after method restoration`);
+		assert.deepEqual(customEntries(f.manager), [], f.diagnostic);
+		assert.deepEqual(f.reopen(), [], f.diagnostic);
+		assert.equal(f.streams.length, 0, f.diagnostic);
+		assert.equal(f.observations.some((event) => event.name === "message_end"), false, f.diagnostic);
+		assert.deepEqual(fs.readdirSync(f.inbox), [envelopeId], f.diagnostic);
+		assert.deepEqual(JSON.parse(fs.readFileSync(`${f.inbox}/${envelopeId}`, "utf8")), envelope, f.diagnostic);
+	},
+	async "pi-provider-failure-queued"(t) {
+		const f = await piCompatFixture(t);
+		assert.equal(f.manager.isPersisted(), true, f.diagnostic);
+		assert.ok(f.manager.getSessionFile(), f.diagnostic);
+		f.startPrompt();
+		await held(f, 1);
+		const { envelopeId, envelope } = await f.publish();
+		assert.deepEqual(customEntries(f.manager), [], f.diagnostic);
+		assert.deepEqual(f.reopen(), [], f.diagnostic);
+		assert.deepEqual(fs.readdirSync(f.inbox), [envelopeId], f.diagnostic);
+		f.streams[0].fail();
+		await held(f, 2);
+		assert.equal(f.observations.filter((event) => event.name === "agent_settled:after").length, 0,
+			`${f.diagnostic}: continuation starts automatically before settlement, without another prompt`);
+		assert.ok(f.manager.getEntries().some((entry) => entry.type === "message" && entry.message.role === "assistant"
+			&& entry.message.stopReason === "error" && entry.message.errorMessage === "Injected synthetic provider failure"), f.diagnostic);
+		assert.deepEqual(f.errors, [], `${f.diagnostic}: provider failure is not a rejected send`);
+		assert.deepEqual(f.deliveries, [envelopeId], f.diagnostic);
+		assertMessageEndBeforeAppend(f, envelopeId);
+		const expected = structuredClone(customEntries(f.manager));
+		assert.equal(expected.length, 1, f.diagnostic);
+		assert.equal(expected[0].customType, "herdr-worker.message", f.diagnostic);
+		assert.equal(expected[0].display, true, f.diagnostic);
+		assert.ok(String(expected[0].content).includes(envelope.message), f.diagnostic);
+		assert.deepEqual(expected[0].details, { envelopeId, from: envelope.from }, f.diagnostic);
+		assert.ok(fs.existsSync(f.manager.getSessionFile()!), f.diagnostic);
+		assert.deepEqual(f.reopen(), expected, `${f.diagnostic}: exact custom entry recovered by opening actual session JSONL`);
+		assert.deepEqual(fs.readdirSync(f.inbox), [], f.diagnostic);
+		const names = f.observations.map((event) => event.name);
+		assert.equal(names.filter((name) => name === "stream:error").length, 1, f.diagnostic);
+		assert.equal(names.filter((name) => name === "mailbox:after-delete").length, 1, f.diagnostic);
+		assert.ok(names.indexOf("stream:error") < names.indexOf("message_end"), f.diagnostic);
+		assert.ok(names.indexOf("mailbox:after-delete") < names.lastIndexOf("stream:held"), f.diagnostic);
+		const before = f.observations.find((event) => event.name === "context:before" && event.entries.length === 1)!;
+		const after = f.observations.find((event) => event.name === "context:after" && event.entries.length === 1)!;
+		assert.deepEqual(before.entries, expected, f.diagnostic);
+		assert.deepEqual(before.files, [envelopeId], f.diagnostic);
+		assert.equal(before.sessionFileExists, true, f.diagnostic);
+		assert.deepEqual(after.entries, expected, f.diagnostic);
+		assert.deepEqual(after.files, [], f.diagnostic);
+		for (let i = 0; i < 3; i++) await f.transport.drainInbox();
+		f.streams[1].release();
+		await f.bounded(f.session.waitForIdle(), "automatic continuation settlement");
+		for (let i = 0; i < 3; i++) await f.transport.drainInbox();
+		const settled = f.observations.filter((event) => event.name === "agent_settled:after");
+		assert.equal(settled.length, 1, f.diagnostic);
+		assert.deepEqual(settled[0].entries, expected, f.diagnostic);
+		assert.deepEqual(settled[0].files, [], f.diagnostic);
+		assert.deepEqual(f.deliveries, [envelopeId], f.diagnostic);
+		assertMessageEndBeforeAppend(f, envelopeId);
+		assert.deepEqual(f.reopen(), expected, `${f.diagnostic}: no duplicate recovered entry after settlement and repeated drains`);
+		assert.equal(f.streams.length, 2, f.diagnostic);
+	},
 };
 
 assert.deepEqual(Object.keys(bodies).sort(), piMailboxCases.map((row) => row.id).sort());

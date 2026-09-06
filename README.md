@@ -52,7 +52,7 @@ Workers are named `agent-<name>` (or `agent-<type>` / `agent-N`). First worker o
 
 An inbox send receipt means the temporary-file write and rename returned. It does not prove receiver acceptance or execution. The receiver keeps queued envelopes until a matching custom entry is visible in SessionManager, then acknowledges through `context` or `agent_settled`. This is a memory-visibility boundary, not confirmation of a session-file write. A fresh receiver also checks matching entries before reading envelope payloads.
 
-The [mailbox guarantee matrix](docs/mailbox-guarantees.md) links the executing publication, queue-retention, acknowledgement, fresh-receiver, and Pi storage cases to their assumptions. Run the isolated filesystem and real-Pi compatibility tests with:
+The [mailbox guarantee matrix](docs/mailbox-guarantees.md) links publication, scheduling, rejection, acknowledgement, containment, and Pi storage tests to their assumptions. Each row matches an executing test. Run the isolated filesystem and real-Pi compatibility tests with:
 
 ```sh
 npm ci
@@ -62,6 +62,12 @@ node --import tsx --test tests/extensions/herdr-worker-pi-compat.test.ts tests/e
 The compatibility baseline pins development dependencies `@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` to 0.84.4 without changing consumer peer ranges. Tests assert the project-local coding-agent, its resolved agent-core, and pi-ai versions. Real Pi queues and SessionManager files run with synthetic assistant streams, isolated resources, and no provider requests, credentials, global Pi, or Herdr panes.
 
 Pi 0.84.4 consumes steering before an earlier follow-up once the held assistant finishes. Its custom `message_end` hook precedes SessionManager append; `context` sees the entry and acknowledges it. Reopened JSONL proves recovery separately. Executing `Known contract gap` cases reproduce deletion of the only mailbox copy before the first session write, with persistence disabled, and after a real append error. These are passing loss reproductions, not no-loss guarantees. The controlled host remains a separate test JSONL model. Process-kill recovery is not implemented in this slice, and neither suite establishes exactly-once execution or power-loss durability.
+
+For Pi 0.84.4 persistent sessions with successful local writes, a synthetic provider error triggers automatic continuation of a queued follow-up. The test proves one consumption, exact recovery from the actual session file, envelope deletion, and the next assistant stream without another prompt. This guarantee excludes disabled or failed storage and other Pi versions. A separate injected rejection of `session.sendCustomMessage` reports a `send_message` error but leaves the envelope stuck in flight in that receiver. Provider failure and rejected handoff are different boundaries.
+
+Mailbox scheduling serializes one receiver's sorted directory snapshot. It does not preserve producer-call order across equal timestamps, reserve unique filenames, or prevent two receivers from injecting the same envelope. Tests reproduce suffix reordering, collision overwrite, and bind-run arriving after an assignment. One real-watcher test disables polling; a separate watch-creation failure test drives the poll callback. A dead listener PID selects prompt fallback, without claiming that the prompt executes.
+
+Use a trusted mailbox root. Pane sanitization and acknowledgement filename checks provide lexical containment only. Tests reproduce pane-name aliases, reads through symlinked inbox entries, writes through symlinked ancestor directories, and local writers impersonating a known pane. Roster checks reject unknown or stale panes but do not authenticate the writer. These tests exercise disposable local paths, not hostile production directories.
 
 ### `ReportWorkerRun` and lifecycle events
 

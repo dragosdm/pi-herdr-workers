@@ -62,6 +62,7 @@ interface HeldStream {
 	released: boolean;
 	release(): void;
 	abort(): void;
+	fail(): void;
 }
 
 export async function piCompatFixture(t: TestContext, options: { disabled?: boolean; expectWriteError?: boolean } = {}) {
@@ -84,6 +85,8 @@ export async function piCompatFixture(t: TestContext, options: { disabled?: bool
 	let transport: MailboxTransport | undefined;
 	let manager: SessionManager;
 	let restoreDirectory: (() => void) | undefined;
+	let restoreSend: (() => void) | undefined;
+	let injectedSendError: Error | undefined;
 	let unsubscribe: (() => void) | undefined;
 	let disposed = false;
 
@@ -100,6 +103,7 @@ export async function piCompatFixture(t: TestContext, options: { disabled?: bool
 		if (disposed) return;
 		disposed = true;
 		try {
+			restoreSend?.();
 			restoreDirectory?.();
 			for (const stream of streams) stream.abort();
 			if (session) {
@@ -112,8 +116,13 @@ export async function piCompatFixture(t: TestContext, options: { disabled?: bool
 			assert.equal(transport?.isStarted() ?? false, false);
 			assert.equal(fs.existsSync(listeningFile(mailboxRoot, "self-pane")), false);
 			assert.deepEqual(failures, [], `${diagnostic}: fixture or prompt failures`);
-			if (!options.expectWriteError) assert.deepEqual(errors, [], `${diagnostic}: unexpected extension errors`);
+			if (injectedSendError) {
+				assert.equal(errors.length, 1, diagnostic);
+				assert.equal(errors[0].event, "send_message", diagnostic);
+				assert.equal(errors[0].error, injectedSendError.message, diagnostic);
+			} else if (!options.expectWriteError) assert.deepEqual(errors, [], `${diagnostic}: unexpected extension errors`);
 		} finally {
+			restoreSend?.();
 			for (const stream of streams) stream.abort();
 			unsubscribe?.();
 			session?.dispose();
@@ -229,17 +238,18 @@ export async function piCompatFixture(t: TestContext, options: { disabled?: bool
 			usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
 				cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 } },
 		};
-		const finish = (aborted: boolean) => {
+		const finish = (outcome: "stop" | "aborted" | "error") => {
 			if (held.released) return;
 			held.released = true;
 			clearTimeout(timer);
 			streamOptions?.signal?.removeEventListener("abort", onAbort);
-			if (aborted) stream.push({ type: "error", reason: "aborted", error: { ...message, stopReason: "aborted" } });
+			if (outcome !== "stop") stream.push({ type: "error", reason: outcome,
+				error: { ...message, stopReason: outcome, errorMessage: outcome === "error" ? "Injected synthetic provider failure" : "Aborted" } });
 			else stream.push({ type: "done", reason: "stop", message });
 			stream.end();
-			record(aborted ? "stream:abort" : "stream:release");
+			record(outcome === "stop" ? "stream:release" : `stream:${outcome}`);
 		};
-		const held: HeldStream = { released: false, release: () => finish(false), abort: () => finish(true) };
+		const held: HeldStream = { released: false, release: () => finish("stop"), abort: () => finish("aborted"), fail: () => finish("error") };
 		const onAbort = () => held.abort();
 		const timer = setTimeout(() => {
 			failures.push(new Error(`${diagnostic}: held assistant stream exceeded ${timeoutMs}ms`));
@@ -273,6 +283,15 @@ export async function piCompatFixture(t: TestContext, options: { disabled?: bool
 	return {
 		root, cwd, sessionDir, inbox, manager, session, transport, observations, streams, deliveries, errors, diagnostic,
 		bounded, waitFor, dispose,
+		injectSendRejection(error: Error) {
+			assert.equal(restoreSend, undefined, "only one targeted send fault per fixture");
+			injectedSendError = error;
+			const original = session!.sendCustomMessage;
+			const calls: Parameters<AgentSession["sendCustomMessage"]>[] = [];
+			session!.sendCustomMessage = async (...args) => { calls.push(args); throw error; };
+			restoreSend = () => { session!.sendCustomMessage = original; restoreSend = undefined; };
+			return { calls, restore: () => restoreSend?.() };
+		},
 		startPrompt() {
 			const promise = session!.prompt("Hold this synthetic assistant response").catch((error) => { failures.push(error); });
 			prompts.push(promise);

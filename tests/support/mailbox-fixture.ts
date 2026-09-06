@@ -4,13 +4,38 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { TestContext } from "node:test";
 import { inboxDir, listeningFile } from "../../mailbox/paths.js";
-import { createMailboxTransport, type MailboxBoundary, type MailboxTransport, type MailboxTransportOptions } from "../../mailbox/transport.js";
+import { createMailboxTransport, type MailboxBoundary, type MailboxCallbacks, type MailboxTransport, type MailboxTransportOptions } from "../../mailbox/transport.js";
 import { createControlledPiHost, type ControlledPiHost, type ControlledPersistenceMode } from "./controlled-pi-host.js";
 
 interface ScheduledCallback {
 	kind: "watch" | "poll";
 	callback: () => void;
 	disposed: boolean;
+}
+
+export async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
+	let timer: ReturnType<typeof setTimeout> | undefined;
+	try {
+		return await Promise.race([promise, new Promise<never>((_resolve, reject) => {
+			timer = setTimeout(() => reject(new Error(`Timed out waiting for ${label}`)), 3000);
+		})]);
+	} finally { clearTimeout(timer); }
+}
+
+export function oneShotRemoveFault(target: string) {
+	let failed = false;
+	const attempts: string[] = [];
+	return {
+		attempts,
+		remove(file: string) {
+			attempts.push(file);
+			if (file === target && !failed) {
+				failed = true;
+				throw new Error("Injected one-shot unlink failure");
+			}
+			fs.rmSync(file, { force: true });
+		},
+	};
 }
 
 export function mailboxFixture(t: TestContext) {
@@ -22,6 +47,8 @@ export function mailboxFixture(t: TestContext) {
 	const listeners: MailboxTransport[] = [];
 	const transports: Array<{ transport: MailboxTransport; paneId: string }> = [];
 	const boundaries: MailboxBoundary[] = [];
+	const releaseGates: Array<() => void> = [];
+	const pendingDeliveries = new Set<Promise<void>>();
 	let disposed = false;
 
 	function schedule(kind: ScheduledCallback["kind"], callback: () => void) {
@@ -36,6 +63,8 @@ export function mailboxFixture(t: TestContext) {
 		const ownedMarkers = transports.filter(({ transport }) => transport.isStarted()).map(({ paneId }) => listeningFile(mailboxRoot, paneId));
 		const failures: unknown[] = [];
 		try {
+			for (const release of releaseGates) release();
+			await bounded(Promise.allSettled([...pendingDeliveries]), "pending fixture deliveries");
 			for (const host of hosts) {
 				try { await host.shutdown(); } catch (error) { failures.push(error); }
 			}
@@ -58,6 +87,12 @@ export function mailboxFixture(t: TestContext) {
 
 	return {
 		root, mailboxRoot, sessionFile, scheduled, boundaries, dispose,
+		gate() {
+			let release!: () => void;
+			const promise = new Promise<void>((resolve) => { release = resolve; });
+			releaseGates.push(release);
+			return { promise, release };
+		},
 		inbox: (paneId = "self-pane") => inboxDir(mailboxRoot, paneId),
 		marker: (paneId = "self-pane") => listeningFile(mailboxRoot, paneId),
 		listen(paneId: string) {
@@ -80,17 +115,39 @@ export function mailboxFixture(t: TestContext) {
 			mode?: "tui" | "rpc";
 			reopen?: boolean;
 			persistenceMode?: ControlledPersistenceMode;
-			transport?: Pick<MailboxTransportOptions, "makeFilename" | "fileSystem" | "observeBoundary">;
+			prepare?: (host: ControlledPiHost) => void;
+			beforeDeliver?: MailboxCallbacks["deliver"];
+			transport?: Omit<MailboxTransportOptions, "root" | "paneId">;
 		} = {}) {
 			let transport!: MailboxTransport;
 			let hostTimeline: string[] | undefined;
 			const host = await createControlledPiHost({
 				cwd: root, sessionFile, mode: options.mode, reopen: options.reopen, persistenceMode: options.persistenceMode,
 				createMailbox(callbacks, defaults) {
-					transport = createMailboxTransport(callbacks, {
-						...defaults, ...options.transport, root: mailboxRoot,
-						watch: (_dir, callback) => ({ close: schedule("watch", callback) }),
-						schedulePoll: (callback) => ({ dispose: schedule("poll", callback) }),
+					transport = createMailboxTransport({ ...callbacks,
+						deliver(envelope, envelopeId) {
+							const pending = (async () => {
+								await options.beforeDeliver?.(envelope, envelopeId);
+								await callbacks.deliver(envelope, envelopeId);
+							})();
+							pendingDeliveries.add(pending);
+							void pending.then(() => pendingDeliveries.delete(pending), () => pendingDeliveries.delete(pending));
+							return pending;
+						},
+					}, {
+						...defaults, root: mailboxRoot,
+						watch: (dir, callback) => {
+							const watcher = options.transport?.watch?.(dir, callback);
+							const close = schedule("watch", callback);
+							return { close() { watcher?.close(); close(); } };
+						},
+						schedulePoll: (callback) => {
+							const poller = options.transport?.schedulePoll?.(callback);
+							const dispose = schedule("poll", callback);
+							return { dispose() { poller?.dispose(); dispose(); } };
+						},
+						makeFilename: options.transport?.makeFilename,
+						fileSystem: options.transport?.fileSystem,
 						observeBoundary(boundary) {
 							boundaries.push(boundary);
 							hostTimeline?.push(`mailbox:${boundary.name}`);
@@ -103,6 +160,7 @@ export function mailboxFixture(t: TestContext) {
 			});
 			hostTimeline = host.timeline;
 			hosts.push(host);
+			options.prepare?.(host);
 			await host.start();
 			return { ...host, transport };
 		},
