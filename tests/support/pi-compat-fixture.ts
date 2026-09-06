@@ -185,6 +185,8 @@ export async function piCompatFixture(t: TestContext, options: { disabled?: bool
 		noThemes: true, noContextFiles: true, systemPrompt: "Reply with a synthetic test response.",
 		extensionFactories: [{ name: "mailbox-compat", factory(pi) {
 			pi.exec = exec;
+			pi.on("session_shutdown", (event) => { record(`session_shutdown:${event.reason}`); });
+			pi.on("session_start", (event) => { record(`session_start:${event.reason}`); });
 			pi.on("message_end", (event) => {
 				if (event.message.role === "custom") record("message_end", (event.message.details as { envelopeId?: string })?.envelopeId);
 			});
@@ -281,8 +283,19 @@ export async function piCompatFixture(t: TestContext, options: { disabled?: bool
 	}
 
 	return {
-		root, cwd, sessionDir, inbox, manager, session, transport, observations, streams, deliveries, errors, diagnostic,
+		root, cwd, sessionDir, inbox, manager, session, get transport() { return transport!; }, observations, streams, deliveries, errors, diagnostic,
 		bounded, waitFor, dispose,
+		assertReloadResources() {
+			assert.deepEqual(loader.getExtensions().errors, [], diagnostic);
+			assert.equal(loader.getExtensions().extensions.length, 1, diagnostic);
+			assert.deepEqual(loader.getSkills(), { skills: [], diagnostics: [] }, diagnostic);
+			assert.deepEqual(loader.getPrompts(), { prompts: [], diagnostics: [] }, diagnostic);
+			assert.deepEqual(loader.getThemes(), { themes: [], diagnostics: [] }, diagnostic);
+			assert.deepEqual(loader.getAgentsFiles(), { agentsFiles: [] }, diagnostic);
+			assert.deepEqual(loader.getAppendSystemPrompt(), [], diagnostic);
+			assert.ok(schedules.slice(0, -2).every((schedule) => schedule.disposed), `${diagnostic}: old extension schedules must be disposed`);
+			assert.equal(schedules.length, 4, diagnostic);
+		},
 		injectSendRejection(error: Error) {
 			assert.equal(restoreSend, undefined, "only one targeted send fault per fixture");
 			injectedSendError = error;

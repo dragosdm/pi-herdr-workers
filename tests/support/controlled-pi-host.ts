@@ -28,6 +28,8 @@ export interface ControlledPiHostOptions {
 	mode?: "tui" | "rpc";
 	reopen?: boolean;
 	persistenceMode?: ControlledPersistenceMode;
+	observeStorage?: (boundary: "after-memory" | "after-write", entry?: ControlledEntry) => void;
+	observeHook?: (name: string, event: unknown) => void;
 }
 
 export async function createControlledPiHost(options: ControlledPiHostOptions) {
@@ -60,6 +62,7 @@ export async function createControlledPiHost(options: ControlledPiHostOptions) {
 		const copy = structuredClone(entry);
 		entries.push(copy);
 		timeline.push(`memory:${entry.customType}`);
+		options.observeStorage?.("after-memory", copy);
 		return copy;
 	}
 
@@ -74,6 +77,7 @@ export async function createControlledPiHost(options: ControlledPiHostOptions) {
 		}
 		fs.writeFileSync(options.sessionFile, entries.map((entry) => JSON.stringify(entry) + "\n").join(""));
 		timeline.push("write:session");
+		options.observeStorage?.("after-write");
 	}
 
 	if (options.reopen) entries.push(...reopen());
@@ -139,6 +143,7 @@ export async function createControlledPiHost(options: ControlledPiHostOptions) {
 
 	async function hook(name: string, event: unknown = {}) {
 		timeline.push(`hook:${name}`);
+		options.observeHook?.(name, event);
 		for (const handler of handlers.get(name) ?? []) await handler(event, ctx);
 	}
 
@@ -167,6 +172,15 @@ export async function createControlledPiHost(options: ControlledPiHostOptions) {
 			write();
 		},
 		start: () => hook("session_start", { reason: "startup" }),
+		async reload() {
+			assert.equal(shutdown, false);
+			await hook("session_shutdown", { reason: "reload" });
+			assert.equal(events.listenerCount(), 0, "old extension subscriptions must be disposed before replacement");
+			handlers.clear();
+			tools.clear();
+			workerExtension(pi, { createMailbox: options.createMailbox });
+			await hook("session_start", { reason: "reload" });
+		},
 		async shutdown() {
 			if (shutdown) return;
 			shutdown = true;

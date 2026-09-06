@@ -210,10 +210,67 @@ export const piMailboxCases = [
 		assertion: "Automatic continuation consumes the queued message once, context deletes its envelope, and the next assistant starts without another prompt; actual session-file reopen recovers the exact custom entry before and after settlement with no duplicate delivery",
 		assumptions: `${piAssumptions}, persistence enabled with successful local writes, one receiver and known peer, no retry or compaction; excludes disabled or failed storage and other Pi versions`,
 	},
+	{
+		id: "pi-ordinary-reload-queued", file: piCaseFile, category: "Known contract gap", kind: "ordinary",
+		boundary: "session.reload while streaming with an unconsumed custom follow-up",
+		mode: "Pi 0.84.4 retained agent queue and SessionManager, replacement extension",
+		assertion: "Reload retains the first queued delivery; the replacement injects the same filename again; two custom messages are consumed and recovered from actual JSONL",
+		assumptions: `${piAssumptions}, direct session.reload API while streaming, not the busy-guarded TUI /reload command; successful local writes and known peer`,
+		obsoleteCondition: "Reload shares delivery identities with retained Pi queues or reconciles queued filenames before reinjection",
+	},
 ] as const satisfies readonly MailboxCase[];
 
 export type PiMailboxCaseId = (typeof piMailboxCases)[number]["id"];
-export const allMailboxCases: readonly MailboxCase[] = [...mailboxCases, ...piMailboxCases];
+
+const recoveryFile = "tests/extensions/herdr-worker-recovery.test.ts";
+const recoveryAssumptions = "SIGKILL at a synchronous pipe barrier, new process, same pane/root/session file, saved team authority when retrying, known peer, one receiver, readable local files; not power-loss durability";
+function recoverySupported<const Id extends string>(id: Id, boundary: string, assertion: string, mode = "Controlled host, file-backed message storage") {
+	return { ...supported(id, "ordinary", boundary, assertion, recoveryAssumptions, mode), file: recoveryFile };
+}
+function recoveryGap<const Id extends string>(id: Id, boundary: string, assertion: string, mode: string, obsoleteCondition: string) {
+	return { ...gap(id, "ordinary", boundary, assertion, recoveryAssumptions, obsoleteCondition, mode), file: recoveryFile };
+}
+
+export const recoveryMailboxCases = [
+	recoveryGap("ordinary-before-create", "Sender before envelope write",
+		"No send receipt returns and no envelope or custom entry survives; replacement has no pending message to recover",
+		"Controlled sender, previously saved receiver authority only", "Durable sender intent records pending work before publication"),
+	recoverySupported("ordinary-partial-temp", "Sender writes a real prefix to the temporary file before completing write",
+		"Partial temporary bytes survive unchanged but are ignored; no final file, receipt, injection, or recovered custom entry"),
+	recoverySupported("ordinary-before-rename", "Sender completes temporary write before rename",
+		"Complete temporary JSON survives unchanged but is unpublished; no final file, receipt, injection, or recovered custom entry"),
+	recoverySupported("ordinary-after-rename", "Sender after rename before receipt and before receiver startup",
+		"Final JSON survives without a returned sender receipt; replacement injects once, removes the envelope after writing, and reopens the exact custom entry"),
+	recoverySupported("ordinary-after-read", "Receiver after parse before handoff",
+		"The retained envelope is parsed again in a fresh process and injected once; exact written custom entry survives acknowledgement"),
+	recoverySupported("ordinary-after-send", "Receiver queued custom payload before append",
+		"Old process injected once but its queue is lost; replacement starts with no queue or custom entry and injects once from the retained file, then writes and acknowledges it"),
+	recoverySupported("ordinary-memory-before-write", "Receiver memory append before file write and acknowledgement",
+		"Memory-only entry does not reopen; retained envelope retries once in a new process and produces a recoverable custom entry"),
+	...(["deferred-first-write", "disabled", "write-failed"] as const).map((mode) => recoveryGap(
+		`ordinary-ack-before-write-${mode}` as const, "Receiver acknowledgement deletes envelope without a recoverable custom write",
+		"Old memory contains one custom entry but the envelope is absent; replacement recovers no custom entry and has no file to retry",
+		`Controlled host, ${mode} message storage`,
+		"Mailbox deletion requires a recoverable custom entry rather than memory visibility")),
+	recoverySupported("ordinary-file-before-ack", "Custom entry written before any acknowledgement hook",
+		"Exact custom entry reopens in replacement; matching filename is deleted without parsing the envelope or injecting again"),
+	recoverySupported("ordinary-before-delete", "Acknowledgement reached before unlink",
+		"Custom entry and envelope survive; replacement reopens the entry and deletes the matching filename without parsing or reinjection"),
+	recoverySupported("ordinary-delete-failed", "One-shot hook unlink error after recoverable custom write",
+		"Failed unlink leaves the envelope; replacement uses the exact recovered entry to clean it without parsing or reinjection"),
+	recoverySupported("ordinary-after-delete", "Envelope removed after recoverable custom write",
+		"Custom entry survives alone in reopened storage; replacement performs no mailbox replay or deletion"),
+	{ ...supported("ordinary-reload-visible", "ordinary", "Extension replacement with reason reload and visible custom entry",
+		"Retained memory suppresses reinjection and permits cleanup despite absent session file; no disk recovery is claimed",
+		"Same controlled host, memory entries retained, old extension disposed, known peer", "Controlled host, disabled message storage and retained memory"), file: recoveryFile },
+	{ ...gap("ordinary-reload-queued", "ordinary", "Extension replacement with reason reload and queued custom payload but no entry",
+		"Old queued delivery survives and replacement injects again; two injections and two consumed memory entries share the same envelope ID",
+		"Same controlled host and queue retained, old extension disposed, known peer", "Reload shares or reconciles delivery identities with the retained queue",
+		"Controlled host, disabled message storage and retained queue"), file: recoveryFile },
+] as const satisfies readonly MailboxCase[];
+
+export type RecoveryMailboxCaseId = (typeof recoveryMailboxCases)[number]["id"];
+export const allMailboxCases: readonly MailboxCase[] = [...mailboxCases, ...piMailboxCases, ...recoveryMailboxCases];
 
 export function mailboxCaseName(row: MailboxCase): string {
 	return `${row.category}: ${row.id}`;

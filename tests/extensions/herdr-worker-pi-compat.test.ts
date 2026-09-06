@@ -68,6 +68,62 @@ async function idleAcknowledgement(t: TestContext, disabled: boolean) {
 }
 
 const bodies: Record<PiMailboxCaseId, (t: TestContext) => Promise<void>> = {
+	async "pi-ordinary-reload-queued"(t) {
+		const f = await piCompatFixture(t);
+		f.startPrompt();
+		await held(f, 1);
+		const { envelopeId, envelope } = await f.publish();
+		assert.deepEqual(f.deliveries, [envelopeId], f.diagnostic);
+		assert.deepEqual(customEntries(f.manager), [], f.diagnostic);
+		assert.deepEqual(f.reopen(), [], f.diagnostic);
+		assert.deepEqual(fs.readdirSync(f.inbox), [envelopeId], f.diagnostic);
+		const oldTransport = f.transport;
+		const manager = f.session.sessionManager;
+		const agent = f.session.agent;
+		assert.equal(f.session.isStreaming, true, f.diagnostic);
+		await f.bounded(f.session.reload(), "real session.reload while streaming");
+		await f.waitFor(() => f.deliveries.length === 2, "replacement mailbox handoff");
+		assert.equal(f.session.agent, agent, `${f.diagnostic}: reload retains the agent that owns the queue`);
+		assert.equal(f.session.sessionManager, manager, f.diagnostic);
+		assert.notEqual(f.transport, oldTransport, f.diagnostic);
+		assert.equal(oldTransport.isStarted(), false, f.diagnostic);
+		assert.equal(f.transport.isStarted(), true, f.diagnostic);
+		f.assertReloadResources();
+		assert.equal(f.observations.filter((event) => event.name === "session_shutdown:reload").length, 1, f.diagnostic);
+		assert.equal(f.observations.filter((event) => event.name === "session_start:reload").length, 1, f.diagnostic);
+		assert.equal(f.streams.length, 1, f.diagnostic);
+		assert.equal(f.streams[0].released, false, f.diagnostic);
+		assert.deepEqual(customEntries(f.manager), [], f.diagnostic);
+		assert.equal(f.observations.filter((event) => event.name === "message_end").length, 0, f.diagnostic);
+		for (let i = 0; i < 3; i++) await f.transport.drainInbox();
+		assert.deepEqual(f.deliveries, [envelopeId, envelopeId], `${f.diagnostic}: two handoffs, no consumed entry yet`);
+		assert.deepEqual(fs.readdirSync(f.inbox), [envelopeId], f.diagnostic);
+		f.streams[0].release();
+		await held(f, 2);
+		assert.equal(customEntries(f.manager).length, 1, f.diagnostic);
+		assert.deepEqual(fs.readdirSync(f.inbox), [], f.diagnostic);
+		f.streams[1].release();
+		await held(f, 3);
+		const expected = structuredClone(customEntries(f.manager));
+		assert.equal(expected.length, 2, `${f.diagnostic}: the old queue and replacement injection both consume`);
+		assert.notEqual(expected[0].id, expected[1].id, f.diagnostic);
+		for (const entry of expected) {
+			assert.equal(entry.customType, "herdr-worker.message", f.diagnostic);
+			assert.equal(entry.display, true, f.diagnostic);
+			assert.ok(String(entry.content).includes(envelope.message), f.diagnostic);
+			assert.deepEqual(entry.details, { envelopeId, from: envelope.from }, f.diagnostic);
+		}
+		assert.equal(expected[0].content, expected[1].content, f.diagnostic);
+		assert.deepEqual(f.reopen(), expected, `${f.diagnostic}: two distinct entries recover from actual Pi JSONL`);
+		f.streams[2].release();
+		await f.bounded(f.session.waitForIdle(), "duplicated reload follow-ups settle");
+		for (let i = 0; i < 3; i++) await f.transport.drainInbox();
+		assert.deepEqual(f.deliveries, [envelopeId, envelopeId], f.diagnostic);
+		assert.equal(f.observations.filter((event) => event.name === "message_end" && event.envelopeId === envelopeId).length, 2, f.diagnostic);
+		assert.equal(f.observations.filter((event) => event.name === "mailbox:after-delete").length, 1, f.diagnostic);
+		assert.deepEqual(f.reopen(), expected, f.diagnostic);
+		assert.deepEqual(fs.readdirSync(f.inbox), [], f.diagnostic);
+	},
 	async "pi-ordinary-queue-consumption"(t) {
 		const f = await piCompatFixture(t);
 		f.startPrompt();
