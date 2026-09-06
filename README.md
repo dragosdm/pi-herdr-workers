@@ -48,7 +48,17 @@ Workers are named `agent-<name>` (or `agent-<type>` / `agent-N`). First worker o
 { "target_id": "agent-explore", "message": "…", "priority": false }
 ```
 
-`priority: true` steers; otherwise follow-up. Transport is a per-pane inbox under `$XDG_RUNTIME_DIR/pi-herdr-worker/`. Pi receives a durable, model-visible custom message attributed to the sending agent, not a fabricated user message. Non-Pi targets fall back to `herdr agent prompt`.
+`priority: true` steers; otherwise follow-up. Transport is a per-pane inbox under `$XDG_RUNTIME_DIR/pi-herdr-worker/`, falling back to the OS temporary directory when `XDG_RUNTIME_DIR` is unset. Pi receives a model-visible custom message attributed to the sending agent, not a fabricated user message. Targets without a listening Pi fall back to `herdr agent prompt`.
+
+An inbox send receipt means the temporary-file write and rename returned. It does not prove receiver acceptance or execution. The receiver keeps queued envelopes until a matching custom entry is visible in SessionManager, then acknowledges through `context` or `agent_settled`. This is a memory-visibility boundary, not confirmation of a session-file write. A fresh receiver also checks matching entries before reading envelope payloads.
+
+The [mailbox guarantee matrix](docs/mailbox-guarantees.md) links the executing publication, queue-retention, acknowledgement, and fresh-receiver cases to their assumptions. Run the isolated filesystem tests and adapter regressions with:
+
+```sh
+node --import tsx --test tests/extensions/herdr-worker-mailbox.test.ts tests/extensions/herdr-worker-adapter.test.ts
+```
+
+These tests use a controlled queue and test JSONL storage, not real Pi persistence or process-kill recovery. They do not establish universal no-loss or exactly-once delivery.
 
 ### `ReportWorkerRun` and lifecycle events
 
@@ -134,7 +144,7 @@ MonitorStop monitorId="1"
 
 - Team snapshots are immutable, versioned, restored on `session_start` and `/tree`, and scoped to the source session. A new fork does not inherit another session's worker-control authority. Legacy unversioned team records remain readable.
 - Loops and monitor handles are **operational facts**: `/tree` does not undo an external launch or resurrect a deleted controller. New session IDs do not inherit active controllers or monitor handles. In explicit shared-store mode, the shared file remains authoritative.
-- Pending loop wakes are journaled before delivery and acknowledged only after their custom message is present in SessionManager. Team messages retain their mailbox file until that same persistence boundary. `message_end` is too early: pi invokes that hook before saving the message.
+- Pending loop wakes are journaled before delivery and acknowledged only after their custom message is present in SessionManager. Team messages retain their mailbox file until a matching session-visible custom entry permits acknowledgement. `message_end` is too early because Pi invokes it before appending the custom entry. Session visibility does not prove that a file write succeeded; a mailbox acknowledgement can remove the last recoverable copy when session storage is buffered, disabled, or fails.
 - Worker lifecycle observations are appended as `herdr-worker.lifecycle.v1` before local publication and restored from all entries in the current session. Duplicate inbox delivery and reload do not republish a new accepted observation; `/tree` does not erase operational lifecycle history.
 - An uncertain writer remains unsafe to replace automatically. The orchestration consumer owns explicit resource claims and quarantine, reconciles the same `runId`, releases the claim only under its phase policy after durable resolution, and treats retry as a separate explicit decision. The worker provider does not infer exclusivity from `cwd`.
 - Restoring state never creates panes, restarts commands, or re-sends an already recorded wake. A dynamic iteration awaiting `LoopUpdate` stays awaiting an update after reload; interrupted external work is not blindly repeated. Inspect it and provide the update, or pause/resume it explicitly from `/loop` when safe. A reached fire cap cannot be resumed; renewal requires a new authorized controller.
@@ -154,6 +164,7 @@ MonitorStop monitorId="1"
 
 ```text
 extensions/herdr-worker.ts   /team, CreateAgentPanel, SendToAgent, ReportWorkerRun
+mailbox/                     internal filesystem publication, listening, draining, acknowledgement
 lifecycle/                   worker lifecycle protocol, acceptance, persistence, publication
 runs/                        durable run registry and run-query protocol
 reconciliation/              guarded uncertain-run reconciliation protocol
