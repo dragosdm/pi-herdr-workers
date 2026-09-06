@@ -19,12 +19,15 @@ export interface QueuedMessage {
 	options: { triggerTurn: boolean; deliverAs: "steer" | "followUp" };
 }
 
+export type ControlledPersistenceMode = "explicit" | "file-backed" | "deferred-first-write" | "disabled" | "write-failed";
+
 export interface ControlledPiHostOptions {
 	cwd: string;
 	sessionFile: string;
 	createMailbox: NonNullable<Parameters<typeof herdrWorker>[1]>["createMailbox"];
 	mode?: "tui" | "rpc";
 	reopen?: boolean;
+	persistenceMode?: ControlledPersistenceMode;
 }
 
 export async function createControlledPiHost(options: ControlledPiHostOptions) {
@@ -40,6 +43,7 @@ export async function createControlledPiHost(options: ControlledPiHostOptions) {
 	const warnings: string[] = [];
 	let activeTools: string[] = [];
 	let shutdown = false;
+	let persistenceMode = options.persistenceMode ?? "explicit";
 	const agents = [
 		{ pane_id: "self-pane", tab_id: "tab-1", name: "orchestrator", agent: "pi", cwd: options.cwd },
 		{ pane_id: "worker-pane", tab_id: "tab-1", name: "agent-scout", agent: "pi", agent_status: "idle", cwd: options.cwd },
@@ -58,6 +62,14 @@ export async function createControlledPiHost(options: ControlledPiHostOptions) {
 	}
 
 	function write() {
+		if (persistenceMode === "disabled" || persistenceMode === "deferred-first-write") {
+			timeline.push(`write:${persistenceMode}`);
+			return;
+		}
+		if (persistenceMode === "write-failed") {
+			timeline.push("write:failed");
+			throw new Error("Controlled session write failed after memory insertion");
+		}
 		fs.writeFileSync(options.sessionFile, entries.map((entry) => JSON.stringify(entry) + "\n").join(""));
 		timeline.push("write:session");
 	}
@@ -120,14 +132,24 @@ export async function createControlledPiHost(options: ControlledPiHostOptions) {
 	workerExtension(pi, { createMailbox: options.createMailbox });
 	return {
 		events, entries, queued, sentMessages, execCalls, warnings, timeline, ctx, tools,
-		hook, append, write, reopen,
+		 hook, append, write, reopen,
 		consume(): QueuedMessage {
 			const delivery = queued.shift();
 			assert.ok(delivery, "expected a queued custom message");
 			timeline.push(`consume:${delivery.message.customType}`);
 			return delivery;
 		},
-		appendMessage(delivery: QueuedMessage) { return append({ type: "custom_message", ...delivery.message }); },
+		appendMessage(delivery: QueuedMessage) {
+			const entry = append({ type: "custom_message", ...delivery.message });
+			if (persistenceMode !== "explicit") write();
+			return entry;
+		},
+		setPersistenceMode(mode: ControlledPersistenceMode) { persistenceMode = mode; },
+		flushFirstWrite() {
+			assert.equal(persistenceMode, "deferred-first-write");
+			persistenceMode = "file-backed";
+			write();
+		},
 		start: () => hook("session_start", { reason: "startup" }),
 		async shutdown() {
 			if (shutdown) return;

@@ -3,7 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import test, { type TestContext } from "node:test";
 import { createWorkerRpcClient } from "../../rpc/client.js";
-import { mailboxCaseCells, mailboxCaseName, mailboxCases, type MailboxCase, type MailboxCaseId } from "../support/mailbox-cases.js";
+import { allMailboxCases, mailboxCaseCells, mailboxCaseName, mailboxCases, type MailboxCaseId } from "../support/mailbox-cases.js";
 import { mailboxFixture } from "../support/mailbox-fixture.js";
 
 process.env.HERDR_ENV = "1";
@@ -181,10 +181,10 @@ const bodies: Record<MailboxCaseId, (t: TestContext) => Promise<void>> = {
 for (const row of mailboxCases) test(mailboxCaseName(row), { timeout: 10_000 }, bodies[row.id]);
 
 test("mailbox guarantee matrix matches the executing cases", () => {
-	const rows: readonly MailboxCase[] = mailboxCases;
+	const rows = allMailboxCases;
 	const ids = rows.map((row) => row.id);
 	assert.equal(new Set(ids).size, ids.length, "case IDs must be unique");
-	assert.deepEqual(Object.keys(bodies).sort(), [...ids].sort(), "each row registers a test body");
+	assert.deepEqual(Object.keys(bodies).sort(), mailboxCases.map((row) => row.id).sort(), "each mailbox row registers a test body");
 	for (const row of rows) {
 		assert.ok(["Supported guarantee", "Known contract gap"].includes(row.category));
 		for (const field of [row.kind, row.boundary, row.mode, row.assertion, row.assumptions]) assert.ok(field.trim());

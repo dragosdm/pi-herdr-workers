@@ -5,7 +5,7 @@ import * as path from "node:path";
 import type { TestContext } from "node:test";
 import { inboxDir, listeningFile } from "../../mailbox/paths.js";
 import { createMailboxTransport, type MailboxBoundary, type MailboxTransport, type MailboxTransportOptions } from "../../mailbox/transport.js";
-import { createControlledPiHost, type ControlledPiHost } from "./controlled-pi-host.js";
+import { createControlledPiHost, type ControlledPiHost, type ControlledPersistenceMode } from "./controlled-pi-host.js";
 
 interface ScheduledCallback {
 	kind: "watch" | "poll";
@@ -79,12 +79,13 @@ export function mailboxFixture(t: TestContext) {
 		async host(options: {
 			mode?: "tui" | "rpc";
 			reopen?: boolean;
+			persistenceMode?: ControlledPersistenceMode;
 			transport?: Pick<MailboxTransportOptions, "makeFilename" | "fileSystem" | "observeBoundary">;
 		} = {}) {
 			let transport!: MailboxTransport;
 			let hostTimeline: string[] | undefined;
 			const host = await createControlledPiHost({
-				cwd: root, sessionFile, mode: options.mode, reopen: options.reopen,
+				cwd: root, sessionFile, mode: options.mode, reopen: options.reopen, persistenceMode: options.persistenceMode,
 				createMailbox(callbacks, defaults) {
 					transport = createMailboxTransport(callbacks, {
 						...defaults, ...options.transport, root: mailboxRoot,

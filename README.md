@@ -52,13 +52,16 @@ Workers are named `agent-<name>` (or `agent-<type>` / `agent-N`). First worker o
 
 An inbox send receipt means the temporary-file write and rename returned. It does not prove receiver acceptance or execution. The receiver keeps queued envelopes until a matching custom entry is visible in SessionManager, then acknowledges through `context` or `agent_settled`. This is a memory-visibility boundary, not confirmation of a session-file write. A fresh receiver also checks matching entries before reading envelope payloads.
 
-The [mailbox guarantee matrix](docs/mailbox-guarantees.md) links the executing publication, queue-retention, acknowledgement, and fresh-receiver cases to their assumptions. Run the isolated filesystem tests and adapter regressions with:
+The [mailbox guarantee matrix](docs/mailbox-guarantees.md) links the executing publication, queue-retention, acknowledgement, fresh-receiver, and Pi storage cases to their assumptions. Run the isolated filesystem and real-Pi compatibility tests with:
 
 ```sh
-node --import tsx --test tests/extensions/herdr-worker-mailbox.test.ts tests/extensions/herdr-worker-adapter.test.ts
+npm ci
+node --import tsx --test tests/extensions/herdr-worker-pi-compat.test.ts tests/extensions/herdr-worker-mailbox.test.ts
 ```
 
-These tests use a controlled queue and test JSONL storage, not real Pi persistence or process-kill recovery. They do not establish universal no-loss or exactly-once delivery.
+The compatibility baseline pins development dependencies `@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` to 0.84.4 without changing consumer peer ranges. Tests assert the project-local coding-agent, its resolved agent-core, and pi-ai versions. Real Pi queues and SessionManager files run with synthetic assistant streams, isolated resources, and no provider requests, credentials, global Pi, or Herdr panes.
+
+Pi 0.84.4 consumes steering before an earlier follow-up once the held assistant finishes. Its custom `message_end` hook precedes SessionManager append; `context` sees the entry and acknowledges it. Reopened JSONL proves recovery separately. Executing `Known contract gap` cases reproduce deletion of the only mailbox copy before the first session write, with persistence disabled, and after a real append error. These are passing loss reproductions, not no-loss guarantees. The controlled host remains a separate test JSONL model. Process-kill recovery is not implemented in this slice, and neither suite establishes exactly-once execution or power-loss durability.
 
 ### `ReportWorkerRun` and lifecycle events
 
