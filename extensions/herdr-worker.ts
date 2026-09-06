@@ -14,12 +14,11 @@
  *   /orchestrated-by <id>          same
  *
  * Both sides get the SendToAgent tool. Delivery goes through a per-pane inbox that this
- * extension watches; receivers inject a durable custom message (steer when priority,
+ * extension watches; receivers inject a custom message (steer when priority,
  * follow-up otherwise). Targets that are not a listening pi fall back to `herdr agent prompt`.
  */
 
 import * as fs from "node:fs";
-import * as os from "node:os";
 import * as path from "node:path";
 import { Buffer } from "node:buffer";
 import { randomUUID } from "node:crypto";
@@ -28,6 +27,8 @@ import { Type } from "typebox";
 import { StringEnum } from "@earendil-works/pi-ai";
 import { Text } from "@earendil-works/pi-tui";
 import { createLifecycleAcceptor, type LifecycleAcceptor } from "../lifecycle/acceptor.js";
+import { mailboxRoot } from "../mailbox/paths.js";
+import { createMailboxTransport, type MailboxCallbacks, type MailboxTransport, type MailboxTransportOptions } from "../mailbox/transport.js";
 import {
 	LIFECYCLE_PROTOCOL_V1,
 	LIFECYCLE_PROTOCOL_V2,
@@ -75,23 +76,6 @@ const DIRECTIONS: Direction[] = ["right", "down", "left", "up"];
 const isDirection = (s: string | undefined): s is Direction => !!s && (DIRECTIONS as string[]).includes(s);
 const SELF_TAB = process.env.HERDR_TAB_ID ?? "";
 const WORKER_PREFIX = "agent-";
-
-function mailboxRoot(): string {
-	const base = process.env.XDG_RUNTIME_DIR || os.tmpdir();
-	return path.join(base, "pi-herdr-worker");
-}
-function sanitize(id: string): string {
-	return id.replace(/[^a-zA-Z0-9_-]/g, "_");
-}
-function mailboxDir(paneId: string): string {
-	return path.join(mailboxRoot(), sanitize(paneId));
-}
-function inboxDir(paneId: string): string {
-	return path.join(mailboxDir(paneId), "inbox");
-}
-function listeningFile(paneId: string): string {
-	return path.join(mailboxDir(paneId), "listening.json");
-}
 
 // ───────────────────────── types ─────────────────────────
 
@@ -191,6 +175,7 @@ function frameMessage(env: MessageEnvelope): string {
 // ───────────────────────── extension ─────────────────────────
 
 interface HerdrWorkerTestOptions {
+	createMailbox?: (callbacks: MailboxCallbacks, defaults: MailboxTransportOptions) => MailboxTransport;
 	disableInbox?: boolean;
 	isListening?: (paneId: string) => boolean;
 	writeEnvelope?: (paneId: string, envelope: Envelope) => void;
@@ -222,9 +207,6 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	let state: State = { workers: [] };
 	let ctxRef: ExtensionContext | undefined;
 	let selfInfo: AgentInfo | undefined;
-	let watcher: fs.FSWatcher | undefined;
-	let poller: ReturnType<typeof setInterval> | undefined;
-	let draining = false;
 	let stopped = false;
 	const lifetime = new AbortController();
 	let createQueue = Promise.resolve();
@@ -234,7 +216,6 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	let reconciliationServer: ReconciliationServer | undefined;
 	let providerLifecycleSequence = 0;
 	const pendingSpawnLifecycles = new Map<string, PendingSpawnLifecycle>();
-	const inFlightEnvelopes = new Set<string>();
 	const interactive = () => HERDR_ENV && !!SELF_PANE && ctxRef?.mode === "tui" && !stopped;
 	const providerState = () => {
 		if (stopped) return { available: false as const, reason: "SHUTTING_DOWN" as const };
@@ -412,68 +393,20 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 
 	// ── inbox (receiving) ──
 
-	function startListening() {
-		if (testOptions.disableInbox || !interactive() || watcher || poller) return;
-		const dir = inboxDir(SELF_PANE);
-		fs.mkdirSync(dir, { recursive: true });
-		fs.writeFileSync(listeningFile(SELF_PANE), JSON.stringify({ pid: process.pid, ts: Date.now(), id: selfId() }));
-		try {
-			watcher = fs.watch(dir, () => void drainInbox());
-		} catch {}
-		poller = setInterval(() => void drainInbox(), 3000);
-		poller.unref?.();
-		void drainInbox();
-	}
-
-	function stopListening() {
-		watcher?.close();
-		watcher = undefined;
-		if (poller) clearInterval(poller);
-		poller = undefined;
-		try {
-			fs.rmSync(listeningFile(SELF_PANE), { force: true });
-		} catch {}
-	}
-
-	async function drainInbox() {
-		if (draining || !interactive()) return;
-		draining = true;
-		try {
-			const dir = inboxDir(SELF_PANE);
-			let files: string[] = [];
-			try {
-				files = fs.readdirSync(dir).filter((f) => f.endsWith(".json")).sort();
-			} catch {
-				return;
-			}
-			for (const f of files) {
-				if (stopped) return;
-				if (inFlightEnvelopes.has(f)) continue;
-				const full = path.join(dir, f);
-				const acknowledgedEntry = ctxRef?.sessionManager.getEntries().find((e) => e.type === "custom_message"
-					&& (e.customType === MESSAGE_CUSTOM_TYPE || e.customType === LIFECYCLE_REPORT_CUSTOM_TYPE)
-					&& (e.details as { envelopeId?: string })?.envelopeId === f);
-				if (acknowledgedEntry) {
-					if ((acknowledgedEntry as { customType?: unknown }).customType !== LIFECYCLE_REPORT_CUSTOM_TYPE || acceptPersistedLifecycleReport(acknowledgedEntry)) {
-						fs.rmSync(full, { force: true });
-					}
-					continue;
-				}
-				let env: Envelope | undefined;
-				try {
-					env = JSON.parse(fs.readFileSync(full, "utf8"));
-				} catch {
-					continue; // probably mid-write; next drain picks it up
-				}
-				if (env) await deliver(env, f);
-				if (!stopped && !inFlightEnvelopes.has(f)) fs.rmSync(full, { force: true });
-			}
-		} catch (error) {
-			if (!stopped && ctxRef?.hasUI) ctxRef.ui.notify(`Team inbox: ${error instanceof Error ? error.message : String(error)}`, "warning");
-		} finally {
-			draining = false;
-		}
-	}
+	let acknowledgementContext: ExtensionContext | undefined;
+	const mailbox = (testOptions.createMailbox ?? createMailboxTransport)({
+		selfId,
+		isInteractive: interactive,
+		isStopped: () => stopped,
+		deliver,
+		getAcknowledgedEntries: () => (acknowledgementContext ?? ctxRef)?.sessionManager.getEntries()
+			.filter((entry) => entry.type === "custom_message")
+			.filter((entry) => entry.customType === MESSAGE_CUSTOM_TYPE || entry.customType === LIFECYCLE_REPORT_CUSTOM_TYPE) ?? [],
+		handleAcknowledged: (entry) => entry.customType !== LIFECYCLE_REPORT_CUSTOM_TYPE || acceptPersistedLifecycleReport(entry),
+		warn: (error) => {
+			if (ctxRef?.hasUI) ctxRef.ui.notify(`Team inbox: ${error instanceof Error ? error.message : String(error)}`, "warning");
+		},
+	}, { root: mailboxRoot(), paneId: SELF_PANE });
 
 	/**
 	 * Resolve our known peers (workers + orchestrator) to live pane ids. A sender is trusted only if
@@ -564,7 +497,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			if (!isWorkerRunReport(envelope.report)) return;
 			const record = lifecycleAcceptor?.getRun(envelope.report.runId);
 			if (!record || record.worker.paneId !== envelope.from.paneId) return;
-			inFlightEnvelopes.add(envelopeId);
+			mailbox.markInFlight(envelopeId);
 			pi.sendMessage({
 				customType: LIFECYCLE_REPORT_CUSTOM_TYPE,
 				content: `Worker ${record.worker.name} reported ${envelope.report.status} for run ${envelope.report.runId}.`,
@@ -575,8 +508,8 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		}
 		if (envelope.type !== "message" || typeof envelope.message !== "string" || typeof envelope.priority !== "boolean") return;
 		const messageEnvelope = envelope as MessageEnvelope;
-		inFlightEnvelopes.add(envelopeId);
-		// The mailbox is the outbox until pi actually persists this custom message.
+		mailbox.markInFlight(envelopeId);
+		// Acknowledgement observes SessionManager memory, not a confirmed session-file write.
 		pi.sendMessage({ customType: MESSAGE_CUSTOM_TYPE, content: frameMessage(messageEnvelope), display: true,
 			details: { envelopeId, from: messageEnvelope.from } }, { triggerTurn: true, deliverAs: messageEnvelope.priority ? "steer" : "followUp" });
 	}
@@ -586,14 +519,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 
 	function isListening(paneId: string): boolean {
 		if (testOptions.isListening) return testOptions.isListening(paneId);
-		try {
-			const j = JSON.parse(fs.readFileSync(listeningFile(paneId), "utf8"));
-			if (typeof j.pid !== "number") return false;
-			process.kill(j.pid, 0);
-			return true;
-		} catch {
-			return false;
-		}
+		return mailbox.isListening(paneId);
 	}
 
 	function writeEnvelope(paneId: string, env: Envelope) {
@@ -601,12 +527,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			testOptions.writeEnvelope(paneId, env);
 			return;
 		}
-		const dir = inboxDir(paneId);
-		fs.mkdirSync(dir, { recursive: true });
-		const name = `${String(env.ts).padStart(15, "0")}-${Math.random().toString(36).slice(2, 8)}.json`;
-		const tmp = path.join(dir, `.${name}.tmp`);
-		fs.writeFileSync(tmp, JSON.stringify(env), { mode: 0o600 });
-		fs.renameSync(tmp, path.join(dir, name));
+		mailbox.writeEnvelope(paneId, env);
 	}
 
 	async function makeSender(targetId: string, target: AgentInfo | undefined): Promise<Sender> {
@@ -1615,21 +1536,19 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			persist();
 		}
 
-		startListening();
+		if (!testOptions.disableInbox) mailbox.startListening();
 		updateUi(); // also gates the SendToAgent tool
 		for (const entry of ctx.sessionManager.getEntries()) acceptPersistedLifecycleReport(entry);
 		if (shouldReportReady) await reportWorkerReady().catch(() => {});
 	});
 
 	function acknowledgePersistedInbox(ctx: ExtensionContext) {
-		// message_end precedes persistence; only acknowledge records actually in SessionManager.
-		for (const entry of ctx.sessionManager.getEntries()) {
-			if (entry.type !== "custom_message" || (entry.customType !== MESSAGE_CUSTOM_TYPE && entry.customType !== LIFECYCLE_REPORT_CUSTOM_TYPE)) continue;
-			if (entry.customType === LIFECYCLE_REPORT_CUSTOM_TYPE && !acceptPersistedLifecycleReport(entry)) continue;
-			const id = (entry.details as { envelopeId?: string })?.envelopeId;
-			if (id && inFlightEnvelopes.delete(id) && /^[a-zA-Z0-9_.-]+\.json$/.test(id)) {
-				try { fs.rmSync(path.join(inboxDir(SELF_PANE), id), { force: true }); } catch {}
-			}
+		// Hooks use their supplied context; drains keep using the session/tree context.
+		acknowledgementContext = ctx;
+		try {
+			mailbox.acknowledgeEntries();
+		} finally {
+			acknowledgementContext = undefined;
 		}
 	}
 	pi.on("context", (_event, ctx) => acknowledgePersistedInbox(ctx));
@@ -1641,7 +1560,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 	});
 	pi.on("session_shutdown", async () => {
 		// Headless sessions must not remove the interactive pane's listener file.
-		const wasListening = !!watcher || !!poller;
+		const wasListening = mailbox.isStarted();
 		for (const pending of pendingSpawnLifecycles.values()) {
 			observeProviderUncertain(
 				pending.opts,
@@ -1659,7 +1578,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		runQueryServer = undefined;
 		rpcServer.dispose();
 		lifetime.abort();
-		if (wasListening) stopListening();
+		if (wasListening) mailbox.stopListening();
 		if (ctxRef?.hasUI) ctxRef.ui.setStatus(STATUS_KEY, undefined);
 		runRegistry = undefined;
 		lifecycleAcceptor = undefined;

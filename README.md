@@ -48,7 +48,36 @@ Workers are named `agent-<name>` (or `agent-<type>` / `agent-N`). First worker o
 { "target_id": "agent-explore", "message": "…", "priority": false }
 ```
 
-`priority: true` steers; otherwise follow-up. Transport is a per-pane inbox under `$XDG_RUNTIME_DIR/pi-herdr-worker/`. Pi receives a durable, model-visible custom message attributed to the sending agent, not a fabricated user message. Non-Pi targets fall back to `herdr agent prompt`.
+`priority: true` steers; otherwise follow-up. Transport is a per-pane inbox under `$XDG_RUNTIME_DIR/pi-herdr-worker/`, falling back to the OS temporary directory when `XDG_RUNTIME_DIR` is unset. Pi receives a model-visible custom message attributed to the sending agent, not a fabricated user message. Targets without a listening Pi fall back to `herdr agent prompt`.
+
+An inbox send receipt means the temporary-file write and rename returned. It does not prove receiver acceptance or execution. The receiver keeps queued envelopes until a matching custom entry is visible in SessionManager, then acknowledges through `context` or `agent_settled`. This is a memory-visibility boundary, not confirmation of a session-file write. A fresh receiver also checks matching entries before reading envelope payloads.
+
+The [mailbox guarantee matrix](docs/mailbox-guarantees.md) links publication, scheduling, rejection, acknowledgement, containment, ordinary and lifecycle recovery, binding controls, reload, and Pi storage tests to their assumptions. Each row matches an executing test. Run the isolated filesystem, recovery, and real-Pi compatibility tests with:
+
+```sh
+npm ci
+node --import tsx --test tests/extensions/herdr-worker-pi-compat.test.ts tests/extensions/herdr-worker-mailbox.test.ts tests/extensions/herdr-worker-recovery.test.ts
+```
+
+The compatibility baseline pins development dependencies `@earendil-works/pi-coding-agent` and `@earendil-works/pi-ai` to 0.84.4 without changing consumer peer ranges. Tests assert the project-local coding-agent, its resolved agent-core, and pi-ai versions. Real Pi queues and SessionManager files run with synthetic assistant streams, isolated resources, and no provider requests, credentials, global Pi, or Herdr panes.
+
+Pi 0.84.4 consumes steering before an earlier follow-up once the held assistant finishes. Its custom `message_end` hook precedes SessionManager append; `context` sees the entry and acknowledges it. Reopened JSONL proves recovery separately. Executing `Known contract gap` cases reproduce deletion of the only mailbox copy before the first session write, with persistence disabled, and after a real append error. These are passing loss reproductions, not no-loss guarantees. The controlled host remains a separate test JSONL model. None of these tests establishes exactly-once execution or power-loss durability.
+
+Ordinary and lifecycle recovery tests stop isolated children at synchronous boundaries, send `SIGKILL`, await exit, and start new receivers from surviving files only. Temporary files stay unpublished. A retained final envelope retries after queue or memory loss; a surviving custom entry suppresses another injection and permits cleanup. Acknowledgement with deferred, disabled, or failed message writes can instead leave neither recoverable copy. Retry cases use previously saved team authority. Recovery assumes the same pane, mailbox root, and session file, a valid peer, and no competing receiver.
+
+Lifecycle recovery adds the real registry, acceptor, and query/replay services. A custom report suppresses another injection for its filename; a surviving accepted journal independently suppresses another acceptance. Killing after the journal file write but before its append callback returns produces no live event in the old process. The replacement restores the exact event and sequence through replay without historical publication. Missing journals can instead lose accepted history or cause the surviving report to be accepted again. Journal append errors retain the envelope before any reload. Separate failed-write cases deliberately reload retained journal memory before killing the process to expose acknowledgement without a recovered journal.
+
+Controls persist team state directly, without a custom-message acknowledgement. Tests cover authorization, state-write failure, restart, and cleanup for `orchestrated-by`, `bind-run`, and `released`. Re-reading a retained `bind-run` resets the source identity and can publish readiness again. A recovered uncertainty event needs a surviving scoped journal; a registration, operation checkpoint, or started history alone does not make restart infer uncertainty. These tests seed production records but do not launch actual Herdr workers or classify external side effects.
+
+Extension reload is different from process restart. Retained custom-entry memory suppresses reinjection without proving a file write. Retained queues can survive while the new extension injects again. Both the controlled host and actual Pi 0.84.4 reproduce this duplicate window. The Pi test calls `session.reload()` while streaming; it does not exercise the TUI `/reload` command, whose busy guard prevents that interaction. Injection counts, consumed custom entries, and reopened file entries are separate assertions.
+
+For Pi 0.84.4 persistent sessions with successful local writes, a synthetic provider error triggers automatic continuation of a queued follow-up. The test proves one consumption, exact recovery from the actual session file, envelope deletion, and the next assistant stream without another prompt. This guarantee excludes disabled or failed storage and other Pi versions. A separate injected rejection of `session.sendCustomMessage` reports a `send_message` error but leaves the envelope stuck in flight in that receiver. Provider failure and rejected handoff are different boundaries.
+
+Mailbox scheduling serializes one receiver's sorted directory snapshot. It does not preserve producer-call order across equal timestamps, reserve unique filenames, or prevent two receivers from injecting the same envelope. Tests reproduce suffix reordering, collision overwrite, and bind-run arriving after an assignment. A dead listener PID selects prompt fallback, without claiming that the prompt executes.
+
+Watcher construction and the listener marker do not establish native notification readiness. On Node 26.4.0 with libuv 1.52.1 on Darwin 25.5.0 arm64, plain `fs.watch` can miss an immediate-startup publication within the three-second test bound. The steady-state test first observes a named readiness event on the same still-open watcher, then requires the final envelope's own notification to drive delivery with polling disabled. Its one-time auxiliary-watcher close synchronizes native rescheduling before the single readiness-marker write; it does not repair production startup. Setup events cannot deliver the envelope. Independent tests cover the startup scan with a pre-existing file and controlled polling after watch creation fails. See the matrix's scheduling section for the source evidence and limits.
+
+Use a trusted mailbox root. Pane sanitization and acknowledgement filename checks provide lexical containment only. Tests reproduce pane-name aliases, reads through symlinked inbox entries, writes through symlinked ancestor directories, and local writers impersonating a known pane. Roster checks reject unknown or stale panes but do not authenticate the writer. These tests exercise disposable local paths, not hostile production directories.
 
 ### `ReportWorkerRun` and lifecycle events
 
@@ -134,8 +163,8 @@ MonitorStop monitorId="1"
 
 - Team snapshots are immutable, versioned, restored on `session_start` and `/tree`, and scoped to the source session. A new fork does not inherit another session's worker-control authority. Legacy unversioned team records remain readable.
 - Loops and monitor handles are **operational facts**: `/tree` does not undo an external launch or resurrect a deleted controller. New session IDs do not inherit active controllers or monitor handles. In explicit shared-store mode, the shared file remains authoritative.
-- Pending loop wakes are journaled before delivery and acknowledged only after their custom message is present in SessionManager. Team messages retain their mailbox file until that same persistence boundary. `message_end` is too early: pi invokes that hook before saving the message.
-- Worker lifecycle observations are appended as `herdr-worker.lifecycle.v1` before local publication and restored from all entries in the current session. Duplicate inbox delivery and reload do not republish a new accepted observation; `/tree` does not erase operational lifecycle history.
+- Pending loop wakes are journaled before delivery and acknowledged only after their custom message is present in SessionManager. Team messages retain their mailbox file until a matching session-visible custom entry permits acknowledgement. `message_end` is too early because Pi invokes it before appending the custom entry. Session visibility does not prove that a file write succeeded; a mailbox acknowledgement can remove the last recoverable copy when session storage is buffered, disabled, or fails.
+- Worker lifecycle observations are appended as `herdr-worker.lifecycle.v1` before local publication and restored from all entries in the current session. A surviving accepted journal suppresses another acceptance and restoration does not republish history. Memory-only journals do not establish process recovery; `/tree` does not erase all-entry lifecycle history.
 - An uncertain writer remains unsafe to replace automatically. The orchestration consumer owns explicit resource claims and quarantine, reconciles the same `runId`, releases the claim only under its phase policy after durable resolution, and treats retry as a separate explicit decision. The worker provider does not infer exclusivity from `cwd`.
 - Restoring state never creates panes, restarts commands, or re-sends an already recorded wake. A dynamic iteration awaiting `LoopUpdate` stays awaiting an update after reload; interrupted external work is not blindly repeated. Inspect it and provide the update, or pause/resume it explicitly from `/loop` when safe. A reached fire cap cannot be resumed; renewal requires a new authorized controller.
 - Timers, subscriptions, in-flight requests, sampled process status and UI contexts are runtime resources, not replayed state. Shutdown aborts/cleans them without killing worker or monitor panes. Headless pi instances do not claim a pane's team mailbox.
@@ -154,6 +183,7 @@ MonitorStop monitorId="1"
 
 ```text
 extensions/herdr-worker.ts   /team, CreateAgentPanel, SendToAgent, ReportWorkerRun
+mailbox/                     internal filesystem publication, listening, draining, acknowledgement
 lifecycle/                   worker lifecycle protocol, acceptance, persistence, publication
 runs/                        durable run registry and run-query protocol
 reconciliation/              guarded uncertain-run reconciliation protocol
