@@ -53,6 +53,7 @@ export function mailboxFixture(t: TestContext) {
 	const boundaries: MailboxBoundary[] = [];
 	const releaseGates: Array<() => void> = [];
 	const pendingDeliveries = new Set<Promise<void>>();
+	const nativeWatchers: Array<{ watcher: fs.FSWatcher; closed: Promise<void> }> = [];
 	let disposed = false;
 
 	function schedule(kind: ScheduledCallback["kind"], callback: () => void) {
@@ -81,6 +82,8 @@ export function mailboxFixture(t: TestContext) {
 			} catch (error) { failures.push(error); }
 		} finally {
 			for (const { transport } of transports) if (transport.isStarted()) transport.stopListening();
+			for (const { watcher } of nativeWatchers) watcher.close();
+			await bounded(Promise.all(nativeWatchers.map(({ closed }) => closed)), "native watcher closure before root removal");
 			fs.rmSync(root, { recursive: true, force: true });
 		}
 		assert.equal(fs.existsSync(root), false, "fixture root must be removed");
@@ -91,6 +94,16 @@ export function mailboxFixture(t: TestContext) {
 
 	return {
 		root, mailboxRoot, sessionFile, scheduled, boundaries, dispose,
+		nativeWatch(dir: string, callback: (event: string, filename: string | null) => void) {
+			const watcher = fs.watch(dir, callback);
+			const closed = new Promise<void>((resolve) => {
+				watcher.once("close", resolve);
+				// Node closes the native handle before emitting a watch error, without a close event.
+				watcher.once("error", () => resolve());
+			});
+			nativeWatchers.push({ watcher, closed });
+			return { watcher, closed };
+		},
 		gate() {
 			let release!: () => void;
 			const promise = new Promise<void>((resolve) => { release = resolve; });

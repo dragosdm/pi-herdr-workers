@@ -58,14 +58,24 @@ function assertInside(root: string, file: string) {
 	assert.ok(relative && relative !== ".." && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative), file);
 }
 
-async function schedulerDelivery(t: TestContext, realWatch: boolean) {
+async function realWatchDelivery(t: TestContext) {
 	const f = mailboxFixture(t);
 	const sent = f.gate();
+	const ready = f.gate();
+	const readinessName = ".watch-ready";
 	let watchAttempts = 0;
-	let watchEvents = 0;
-	let watchError: unknown;
+	const watchEvents: Array<{ event: string; filename: string | null; published: boolean }> = [];
+	const watchErrors: string[] = [];
+	let rejectWatch!: (error: Error) => void;
+	const failed = new Promise<never>((_resolve, reject) => { rejectWatch = reject; });
+	void failed.catch(() => {});
+	let published = false;
+	let readinessWritten = false;
+	let readinessSeen = false;
+	let deliveryNotifications = 0;
 	let pollCalls = 0;
 	const snapshots: string[][] = [];
+	function onWatchError(error: Error) { watchErrors.push(String(error)); rejectWatch(error); }
 	const h = await f.host({ transport: {
 		makeFilename: () => envelopeId,
 		fileSystem: { readdir(dir) {
@@ -75,36 +85,53 @@ async function schedulerDelivery(t: TestContext, realWatch: boolean) {
 		} },
 		watch(dir, callback) {
 			watchAttempts++;
-			if (!realWatch) throw new Error("Injected watch creation failure");
-			try {
-				return fs.watch(dir, () => { watchEvents++; callback(); });
-			} catch (error) { watchError = error; throw error; }
+			const { watcher } = f.nativeWatch(dir, (event, filename) => {
+				watchEvents.push({ event, filename, published });
+				if (readinessWritten && filename === readinessName) { readinessSeen = true; ready.release(); }
+				// Only the final envelope's own notification may drive the asserted delivery.
+				if (published && filename === envelopeId) { deliveryNotifications++; callback(); }
+			});
+			watcher.on("error", onWatchError);
+			return watcher;
 		},
 		schedulePoll: () => ({ dispose() {} }),
-	}, prepare(host) { host.observeSend(() => sent.release()); } });
-	assert.equal(watchAttempts, 1);
-	assert.equal(h.transport.isStarted(), true);
-	assert.equal(h.transport.isListening("self-pane"), true);
-	h.transport.writeEnvelope("self-pane", ordinary);
-	if (!realWatch) {
-		assert.deepEqual(f.scheduled.map((record) => record.kind), ["poll"]);
-		assert.equal(h.sentMessages.length, 0);
-		f.scheduled[0].callback();
-		pollCalls++;
-	}
+	}, prepare(host) { host.observeSend(() => sent.release()); }, beforeDeliver: async () => {
+		assert.equal(readinessSeen, true);
+		assert.ok(deliveryNotifications > 0);
+	} });
 	try {
-		await bounded(sent.promise, realWatch ? "real watcher delivery without polling" : "poll fallback delivery");
+		assert.equal(watchAttempts, 1);
+		assert.equal(h.transport.isStarted(), true);
+		assert.equal(h.transport.isListening("self-pane"), true);
+		assert.deepEqual(snapshots, [[]]);
+		const poll = f.scheduled.find((record) => record.kind === "poll")!;
+		poll.callback = () => { pollCalls++; assert.fail("Watcher delivery must not invoke polling"); };
+		// Darwin libuv close synchronizes a reschedule containing the still-open primary watcher.
+		// A single marker write without this boundary has the same registration race as startup delivery.
+		const auxiliary = f.nativeWatch(f.inbox(), () => {});
+		auxiliary.watcher.on("error", onWatchError);
+		auxiliary.watcher.close();
+		await bounded(Promise.race([auxiliary.closed, failed]), "auxiliary watcher closure");
+		readinessWritten = true;
+		fs.writeFileSync(path.join(f.inbox(), readinessName), "ready");
+		await bounded(Promise.race([ready.promise, failed]), "named primary watcher readiness event");
+		assert.equal(h.sentMessages.length, 0);
+		assert.deepEqual(snapshots, [[]], "readiness events must not drive mailbox scans");
+		h.transport.writeEnvelope("self-pane", ordinary);
+		published = true;
+		await bounded(Promise.race([sent.promise, failed]), "final-envelope watcher delivery without polling");
 	} catch (error) {
-		t.diagnostic(JSON.stringify({ watchAttempts, watchEvents, watchError: String(watchError), pollCalls,
+		t.diagnostic(JSON.stringify({ watchAttempts, watchEvents, watchErrors, readinessSeen, deliveryNotifications, pollCalls,
 			files: fs.readdirSync(f.inbox()), snapshots, timeline: h.timeline, warnings: h.warnings }));
 		throw error;
 	}
-	assert.equal(pollCalls, realWatch ? 0 : 1);
-	assert.equal(watchError, undefined);
-	assert.equal(watchEvents > 0, realWatch);
+	assert.equal(pollCalls, 0);
+	assert.deepEqual(watchErrors, []);
+	assert.ok(deliveryNotifications > 0);
 	assert.deepEqual(messageIds(h), [envelopeId]);
 	assert.equal(h.queued.length, 1);
 	assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.inbox(), envelopeId), "utf8")), ordinary);
+	assert.equal(fs.readFileSync(path.join(f.inbox(), readinessName), "utf8"), "ready", "no readiness cleanup stimulus before delivery");
 	await f.dispose();
 	assert.equal(fs.existsSync(f.marker()), false);
 	assert.ok(f.scheduled.every((record) => record.disposed));
@@ -303,8 +330,41 @@ const bodies: Record<MailboxCaseId, (t: TestContext) => Promise<void>> = {
 		assert.equal(h.queued.length, 4);
 		assert.deepEqual(fs.readdirSync(f.inbox()).sort(), [late, ...ids]);
 	},
-	"real-watch-delivery": (t) => schedulerDelivery(t, true),
-	"watch-failure-poll-fallback": (t) => schedulerDelivery(t, false),
+	"real-watch-delivery": realWatchDelivery,
+	async "startup-scan-without-notifications"(t) {
+		const f = mailboxFixture(t);
+		const sent = f.gate();
+		fs.mkdirSync(f.inbox(), { recursive: true });
+		fs.writeFileSync(path.join(f.inbox(), envelopeId), JSON.stringify(ordinary));
+		const h = await f.host({ prepare(host) { host.observeSend(() => sent.release()); } });
+		await bounded(sent.promise, "startup scan with no watch or poll callback");
+		assert.deepEqual(messageIds(h), [envelopeId]);
+		assert.equal(h.queued.length, 1);
+		assert.deepEqual(fs.readdirSync(f.inbox()), [envelopeId]);
+		assert.deepEqual(f.scheduled.map((record) => record.kind), ["watch", "poll"]);
+	},
+	async "watch-failure-poll-fallback"(t) {
+		const f = mailboxFixture(t);
+		const sent = f.gate();
+		let watchAttempts = 0;
+		const h = await f.host({ transport: { makeFilename: () => envelopeId,
+			watch() { watchAttempts++; throw new Error("Injected watch creation failure"); },
+		}, prepare(host) { host.observeSend(() => sent.release()); } });
+		assert.equal(watchAttempts, 1);
+		assert.equal(h.transport.isStarted(), true);
+		assert.equal(h.transport.isListening("self-pane"), true);
+		h.transport.writeEnvelope("self-pane", ordinary);
+		assert.equal(h.sentMessages.length, 0);
+		assert.deepEqual(f.scheduled.map((record) => record.kind), ["poll"]);
+		f.scheduled[0].callback();
+		await bounded(sent.promise, "poll fallback delivery");
+		assert.deepEqual(messageIds(h), [envelopeId]);
+		assert.equal(h.queued.length, 1);
+		assert.deepEqual(JSON.parse(fs.readFileSync(path.join(f.inbox(), envelopeId), "utf8")), ordinary);
+		await f.dispose();
+		assert.equal(fs.existsSync(f.marker()), false);
+		assert.ok(f.scheduled.every((record) => record.disposed));
+	},
 	async "dead-listener-prompt-fallback"(t) {
 		const f = mailboxFixture(t);
 		const listener = f.listen("worker-pane");
