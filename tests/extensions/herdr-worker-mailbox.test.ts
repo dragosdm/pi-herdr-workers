@@ -7,8 +7,10 @@ import { createWorkerRpcClient } from "../../rpc/client.js";
 import { inboxDir, mailboxDir } from "../../mailbox/paths.js";
 import { LIFECYCLE_JOURNAL_ENTRY } from "../../lifecycle/acceptor.js";
 import type { ControlledPiHost } from "../support/controlled-pi-host.js";
-import { allMailboxCases, mailboxCaseCells, mailboxCaseName, mailboxCases, type MailboxCaseId } from "../support/mailbox-cases.js";
+import { allMailboxCases, mailboxCaseCells, mailboxCaseName, mailboxCases, type MailboxCase, type MailboxCaseId } from "../support/mailbox-cases.js";
 import { bounded, mailboxFixture, oneShotRemoveFault } from "../support/mailbox-fixture.js";
+import { lifecycleMailboxCases, type LifecycleMailboxCaseId } from "../support/mailbox-cases.js";
+import { journals, lifecycleEnvelope, queryLifecycle, recoveryRunId, seedLifecycleAuthority, selectedTeamEntry, teamState } from "../support/mailbox-lifecycle.js";
 
 process.env.HERDR_ENV = "1";
 process.env.HERDR_PANE_ID = "self-pane";
@@ -733,18 +735,239 @@ const bodies: Record<MailboxCaseId, (t: TestContext) => Promise<void>> = {
 
 for (const row of mailboxCases) test(mailboxCaseName(row), { timeout: 10_000 }, bodies[row.id]);
 
-test("mailbox guarantee matrix matches the executing cases", () => {
-	const rows = allMailboxCases;
+async function publishLifecycle(h: Awaited<ReturnType<ReturnType<typeof mailboxFixture>["host"]>>) {
+	h.transport.writeEnvelope("self-pane", lifecycleEnvelope);
+	await h.transport.drainInbox();
+	assert.equal(h.sentMessages.length, 1);
+	assert.equal(h.queued.length, 1);
+	const entry = h.appendMessage(h.consume());
+	assert.deepEqual(h.reopen().filter((entry) => entry.type === "custom_message"), [entry]);
+	return entry;
+}
+
+async function lifecycleAppendFailure(t: TestContext, afterMemory: boolean) {
+	const f = mailboxFixture(t);
+	const h = await f.host({ persistenceMode: "file-backed", prepare: seedLifecycleAuthority, branchEntry: selectedTeamEntry,
+		transport: { makeFilename: () => envelopeId } });
+	await publishLifecycle(h);
+	const bytes = fs.readFileSync(f.sessionFile, "utf8");
+	h.setAppendFault({ customType: LIFECYCLE_JOURNAL_ENTRY, afterMemory });
+	await h.hook("context");
+	assert.equal(journals(h.entries).length, Number(afterMemory));
+	assert.equal(journals(h.reopen()).length, 0);
+	assert.equal(fs.readFileSync(f.sessionFile, "utf8"), bytes);
+	assert.deepEqual(fs.readdirSync(f.inbox()), [envelopeId]);
+	assert.equal(h.events.emissions.filter((event) => event.channel === "herdr-workers:lifecycle").length, 0);
+	const failed = await queryLifecycle(h.events);
+	assert.equal(failed.record.lifecycle.acceptedSequence, 0);
+	assert.deepEqual(failed.replay.events, []);
+	h.setAppendFault();
+	await h.hook("agent_settled");
+	const accepted = await queryLifecycle(h.events);
+	assert.equal(accepted.record.lifecycle.acceptedSequence, 1);
+	assert.equal(journals(h.entries).length, afterMemory ? 2 : 1);
+	assert.deepEqual(journals(h.reopen()), journals(h.entries), "full-snapshot model writes raw candidates on explicit successful retry");
+	assert.deepEqual(accepted.replay.events, [journals(h.reopen())[0].event]);
+	assert.deepEqual(fs.readdirSync(f.inbox()), []);
+	assert.equal(h.sentMessages.length, 1);
+	const publications = h.events.emissions.filter((event) => ["herdr-workers:lifecycle", "herdr-workers:completed"].includes(event.channel));
+	assert.deepEqual(publications.map((event) => event.channel), ["herdr-workers:lifecycle", "herdr-workers:completed"]);
+	assert.equal(publications[0].payload, publications[1].payload);
+	assert.deepEqual(publications[0].payload, accepted.replay.events[0]);
+	assert.ok(h.timeline.lastIndexOf("write:session") < h.timeline.indexOf("emit:herdr-workers:lifecycle"));
+	assert.ok(h.timeline.indexOf("emit:herdr-workers:completed") < h.timeline.indexOf("mailbox:before-delete"));
+	await h.reload();
+	assert.deepEqual((await queryLifecycle(h.events)).replay, accepted.replay);
+	assert.equal(h.events.emissions.filter((event) => event.channel === "herdr-workers:lifecycle").length, 1);
+}
+
+async function handledRejection(t: TestContext, reason: string) {
+	const f = mailboxFixture(t);
+	const rejectedId = "000000000000002-rejected.json";
+	const h = await f.host({ persistenceMode: "file-backed", prepare: seedLifecycleAuthority, branchEntry: selectedTeamEntry,
+		transport: { makeFilename: (ts) => ts === 1 ? envelopeId : rejectedId } });
+	const baselineReport = { ...lifecycleEnvelope.report, eventId: "baseline", sourceSequence: 2,
+		...(reason === "terminal-conflict" ? { status: "failed", evidence: { kind: "worker_failed", error: "Prior failure" } }
+			: { status: "message", evidence: { kind: "worker_message", message: "Prior progress" } }) };
+	h.transport.writeEnvelope("self-pane", { ...lifecycleEnvelope, report: baselineReport });
+	await h.transport.drainInbox();
+	h.appendMessage(h.consume());
+	await h.hook("context");
+	const before = await queryLifecycle(h.events);
+	assert.equal(before.record.lifecycle.acceptedSequence, 1);
+	const report = { ...lifecycleEnvelope.report, sourceSequence: 3,
+		...(reason === "duplicate-event" ? { eventId: "baseline" } : {}),
+		...(reason === "stale-source" ? { sourceSequence: 1 } : {}),
+		...(reason === "protocol-mismatch" ? { protocol: 1, evidence: { kind: "worker_completed", result: "Wrong contract" } } : {}) };
+	const details = { envelopeId: rejectedId, report, from: { ...lifecycleEnvelope.from, ...(reason === "pane-mismatch" ? { paneId: "other-pane" } : {}) } };
+	h.transport.writeEnvelope("self-pane", { ...lifecycleEnvelope, ts: 2 });
+	h.transport.markInFlight(rejectedId);
+	h.appendEntry("test-recorded-rejection", { reason });
+	h.append({ type: "custom_message", customType: "herdr-worker.lifecycle-report", display: true, content: "Already recorded report",
+		details: reason === "malformed-details" ? { envelopeId: rejectedId, report: {}, from: null } : details });
+	h.write();
+	await h.hook("context");
+	await h.hook("agent_settled");
+	await h.transport.drainInbox();
+	assert.deepEqual(fs.readdirSync(f.inbox()), []);
+	assert.equal(h.sentMessages.length, 1, "recorded handled report must not be reinjected");
+	assert.deepEqual(await queryLifecycle(h.events), before);
+	assert.equal(journals(h.reopen()).length, 1);
+	assert.equal(h.events.emissions.filter((event) => event.channel === "herdr-workers:lifecycle").length, 1);
+	assert.equal(h.events.emissions.filter((event) => event.channel === "herdr-workers:completed").length, 0);
+	if (reason === "terminal-conflict") {
+		const rejections = h.reopen().filter((entry) => entry.type === "custom" && entry.customType === "herdr-worker.lifecycle-rejection.v1");
+		assert.ok(rejections.length > 0);
+		assert.ok(rejections.every((entry) => (entry as { data: { reason: string } }).data.reason === "terminal_conflict"));
+	}
+}
+
+async function controlAuthority(t: TestContext, action: "orchestrated-by" | "bind-run" | "released") {
+	const scenarios = [
+		{ assigned: false, known: false, current: false, valid: true },
+		{ assigned: true, known: false, current: true, valid: true },
+		{ assigned: true, known: true, current: false, valid: true },
+		{ assigned: true, known: true, current: true, valid: false },
+		{ assigned: true, known: true, current: true, valid: true },
+	];
+	for (const spec of scenarios) {
+		const f = mailboxFixture(t);
+		const initial = { version: 1, sessionId: "session", workers: ["agent-scout"],
+			...(spec.assigned ? { orchestratedBy: "agent-scout", activeRun: { protocol: 2, runId: "old-run", sourceInstanceId: "old-source", sourceSequence: 0 } } : {}) };
+		const h = await f.host({ persistenceMode: "file-backed", prepare(host) { host.appendEntry("herdr-worker", initial); }, transport: { makeFilename: () => envelopeId } });
+		const from = { ...lifecycleEnvelope.from, id: spec.current ? "agent-scout" : "claimed-other", paneId: spec.known ? "worker-pane" : "unknown-pane" };
+		const allowed = action === "orchestrated-by" ? !spec.assigned || spec.known
+			: action === "bind-run" ? spec.valid && (!spec.assigned || (spec.known && spec.current)) : spec.assigned && spec.known && spec.current;
+		const count = h.entries.length;
+		h.transport.writeEnvelope("self-pane", { type: "control", ts: 1, from, action,
+			binding: spec.valid ? { protocol: 2, runId: recoveryRunId } : { protocol: 999, runId: recoveryRunId } });
+		await h.transport.drainInbox();
+		assert.equal(h.entries.length, count + Number(allowed), JSON.stringify({ action, spec }));
+		assert.deepEqual(h.reopen(), JSON.parse(JSON.stringify(h.entries)), "JSON omits undefined cleared state fields");
+		assert.equal(h.sentMessages.length, 0);
+		assert.deepEqual(fs.readdirSync(f.inbox()), []);
+		const state = teamState(h.reopen());
+		if (!allowed) assert.deepEqual(state, initial);
+		else {
+			assert.equal(state.orchestratedBy, action === "released" ? undefined : from.id);
+			if (action === "bind-run") {
+				assert.equal(state.activeRun.runId, recoveryRunId);
+				assert.notEqual(state.activeRun.sourceInstanceId, "old-source");
+			} else assert.deepEqual(state.activeRun, action === "orchestrated-by" && spec.current ? initial.activeRun : undefined);
+		}
+		assert.equal(journals(h.entries).length, 0);
+		await f.dispose();
+	}
+}
+
+const lifecycleBodies: Record<LifecycleMailboxCaseId, (t: TestContext) => Promise<void>> = {
+	"lifecycle-journal-append-failed": (t) => lifecycleAppendFailure(t, false),
+	"lifecycle-memory-journal-error": (t) => lifecycleAppendFailure(t, true),
+	"lifecycle-handled-malformed-details": (t) => handledRejection(t, "malformed-details"),
+	"lifecycle-handled-pane-mismatch": (t) => handledRejection(t, "pane-mismatch"),
+	"lifecycle-handled-duplicate-event": (t) => handledRejection(t, "duplicate-event"),
+	"lifecycle-handled-stale-source": (t) => handledRejection(t, "stale-source"),
+	"lifecycle-handled-protocol-mismatch": (t) => handledRejection(t, "protocol-mismatch"),
+	"lifecycle-handled-terminal-conflict": (t) => handledRejection(t, "terminal-conflict"),
+	"control-orchestrated-by-authority": (t) => controlAuthority(t, "orchestrated-by"),
+	"control-bind-run-authority": (t) => controlAuthority(t, "bind-run"),
+	"control-released-authority": (t) => controlAuthority(t, "released"),
+	async "lifecycle-recorded-unbound"(t) {
+		const f = mailboxFixture(t);
+		const h = await f.host({ persistenceMode: "file-backed", branchEntry: selectedTeamEntry,
+			prepare: (host) => seedLifecycleAuthority(host, false), transport: { makeFilename: () => envelopeId } });
+		h.transport.writeEnvelope("self-pane", lifecycleEnvelope);
+		h.append({ type: "custom_message", customType: "herdr-worker.lifecycle-report", content: "Recorded unbound report", display: true,
+			details: { envelopeId, from: lifecycleEnvelope.from, report: lifecycleEnvelope.report } });
+		h.write();
+		await h.hook("context");
+		await h.hook("agent_settled");
+		await h.transport.drainInbox();
+		assert.equal((await queryLifecycle(h.events)).record.lifecycle.acceptedSequence, 0);
+		assert.equal(h.sentMessages.length, 0);
+		assert.equal(journals(h.reopen()).length, 0);
+		assert.equal(h.events.emissions.filter((event) => event.channel === "herdr-workers:lifecycle").length, 0);
+		assert.deepEqual(fs.readdirSync(f.inbox()), [envelopeId]);
+		await h.shutdown();
+		const next = await f.host({ reopen: true, persistenceMode: "file-backed", branchEntry: selectedTeamEntry, prepare: seedLifecycleAuthority });
+		await next.transport.drainInbox();
+		await next.hook("context");
+		assert.equal(next.sentMessages.length, 0);
+		const accepted = await queryLifecycle(next.events);
+		assert.equal(accepted.record.lifecycle.acceptedSequence, 1);
+		assert.deepEqual(accepted.replay.events, journals(next.reopen()).map((entry) => entry.event));
+		assert.equal(journals(next.reopen()).length, 1);
+		assert.equal(next.events.emissions.filter((event) => event.channel === "herdr-workers:lifecycle").length, 1);
+		assert.deepEqual(fs.readdirSync(f.inbox()), []);
+	},
+	async "control-bind-run-redelivery-ready"(t) {
+		const f = mailboxFixture(t);
+		f.listen("worker-pane");
+		const ready = [f.gate(), f.gate()];
+		const readiness: any[] = [];
+		const fault = oneShotRemoveFault(path.join(f.inbox(), envelopeId));
+		let filename = 0;
+		const h = await f.host({ persistenceMode: "file-backed", prepare(host) {
+			host.appendEntry("herdr-worker", { version: 1, sessionId: "session", workers: [], orchestratedBy: "agent-scout" });
+		}, transport: { makeFilename: () => filename++ === 0 ? envelopeId : `ready-${filename}.json`, fileSystem: { remove: fault.remove },
+			observeBoundary(boundary) {
+				if (boundary.name === "after-rename" && boundary.paneId === "worker-pane") {
+					readiness.push(JSON.parse(fs.readFileSync(boundary.fullPath, "utf8")));
+					ready[readiness.length - 1].release();
+				}
+			} } });
+		h.transport.writeEnvelope("self-pane", { type: "control", ts: 1, from: lifecycleEnvelope.from, action: "bind-run", binding: { protocol: 2, runId: recoveryRunId } });
+		await h.transport.drainInbox();
+		await bounded(ready[0].promise, "first completed readiness publication");
+		const first = structuredClone(teamState(h.reopen()));
+		assert.deepEqual(fs.readdirSync(f.inbox()), [envelopeId]);
+		await h.transport.drainInbox();
+		await bounded(ready[1].promise, "second completed readiness publication");
+		const second = teamState(h.reopen());
+		assert.notEqual(second.activeRun.sourceInstanceId, first.activeRun.sourceInstanceId);
+		assert.equal(first.activeRun.sourceSequence, 1);
+		assert.equal(second.activeRun.sourceSequence, 1);
+		assert.equal(readiness.length, 2);
+		assert.notEqual(readiness[0].report.eventId, readiness[1].report.eventId);
+		assert.deepEqual(readiness.map((envelope) => envelope.report.sourceInstanceId), [first.activeRun.sourceInstanceId, second.activeRun.sourceInstanceId]);
+		assert.ok(readiness.every((envelope) => envelope.type === "lifecycle" && envelope.report.status === "started" && envelope.report.evidence.kind === "worker_ready"));
+		assert.equal(fs.readdirSync(f.inbox("worker-pane")).length, 2);
+		assert.deepEqual(fs.readdirSync(f.inbox()), []);
+		assert.equal(h.sentMessages.length, 0);
+	},
+};
+assert.deepEqual(Object.keys(lifecycleBodies).sort(), lifecycleMailboxCases.map((row) => row.id).sort());
+for (const row of lifecycleMailboxCases) test(mailboxCaseName(row), { timeout: 10_000 }, lifecycleBodies[row.id]);
+
+function verifyMatrix(rows: readonly MailboxCase[], doc: string) {
 	const ids = rows.map((row) => row.id);
 	assert.equal(new Set(ids).size, ids.length, "case IDs must be unique");
-	assert.deepEqual(Object.keys(bodies).sort(), mailboxCases.map((row) => row.id).sort(), "each mailbox row registers a test body");
 	for (const row of rows) {
 		assert.ok(["Supported guarantee", "Known contract gap"].includes(row.category));
-		for (const field of [row.kind, row.boundary, row.mode, row.assertion, row.assumptions]) assert.ok(field.trim());
+		for (const field of [row.id, row.kind, row.boundary, row.mode, row.assertion, row.assumptions]) assert.ok(field?.trim());
 		if (row.category === "Known contract gap") assert.ok(row.obsoleteCondition?.trim());
 	}
-	const doc = fs.readFileSync(new URL("../../docs/mailbox-guarantees.md", import.meta.url), "utf8");
 	const documentedRows = doc.split("\n").filter((line) => line.startsWith("| ")).slice(1)
 		.map((line) => line.split("|").slice(1, -1).map((cell) => cell.trim()));
 	assert.deepEqual(documentedRows, rows.map(mailboxCaseCells));
+}
+
+test("mailbox guarantee matrix matches the executing cases", () => {
+	assert.deepEqual(Object.keys(bodies).sort(), mailboxCases.map((row) => row.id).sort(), "each mailbox row registers a test body");
+	const doc = fs.readFileSync(new URL("../../docs/mailbox-guarantees.md", import.meta.url), "utf8");
+	verifyMatrix(allMailboxCases, doc);
+	assert.throws(() => verifyMatrix(allMailboxCases.slice(1), doc), "missing case IDs must fail");
+	assert.throws(() => verifyMatrix([...allMailboxCases, allMailboxCases[0]], doc), "duplicate case IDs must fail");
+	for (const field of ["id", "boundary", "mode", "assumptions"] as const) {
+		const rows = structuredClone(allMailboxCases);
+		rows[0][field] = "";
+		assert.throws(() => verifyMatrix(rows, doc), `missing ${field} must fail`);
+	}
+	const rows = structuredClone(allMailboxCases);
+	rows[0].category = "Known contract gap";
+	rows[0].obsoleteCondition = "Mutation probe";
+	assert.throws(() => verifyMatrix(rows, doc), "category mismatches must fail even when fields are valid");
+	const gapRows = structuredClone(allMailboxCases);
+	delete gapRows.find((row) => row.category === "Known contract gap")!.obsoleteCondition;
+	assert.throws(() => verifyMatrix(gapRows, doc), "gap removal condition is required");
 });

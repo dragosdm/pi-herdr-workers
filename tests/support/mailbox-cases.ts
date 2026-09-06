@@ -270,7 +270,87 @@ export const recoveryMailboxCases = [
 ] as const satisfies readonly MailboxCase[];
 
 export type RecoveryMailboxCaseId = (typeof recoveryMailboxCases)[number]["id"];
-export const allMailboxCases: readonly MailboxCase[] = [...mailboxCases, ...piMailboxCases, ...recoveryMailboxCases];
+
+const lifecycleAssumptions = "Private trusted root, known peer, production registry and acceptor, branch-selected team metadata, all-entry history, real query client/server";
+function lifecycleRecovery<const Id extends string>(id: Id, boundary: string, assertion: string, category: MailboxCaseCategory = "Supported guarantee",
+	mode = "Controlled host, file-backed report and journal", obsoleteCondition?: string) {
+	return { id, file: recoveryFile, category, kind: "lifecycle" as const, boundary, assertion, mode, assumptions: `${recoveryAssumptions}; ${lifecycleAssumptions}`, obsoleteCondition };
+}
+
+export const lifecycleRecoveryCases = [
+	lifecycleRecovery("lifecycle-before-create", "Sender before report envelope write", "No returned report receipt, published envelope, custom report, or accepted history is recovered", "Known contract gap",
+		"Controlled sender with saved source sequence, separate receiver session", "Durable sender intent stores report bodies before publication"),
+	lifecycleRecovery("lifecycle-partial-temp", "Sender during temporary write", "Real partial temporary bytes survive but cause no injection or acceptance"),
+	lifecycleRecovery("lifecycle-before-rename", "Sender after complete temporary write", "Complete temporary JSON remains unpublished with no injection or acceptance"),
+	lifecycleRecovery("lifecycle-after-rename", "Sender after rename before report receipt", "Replacement injects the retained report once and recovers one exact accepted event"),
+	lifecycleRecovery("lifecycle-after-read", "Receiver after parse before handoff", "Replacement re-reads the envelope, injects once and accepts once"),
+	lifecycleRecovery("lifecycle-after-send", "Queued report before custom append", "Old injection and queue are lost; replacement injects once from the retained file and accepts once"),
+	lifecycleRecovery("lifecycle-memory-before-write", "Custom report in memory before write or acknowledgement", "Retained envelope retries; old memory-only report does not reopen; replacement writes and accepts once"),
+	lifecycleRecovery("lifecycle-custom-before-journal", "Recoverable custom report before acknowledgement and journal", "Replacement recovers report and authority, cleans without injection, writes one accepted event and exposes exact query/replay"),
+	lifecycleRecovery("lifecycle-journal-before-publication", "Journal file write before append callback returns to acceptor", "No old live publication; replacement restores exact event and sequence without historical publication and replay returns it"),
+	lifecycleRecovery("lifecycle-before-delete", "Recoverable report and accepted journal before unlink", "Replacement cleans the same filename without injection or acceptance; query/replay retain the exact journal event"),
+	lifecycleRecovery("lifecycle-after-delete", "Envelope deleted with recoverable report and journal", "Report and accepted history survive alone; replacement neither injects nor republishes"),
+	lifecycleRecovery("lifecycle-delete-failed", "One-shot unlink failure after journal publication", "Retained file becomes cleanable in replacement without another injection, accepted event or publication"),
+	lifecycleRecovery("lifecycle-duplicate-after-restart", "Retained original filename, then duplicate report under another filename", "Original filename cleans without injection; new filename injects once but adds no accepted event or sequence"),
+	...(["report", "journal"] as const).flatMap((target) => (["deferred-first-write", "disabled", "write-failed"] as const).map((mode) =>
+		lifecycleRecovery(`lifecycle-ack-${target}-${mode}` as const, "Memory acknowledgement without recoverable journal",
+			target === "report" ? "Envelope is deleted but neither report nor accepted journal reopens; replacement cannot recover the report"
+				: "Written report survives but journal does not; replacement accepts the same evidence again from the report without injection",
+			"Known contract gap", `Controlled host, ${mode} ${target === "report" ? "report and journal" : "journal-only"} storage; write-failed acknowledgement requires retained-memory reload`,
+			"Acknowledgement and accepted publication require recoverable report and journal writes"))),
+	lifecycleRecovery("lifecycle-uncertainty-survives", "SIGKILL after seeded uncertainty journal", "Query and replay recover original uncertainty scope, event ID and sequence without historical publication"),
+	...(["registered", "started"] as const).map((status) => lifecycleRecovery(`lifecycle-no-inferred-uncertainty-${status}` as const,
+		"SIGKILL after seeded operation checkpoint and saved authority", `Recovered ${status} evidence stays ${status}; startup adds no uncertainty or completion`,
+		"Known contract gap", `Controlled host, file-backed ${status} records; no actual Herdr side effect`,
+		"A durable operation journal classifies abrupt interruption and records scoped uncertainty")),
+] as const satisfies readonly MailboxCase[];
+export type LifecycleRecoveryCaseId = (typeof lifecycleRecoveryCases)[number]["id"];
+
+export const controlRecoveryCases = (["orchestrated-by", "bind-run", "released"] as const).flatMap((action) => [
+	{ ...supported(`control-${action}-before-delete` as const, "control", `${action} state written before deletion`,
+		"State reopens before deletion; retained control is parsed by replacement without custom-message injection; bind-run redelivery resets its source identity",
+		recoveryAssumptions, "Controlled host, file-backed state; no readiness listener"), file: recoveryFile,
+		...(action === "bind-run" ? { category: "Known contract gap" as const, obsoleteCondition: "Binding replay preserves its source generation through durable control identity" } : {}) },
+	{ ...supported(`control-${action}-write-failed` as const, "control", `${action} state append throws after memory insertion`,
+		"Envelope remains and prior file state is unchanged; replacement re-reads the retained control with working storage and recovers its state",
+		recoveryAssumptions, "Controlled host, failed state write then fresh file-backed receiver"), file: recoveryFile },
+	...(["deferred-first-write", "disabled"] as const).map((mode) => ({ ...gap(`control-${action}-ack-${mode}` as const, "control",
+		`${action} cleanup after memory-only state append`, "Control file disappears without a recovered state change; replacement retains only the previously saved state and injects no custom message",
+		recoveryAssumptions, "Control cleanup requires a recoverable state write", `Controlled host, previously saved state then ${mode} append suppression`), file: recoveryFile })),
+]);
+export type ControlRecoveryCaseId = (typeof controlRecoveryCases)[number]["id"];
+
+export const lifecycleMailboxCases = [
+	supported("lifecycle-recorded-unbound", "lifecycle", "Recorded unbound report, then authority restoration",
+		"Report remains pending without injection or live publication; restoring saved authority accepts it once without reinjection", lifecycleAssumptions, "Controlled host, reopened records and extension replacement"),
+	supported("lifecycle-journal-append-failed", "lifecycle", "Selected append callback fails before memory",
+		"Envelope remains, sequence and publications stay unchanged; explicit retry after fault removal writes and accepts once", lifecycleAssumptions, "Controlled fail-before-memory journal fault"),
+	gap("lifecycle-memory-journal-error", "lifecycle", "Journal memory insertion then file exception, explicit retry and reload",
+		"Unfolded raw journal remains in memory; retry adds another raw candidate but one accepted replay event; reload does not republish",
+		lifecycleAssumptions, "Pi separates recoverable journals from failed memory entries", "Controlled memory-then-file fault; full-snapshot retry writes both raw entries"),
+	...(["malformed-details", "pane-mismatch", "duplicate-event", "stale-source", "protocol-mismatch", "terminal-conflict"] as const).map((reason) =>
+		supported(`lifecycle-handled-${reason}` as const, "lifecycle", `Recorded report rejected by handled gate: ${reason}`,
+			"Handled report permits envelope cleanup without new accepted completion, publication or sequence", lifecycleAssumptions, "Controlled host, file-backed records and real acceptor")),
+	...(["orchestrated-by", "bind-run", "released"] as const).map((action) => supported(`control-${action}-authority` as const, "control",
+		`${action} bootstrap and assigned-worker sender checks`, "Real receiver applies only authorized state changes, writes state and cleans parsed controls without custom injection",
+		"Private root, controlled live peer roster, valid and invalid bindings, existing bootstrap exceptions", "Controlled host, file-backed team state")),
+	gap("control-bind-run-redelivery-ready", "control", "Completed readiness write before retained bind-run redelivery",
+		"Same retained control resets source identity and publishes a second completed readiness envelope, with no custom-message injection",
+		"Known current orchestrator with live fixture listener; explicit completed rename observations; one-shot delete fault",
+		"Binding controls have persistent deduplication identity and do not reset source generation on replay", "Controlled host, file-backed state and real readiness publication"),
+] as const satisfies readonly MailboxCase[];
+export type LifecycleMailboxCaseId = (typeof lifecycleMailboxCases)[number]["id"];
+
+export const lifecyclePiCases = [{ ...gap("pi-lifecycle-memory-journal-error", "lifecycle", "Real appendCustomEntry ENOTDIR after memory insertion",
+	"Extension retains envelope and does not fold or publish the failed append; memory reload restores its journal without historical publication while disk still lacks it",
+	piAssumptions, "Pi rolls back failed journal memory or exposes only recoverable journals to restoration", "Pi 0.84.4 flushed report, real journal directory fault and retained-memory reload"), file: piCaseFile },
+	{ ...gap("pi-lifecycle-memory-journal-retry", "lifecycle", "Real journal append failure followed by explicit retry after directory restoration",
+		"Retry leaves two raw journal candidates in memory, one new raw entry on disk and one accepted replay event; reload deduplicates without publication",
+		piAssumptions, "Pi rolls back failed journal memory or separates recoverable entries", "Pi 0.84.4 real ENOTDIR, restored directory, explicit acknowledgement retry and reload"), file: piCaseFile },
+] as const;
+
+export const allMailboxCases: readonly MailboxCase[] = [...mailboxCases, ...piMailboxCases, ...recoveryMailboxCases,
+	...lifecycleRecoveryCases, ...controlRecoveryCases, ...lifecycleMailboxCases, ...lifecyclePiCases];
 
 export function mailboxCaseName(row: MailboxCase): string {
 	return `${row.category}: ${row.id}`;

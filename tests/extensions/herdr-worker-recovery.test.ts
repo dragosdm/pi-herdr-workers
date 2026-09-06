@@ -6,6 +6,8 @@ import { inboxDir, listeningFile } from "../../mailbox/paths.js";
 import type { ChildConfig, ChildSnapshot } from "../support/mailbox-child.js";
 import { mailboxCaseName, recoveryMailboxCases, type RecoveryMailboxCaseId } from "../support/mailbox-cases.js";
 import { bounded, mailboxFixture, mailboxProcessFixture } from "../support/mailbox-fixture.js";
+import { controlRecoveryCases, lifecycleRecoveryCases, type LifecycleRecoveryCaseId } from "../support/mailbox-cases.js";
+import { journals, lifecycleEnvelope, recoveryRunId, teamState } from "../support/mailbox-lifecycle.js";
 
 process.env.HERDR_ENV = "1";
 process.env.HERDR_PANE_ID = "self-pane";
@@ -189,6 +191,151 @@ const bodies: Record<RecoveryMailboxCaseId, (t: TestContext) => Promise<void>> =
 };
 assert.deepEqual(Object.keys(bodies).sort(), recoveryMailboxCases.map((row) => row.id).sort());
 for (const row of recoveryMailboxCases) test(mailboxCaseName(row), { timeout: 30_000 }, bodies[row.id]);
+
+const lifecycleCrashes: Partial<Record<LifecycleRecoveryCaseId, CrashCase>> = {
+	"lifecycle-before-create": crashes["ordinary-before-create"],
+	"lifecycle-partial-temp": crashes["ordinary-partial-temp"],
+	"lifecycle-before-rename": crashes["ordinary-before-rename"],
+	"lifecycle-after-rename": crashes["ordinary-after-rename"],
+	"lifecycle-after-read": crashes["ordinary-after-read"],
+	"lifecycle-after-send": crashes["ordinary-after-send"],
+	"lifecycle-memory-before-write": crashes["ordinary-memory-before-write"],
+	"lifecycle-custom-before-journal": crashes["ordinary-file-before-ack"],
+	"lifecycle-journal-before-publication": { ...crashes["ordinary-before-delete"], boundary: "journal-before-publication" },
+	"lifecycle-before-delete": crashes["ordinary-before-delete"],
+	"lifecycle-after-delete": crashes["ordinary-after-delete"],
+	"lifecycle-delete-failed": crashes["ordinary-delete-failed"],
+	"lifecycle-duplicate-after-restart": crashes["ordinary-before-delete"],
+};
+
+async function lifecycleCrash(t: TestContext, id: LifecycleRecoveryCaseId) {
+	const f = mailboxProcessFixture(t);
+	const lossTarget = id.includes("-ack-report-") ? "report" : id.includes("-ack-journal-") ? "journal" : undefined;
+	const mode = id.endsWith("deferred-first-write") ? "deferred-first-write" : id.endsWith("disabled") ? "disabled" : id.endsWith("write-failed") ? "write-failed" : "file-backed";
+	const evidence = id === "lifecycle-uncertainty-survives" ? "uncertain" : id.endsWith("-registered") ? "registered" : id.endsWith("-started") ? "started" : undefined;
+	const spec = lifecycleCrashes[id] ?? (lossTarget ? { role: "receiver", boundary: "ack-before-write", file: "none", oldInjection: 1,
+		memory: 1, recovered: lossTarget === "journal" ? 1 : 0, retry: false } : undefined);
+	assert.ok(spec || evidence, `unmapped executing boundary ${id}`);
+	const boundary = spec?.boundary ?? "evidence-saved";
+	const first = f.start({ scenario: id, kind: "lifecycle", role: spec?.role ?? "receiver", boundary, mode, lossTarget, evidence });
+	const checkpoint = await first.record("checkpoint");
+	assert.equal(checkpoint.boundary, boundary);
+	const old = checkpoint.snapshot!;
+	assert.equal(old.sent.length, spec?.oldInjection ?? 0);
+	assert.equal(old.memory.length, spec?.memory ?? 0);
+	assert.equal(old.recovered.length, spec?.recovered ?? 0);
+	assert.equal(old.queued, boundary === "after-send" ? 1 : 0);
+	assert.equal(old.receiptReturned, false);
+	const oldJournal = journals(old.allRecovered);
+	const acceptedBeforeKill = ["before-delete", "after-delete", "delete-failed"].includes(boundary) || (evidence && evidence !== "registered");
+	assert.equal(old.lifecycleEvents, Number(!!acceptedBeforeKill || (!!lossTarget && mode !== "write-failed")));
+	assert.equal(oldJournal.length, Number(!!acceptedBeforeKill || boundary === "journal-before-publication"));
+	if (lossTarget) {
+		assert.equal(journals(old.allMemory).length, 1);
+		assert.equal(oldJournal.length, 0);
+		assert.deepEqual(old.files, {});
+	}
+	if (boundary === "journal-before-publication") {
+		assert.equal(old.lifecycleEvents, 0);
+		assert.equal(old.timeline.at(-1), "write:session");
+		assert.equal(old.query?.record.lifecycle.acceptedSequence, 0, "query before acknowledgement had no accepted event");
+	}
+	if (spec) {
+		const names = spec.file === "final" ? [envelopeId] : ["partial", "temporary"].includes(spec.file) ? [temporaryId] : [];
+		assert.deepEqual(Object.keys(old.files), names);
+		if (spec.file === "partial") { assert.equal(old.files[temporaryId].length, 17); assert.throws(() => JSON.parse(old.files[temporaryId])); }
+		if (["temporary", "final"].includes(spec.file)) {
+			const published = JSON.parse(old.files[names[0]]);
+			assert.equal(published.type, "lifecycle");
+			assert.equal(published.report.runId, recoveryRunId);
+			assert.deepEqual(published.report.evidence, lifecycleEnvelope.report.evidence);
+		}
+	}
+	assert.equal(first.records.filter((record) => record.kind === "reload").length, lossTarget && mode === "write-failed" ? 1 : 0);
+	await first.kill();
+	const sessionFile = path.join(f.root, "controlled-session.jsonl");
+	const savedEntries = fs.existsSync(sessionFile) ? fs.readFileSync(sessionFile, "utf8").split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
+	const inbox = inboxDir(path.join(f.root, "mailbox"), "self-pane");
+	assert.deepEqual(Object.fromEntries(fs.readdirSync(inbox).map((name) => [name, fs.readFileSync(path.join(inbox, name), "utf8")])), old.files);
+	assert.deepEqual(old.warnings, []);
+	const replacement = f.start({ scenario: id, kind: "lifecycle", role: "replacement", boundary: "none", mode: "file-backed", lossTarget,
+		duplicate: id === "lifecycle-duplicate-after-restart" });
+	const result = (await replacement.result()).snapshot!;
+	assert.notEqual(first.child.pid, replacement.child.pid);
+	assert.equal(result.initialQueued, 0);
+	assert.equal(result.initialInjections, 0);
+	assert.deepEqual(result.initialRecovered, old.recovered);
+	assert.deepEqual(result.initialEntries, savedEntries, "replacement restores authority and journals exclusively from surviving files");
+	assert.deepEqual(result.warnings, []);
+	assert.equal(result.sent.length, Number(!!spec?.retry) + Number(id === "lifecycle-duplicate-after-restart"));
+	assert.equal(result.queued, 0);
+	assert.deepEqual(result.recovered, result.memory);
+	const recoveredJournal = journals(result.allRecovered);
+	const expectedSequence = evidence ? Number(evidence !== "registered") : lossTarget === "report" ? 0 : Number(!!spec?.retry || !!spec?.recovered);
+	assert.equal(recoveredJournal.length, expectedSequence);
+	assert.equal(result.lifecycleEvents, expectedSequence - oldJournal.length);
+	if (result.query) {
+		assert.equal("legacy" in result.query.record, false, "query restores production registration and endpoint, not a legacy approximation");
+		assert.equal(result.query.record.runId, recoveryRunId);
+		assert.equal(result.query.record.correlationId, "recovery-correlation");
+		assert.equal(result.query.record.lifecycle.acceptedSequence, expectedSequence);
+		assert.equal(result.query.record.lifecycle.status, evidence ?? (expectedSequence ? "completed" : "registered"));
+		assert.deepEqual(result.query.replay.events, recoveredJournal.map((entry) => entry.event));
+		if (!("legacy" in result.query.record)) {
+			assert.deepEqual(result.query.record.assignment, { cwd: f.root, role: "test" });
+			assert.deepEqual(result.query.record.endpoint, { agentName: "agent-scout", paneId: "worker-pane", observedAt: 2 });
+		}
+	} else assert.equal(lossTarget, "report");
+	if (oldJournal.length) assert.deepEqual(recoveredJournal, oldJournal, "surviving journal restores exact event ID, evidence and accepted sequence");
+	if (recoveredJournal.length && !evidence) {
+		const report = (result.recovered[0] as { details: { report: unknown } }).details.report;
+		assert.deepEqual(recoveredJournal[0].event, { ...(report as object), source: "worker", worker: { name: "agent-scout", paneId: "worker-pane" },
+			correlationId: "recovery-correlation", acceptedSequence: 1 });
+	}
+	if (evidence === "uncertain") assert.deepEqual(result.query?.replay, old.query?.replay);
+	assert.equal(result.boundaries.filter((name) => name === "after-parse").length, Number(!!spec?.retry) + Number(id === "lifecycle-duplicate-after-restart"));
+	assert.equal(result.boundaries.filter((name) => name === "after-delete").length, Number(spec?.file === "final") + Number(id === "lifecycle-duplicate-after-restart"));
+	assert.deepEqual(result.files, spec && ["partial", "temporary"].includes(spec.file) ? old.files : {});
+}
+
+for (const row of lifecycleRecoveryCases) test(mailboxCaseName(row), { timeout: 30_000 }, (t) => lifecycleCrash(t, row.id));
+
+for (const row of controlRecoveryCases) test(mailboxCaseName(row), { timeout: 30_000 }, async (t) => {
+	const action = row.id.startsWith("control-orchestrated-by-") ? "orchestrated-by" : row.id.startsWith("control-bind-run-") ? "bind-run" : "released";
+	const mode = row.id.endsWith("write-failed") ? "write-failed" : row.id.endsWith("disabled") ? "disabled" : row.id.endsWith("deferred-first-write") ? "deferred-first-write" : "file-backed";
+	const boundary = mode === "write-failed" ? "control-write-failed" : mode === "file-backed" ? "before-delete" : "after-delete";
+	const f = mailboxProcessFixture(t);
+	const first = f.start({ scenario: row.id, kind: "control", action, role: "receiver", mode, boundary });
+	const checkpoint = await first.record("checkpoint");
+	assert.equal(checkpoint.boundary, boundary);
+	const old = checkpoint.snapshot!;
+	assert.equal(old.sent.length, 0);
+	assert.deepEqual(old.memory, []);
+	assert.equal(old.lifecycleEvents, 0);
+	assert.equal(old.warnings.length, Number(mode === "write-failed"));
+	if (mode === "write-failed") assert.match(old.warnings[0], /session write failed after memory insertion/);
+	assert.equal(old.allMemory.length, old.allRecovered.length + Number(mode !== "file-backed"));
+	const state = teamState(old.allMemory);
+	assert.equal(state.orchestratedBy, action === "released" ? undefined : "agent-scout");
+	assert.equal(state.activeRun?.runId, action === "bind-run" ? recoveryRunId : undefined);
+	assert.deepEqual(Object.keys(old.files), mode === "file-backed" || mode === "write-failed" ? [envelopeId] : []);
+	await first.kill();
+	const replacement = f.start({ scenario: row.id, kind: "control", action, role: "replacement", mode: "file-backed", boundary: "none" });
+	const result = (await replacement.result()).snapshot!;
+	assert.equal(result.sent.length, 0);
+	assert.deepEqual(result.recovered, []);
+	assert.equal(result.lifecycleEvents, 0);
+	assert.deepEqual(result.warnings, []);
+	assert.deepEqual(result.files, {});
+	const recovered = teamState(result.allRecovered);
+	if (mode === "disabled" || mode === "deferred-first-write") assert.deepEqual(recovered, teamState(old.allRecovered), "deleted control cannot restore its memory-only change");
+	else {
+		assert.equal(recovered.orchestratedBy, state.orchestratedBy);
+		assert.equal(recovered.activeRun?.runId, state.activeRun?.runId);
+		if (action === "bind-run") assert.notEqual(recovered.activeRun.sourceInstanceId, state.activeRun.sourceInstanceId, "retained bind-run is not deduplicated");
+	}
+	assert.equal(result.boundaries.filter((name) => name === "after-parse").length, Number(mode === "file-backed" || mode === "write-failed"));
+});
 
 test("recovery fixture reaps a child and removes its root after an unreached checkpoint", { timeout: 15_000 }, async (t) => {
 	const f = mailboxProcessFixture(t);

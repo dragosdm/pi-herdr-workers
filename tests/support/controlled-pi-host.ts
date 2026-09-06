@@ -30,6 +30,7 @@ export interface ControlledPiHostOptions {
 	persistenceMode?: ControlledPersistenceMode;
 	observeStorage?: (boundary: "after-memory" | "after-write", entry?: ControlledEntry) => void;
 	observeHook?: (name: string, event: unknown) => void;
+	branchEntry?: (entry: ControlledEntry) => boolean;
 }
 
 export async function createControlledPiHost(options: ControlledPiHostOptions) {
@@ -48,6 +49,7 @@ export async function createControlledPiHost(options: ControlledPiHostOptions) {
 	let sendError: Error | undefined;
 	let onSend: ((delivery: QueuedMessage) => void) | undefined;
 	let persistenceMode = options.persistenceMode ?? "explicit";
+	let appendFault: { customType: string; afterMemory: boolean } | undefined;
 	const agents = [
 		{ pane_id: "self-pane", tab_id: "tab-1", name: "orchestrator", agent: "pi", cwd: options.cwd },
 		{ pane_id: "worker-pane", tab_id: "tab-1", name: "agent-scout", agent: "pi", agent_status: "idle", cwd: options.cwd },
@@ -66,7 +68,7 @@ export async function createControlledPiHost(options: ControlledPiHostOptions) {
 		return copy;
 	}
 
-	function write() {
+	function write(entry?: ControlledEntry) {
 		if (persistenceMode === "disabled" || persistenceMode === "deferred-first-write") {
 			timeline.push(`write:${persistenceMode}`);
 			return;
@@ -77,7 +79,7 @@ export async function createControlledPiHost(options: ControlledPiHostOptions) {
 		}
 		fs.writeFileSync(options.sessionFile, entries.map((entry) => JSON.stringify(entry) + "\n").join(""));
 		timeline.push("write:session");
-		options.observeStorage?.("after-write");
+		options.observeStorage?.("after-write", entry);
 	}
 
 	if (options.reopen) entries.push(...reopen());
@@ -99,8 +101,11 @@ export async function createControlledPiHost(options: ControlledPiHostOptions) {
 		getActiveTools: () => activeTools,
 		setActiveTools(value: string[]) { activeTools = value; },
 		appendEntry(customType: string, data: unknown) {
-			append({ type: "custom", customType, data });
-			write();
+			const fault = appendFault?.customType === customType ? appendFault : undefined;
+			if (fault && !fault.afterMemory) throw new Error("Controlled append failed before memory insertion");
+			const entry = append({ type: "custom", customType, data });
+			if (fault) throw new Error("Controlled append failed after memory insertion");
+			write(entry);
 		},
 		sendMessage(message: ControlledMessage, messageOptions: QueuedMessage["options"]) {
 			const delivery = structuredClone({ message, options: messageOptions });
@@ -136,7 +141,7 @@ export async function createControlledPiHost(options: ControlledPiHostOptions) {
 	const ctx: any = {
 		mode: options.mode ?? "tui", cwd: options.cwd, hasUI: false,
 		model: { provider: "test", id: "model" }, signal: new AbortController().signal,
-		sessionManager: { getSessionId: () => "session", getBranch: () => entries, getEntries: () => entries },
+		sessionManager: { getSessionId: () => "session", getBranch: () => options.branchEntry ? entries.filter(options.branchEntry) : entries, getEntries: () => entries },
 		ui: { setStatus() {}, notify(message: string) { warnings.push(message); } },
 		isIdle: () => queued.length === 0,
 	};
@@ -150,7 +155,8 @@ export async function createControlledPiHost(options: ControlledPiHostOptions) {
 	workerExtension(pi, { createMailbox: options.createMailbox });
 	return {
 		events, entries, queued, sentMessages, execCalls, warnings, timeline, ctx, tools,
-		hook, append, write, reopen,
+		hook, append, write, reopen, appendEntry: pi.appendEntry as (customType: string, data: unknown) => void,
+		setAppendFault(fault?: { customType: string; afterMemory: boolean }) { appendFault = fault; },
 		setPeerPane(paneId: string) { agents[1].pane_id = paneId; },
 		failNextSend(error: Error) { sendError = error; },
 		observeSend(callback: (delivery: QueuedMessage) => void) { onSend = callback; },
@@ -162,7 +168,7 @@ export async function createControlledPiHost(options: ControlledPiHostOptions) {
 		},
 		appendMessage(delivery: QueuedMessage) {
 			const entry = append({ type: "custom_message", ...delivery.message });
-			if (persistenceMode !== "explicit") write();
+			if (persistenceMode !== "explicit") write(entry);
 			return entry;
 		},
 		setPersistenceMode(mode: ControlledPersistenceMode) { persistenceMode = mode; },

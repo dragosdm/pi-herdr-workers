@@ -9,7 +9,7 @@ import { fileURLToPath } from "node:url";
 import type { ChildConfig, ChildRecord } from "./mailbox-child.js";
 import { inboxDir, listeningFile } from "../../mailbox/paths.js";
 import { createMailboxTransport, type MailboxBoundary, type MailboxCallbacks, type MailboxTransport, type MailboxTransportOptions } from "../../mailbox/transport.js";
-import { createControlledPiHost, type ControlledPiHost, type ControlledPersistenceMode } from "./controlled-pi-host.js";
+import { createControlledPiHost, type ControlledPiHost, type ControlledPiHostOptions, type ControlledPersistenceMode } from "./controlled-pi-host.js";
 
 interface ScheduledCallback {
 	kind: "watch" | "poll";
@@ -119,6 +119,8 @@ export function mailboxFixture(t: TestContext) {
 			mode?: "tui" | "rpc";
 			reopen?: boolean;
 			persistenceMode?: ControlledPersistenceMode;
+			observeStorage?: ControlledPiHostOptions["observeStorage"];
+			branchEntry?: ControlledPiHostOptions["branchEntry"];
 			prepare?: (host: ControlledPiHost) => void;
 			beforeDeliver?: MailboxCallbacks["deliver"];
 			transport?: Omit<MailboxTransportOptions, "root" | "paneId">;
@@ -127,6 +129,7 @@ export function mailboxFixture(t: TestContext) {
 			let hostTimeline: string[] | undefined;
 			const host = await createControlledPiHost({
 				cwd: root, sessionFile, mode: options.mode, reopen: options.reopen, persistenceMode: options.persistenceMode,
+				observeStorage: options.observeStorage, branchEntry: options.branchEntry,
 				createMailbox(callbacks, defaults) {
 					transport = createMailboxTransport({ ...callbacks,
 						deliver(envelope, envelopeId) {
@@ -229,7 +232,7 @@ export function mailboxProcessFixture(t: TestContext) {
 					assert.equal(record.scenario, config.scenario);
 					assert.equal(record.role, config.role);
 					assert.equal(record.pid, child.pid);
-					assert.ok(["checkpoint", "ready", "result", "shutdown", "failure"].includes(record.kind));
+					assert.ok(["checkpoint", "ready", "result", "shutdown", "reload", "failure"].includes(record.kind));
 					records.push(record);
 					if (record.kind === "failure") failure = new Error(record.error);
 				} catch (error) { failure = error as Error; }

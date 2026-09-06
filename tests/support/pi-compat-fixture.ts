@@ -13,6 +13,7 @@ import {
 import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
 import { inboxDir, listeningFile } from "../../mailbox/paths.js";
 import { createMailboxTransport, type MailboxTransport } from "../../mailbox/transport.js";
+import { lifecycleEnvelope, seedLifecycleAuthority } from "./mailbox-lifecycle.js";
 
 export const piCompatibilityVersion = "0.84.4";
 const timeoutMs = 5000;
@@ -65,7 +66,7 @@ interface HeldStream {
 	fail(): void;
 }
 
-export async function piCompatFixture(t: TestContext, options: { disabled?: boolean; expectWriteError?: boolean } = {}) {
+export async function piCompatFixture(t: TestContext, options: { disabled?: boolean; expectWriteError?: boolean; lifecycle?: boolean } = {}) {
 	const diagnostic = assertPiCompatibility(t);
 	const root = fs.mkdtempSync(path.join(os.tmpdir(), "herdr-pi-compat-"));
 	const cwd = path.join(root, "cwd");
@@ -89,6 +90,8 @@ export async function piCompatFixture(t: TestContext, options: { disabled?: bool
 	let injectedSendError: Error | undefined;
 	let unsubscribe: (() => void) | undefined;
 	let disposed = false;
+	let workerPi!: ExtensionAPI;
+	let beforeContext: (() => void) | undefined;
 
 	async function bounded<T>(promise: Promise<T>, label: string): Promise<T> {
 		let timer: ReturnType<typeof setTimeout> | undefined;
@@ -142,6 +145,8 @@ export async function piCompatFixture(t: TestContext, options: { disabled?: bool
 	manager = options.disabled ? SessionManager.inMemory(cwd, { id: "pi-mailbox-compat" })
 		: SessionManager.create(cwd, sessionDir, { id: "pi-mailbox-compat" });
 	manager.appendCustomEntry("herdr-worker", { version: 1, sessionId: manager.getSessionId(), workers: ["agent-scout"] });
+	if (options.lifecycle) seedLifecycleAuthority({ entries: manager.getEntries(), ctx: { cwd, sessionManager: manager },
+		appendEntry: (customType, data) => { manager.appendCustomEntry(customType, data); } });
 	const settingsManager = SettingsManager.inMemory({ retry: { enabled: false }, compaction: { enabled: false } });
 	const { default: workerExtension } = await import("../../extensions/herdr-worker.js");
 
@@ -184,13 +189,14 @@ export async function piCompatFixture(t: TestContext, options: { disabled?: bool
 		cwd, agentDir, settingsManager, noExtensions: true, noSkills: true, noPromptTemplates: true,
 		noThemes: true, noContextFiles: true, systemPrompt: "Reply with a synthetic test response.",
 		extensionFactories: [{ name: "mailbox-compat", factory(pi) {
+			workerPi = pi;
 			pi.exec = exec;
 			pi.on("session_shutdown", (event) => { record(`session_shutdown:${event.reason}`); });
 			pi.on("session_start", (event) => { record(`session_start:${event.reason}`); });
 			pi.on("message_end", (event) => {
 				if (event.message.role === "custom") record("message_end", (event.message.details as { envelopeId?: string })?.envelopeId);
 			});
-			pi.on("context", () => { record("context:before"); });
+			pi.on("context", () => { record("context:before"); beforeContext?.(); });
 			pi.on("agent_settled", () => { record("agent_settled:before"); });
 			pi.on("tool_call", () => {
 				failures.push(new Error(`${diagnostic}: synthetic streams must never call tools`));
@@ -285,6 +291,13 @@ export async function piCompatFixture(t: TestContext, options: { disabled?: bool
 	return {
 		root, cwd, sessionDir, inbox, manager, session, get transport() { return transport!; }, observations, streams, deliveries, errors, diagnostic,
 		bounded, waitFor, dispose,
+		get events() { return workerPi.events; },
+		beforeContext(callback?: () => void) { beforeContext = callback; },
+		async publishLifecycle() {
+			transport!.writeEnvelope("self-pane", lifecycleEnvelope);
+			await transport!.drainInbox();
+			return "000000000000001-pi.json";
+		},
 		assertReloadResources() {
 			assert.deepEqual(loader.getExtensions().errors, [], diagnostic);
 			assert.equal(loader.getExtensions().extensions.length, 1, diagnostic);

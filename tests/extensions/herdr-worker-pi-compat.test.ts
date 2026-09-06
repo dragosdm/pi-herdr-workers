@@ -4,6 +4,10 @@ import test, { type TestContext } from "node:test";
 import { mailboxCaseName, piMailboxCases, type PiMailboxCaseId } from "../support/mailbox-cases.js";
 import { customEntries, piCompatFixture } from "../support/pi-compat-fixture.js";
 import { mailboxFixture } from "../support/mailbox-fixture.js";
+import { SessionManager, type CustomEntry } from "@earendil-works/pi-coding-agent";
+import { LIFECYCLE_JOURNAL_ENTRY, type LifecycleJournalEntry } from "../../lifecycle/acceptor.js";
+import { lifecyclePiCases } from "../support/mailbox-cases.js";
+import { queryLifecycle } from "../support/mailbox-lifecycle.js";
 
 process.env.HERDR_ENV = "1";
 process.env.HERDR_PANE_ID = "self-pane";
@@ -313,6 +317,73 @@ const bodies: Record<PiMailboxCaseId, (t: TestContext) => Promise<void>> = {
 
 assert.deepEqual(Object.keys(bodies).sort(), piMailboxCases.map((row) => row.id).sort());
 for (const row of piMailboxCases) test(mailboxCaseName(row), { timeout: 20_000 }, bodies[row.id]);
+
+for (const row of lifecyclePiCases) test(mailboxCaseName(row), { timeout: 20_000 }, async (t) => {
+	const retry = row.id === "pi-lifecycle-memory-journal-retry";
+	const f = await piCompatFixture(t, { lifecycle: true });
+	await flushFirstAssistant(f);
+	f.startPrompt();
+	await held(f, 2);
+	const envelopeId = await f.publishLifecycle();
+	assert.deepEqual(customEntries(f.manager), [], f.diagnostic);
+	assert.deepEqual(fs.readdirSync(f.inbox), [envelopeId], f.diagnostic);
+	let restore: (() => void) | undefined;
+	let bytes: string | undefined;
+	const file = f.manager.getSessionFile()!;
+	const journalEntries = (manager: SessionManager) => manager.getEntries().filter((entry): entry is CustomEntry => entry.type === "custom" && entry.customType === LIFECYCLE_JOURNAL_ENTRY);
+	const publications: unknown[] = [];
+	const unsubscribe = f.events.on("herdr-workers:lifecycle", (event) => publications.push(event));
+	t.after(unsubscribe);
+	f.beforeContext(() => {
+		if (customEntries(f.manager).length && !restore) {
+			assert.deepEqual(f.reopen(), customEntries(f.manager), `${f.diagnostic}: custom report is written before journal fault`);
+			bytes = fs.readFileSync(file, "utf8");
+			restore = f.breakSessionDirectory();
+		}
+	});
+	f.streams[1].release();
+	await held(f, 3);
+	assert.ok(restore, f.diagnostic);
+	f.beforeContext();
+	assert.deepEqual(publications, [], f.diagnostic);
+	const failedJournal = journalEntries(f.manager);
+	assert.equal(failedJournal.length, 1, `${f.diagnostic}: real appendCustomEntry inserted memory before ENOTDIR`);
+	assert.equal(f.manager.getLeafId(), failedJournal[0].id, f.diagnostic);
+	assert.equal((await queryLifecycle(f.events)).record.lifecycle.acceptedSequence, 0, f.diagnostic);
+	assert.deepEqual((await queryLifecycle(f.events)).replay.events, [], f.diagnostic);
+	assert.deepEqual(fs.readdirSync(f.inbox), [envelopeId], f.diagnostic);
+	assert.deepEqual(f.errors, [], `${f.diagnostic}: worker handled gate catches journal append error`);
+	// Observe the underlying filesystem error independently without replacing a Pi persistence method.
+	assert.throws(() => f.manager.appendCustomEntry("test-ENOTDIR-probe", {}), { code: "ENOTDIR" }, f.diagnostic);
+	if (retry) {
+		restore();
+		assert.equal(fs.readFileSync(file, "utf8"), bytes, f.diagnostic);
+		assert.deepEqual(journalEntries(SessionManager.open(file, f.sessionDir, f.cwd)), [], f.diagnostic);
+		await f.session.extensionRunner.emit({ type: "agent_settled" });
+		assert.equal(journalEntries(f.manager).length, 2, f.diagnostic);
+		assert.equal(journalEntries(SessionManager.open(file, f.sessionDir, f.cwd)).length, 1, f.diagnostic);
+		assert.equal(publications.length, 1, f.diagnostic);
+	}
+	await f.bounded(f.session.reload(), "journal memory restoration through real reload");
+	f.assertReloadResources();
+	const restored = await queryLifecycle(f.events);
+	assert.equal(restored.record.lifecycle.acceptedSequence, 1, f.diagnostic);
+	assert.deepEqual(restored.replay.events, [(failedJournal[0].data as LifecycleJournalEntry).event], f.diagnostic);
+	assert.equal(publications.length, Number(retry), `${f.diagnostic}: restored journal must not republish history`);
+	assert.deepEqual(fs.readdirSync(f.inbox), [], `${f.diagnostic}: retained journal memory permits envelope cleanup after reload`);
+	assert.equal(journalEntries(f.manager).length, retry ? 2 : 1, f.diagnostic);
+	restore();
+	if (!retry) assert.equal(fs.readFileSync(file, "utf8"), bytes, f.diagnostic);
+	const reopened = SessionManager.open(file, f.sessionDir, f.cwd);
+	assert.deepEqual(customEntries(reopened), customEntries(f.manager), f.diagnostic);
+	assert.equal(journalEntries(reopened).length, Number(retry), `${f.diagnostic}: only the successful retry writes a journal`);
+	f.streams[2].release();
+	await f.bounded(f.session.waitForIdle(), "journal compatibility settlement");
+	assert.equal(journalEntries(SessionManager.open(file, f.sessionDir, f.cwd)).length, Number(retry), `${f.diagnostic}: later Pi appends do not backfill the failed journal`);
+	assert.equal(publications.length, Number(retry), f.diagnostic);
+	assert.deepEqual(f.deliveries, [envelopeId], f.diagnostic);
+	unsubscribe();
+});
 
 test("controlled host models keep memory and file modes separate", async (t) => {
 	for (const persistenceMode of ["file-backed", "deferred-first-write", "disabled", "write-failed"] as const) {
