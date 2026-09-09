@@ -17,6 +17,8 @@ if (!process.env.TEAM_COMMAND_ENV_CASE) {
 	process.env.HERDR_TAB_ID = "tab-1";
 }
 
+type ExecOptions = { timeout: number; signal: AbortSignal };
+
 async function harness(options: {
 	listening?: boolean;
 	branch?: any[];
@@ -27,7 +29,7 @@ async function harness(options: {
 	flags?: Record<string, unknown>;
 	selfName?: string;
 	agents?: any[];
-	execOverride?: (args: string[]) => Promise<any> | any;
+	execOverride?: (args: string[], options: ExecOptions) => Promise<any> | any;
 	writeEnvelopeErrorForType?: string;
 	isIdle?: boolean;
 	hasUI?: boolean;
@@ -45,6 +47,8 @@ async function harness(options: {
 	const sessionEntries = structuredClone(options.sessionEntries ?? []);
 	const branch = structuredClone(options.branch ?? []);
 	const execCalls: string[][] = [];
+	const execOptions: ExecOptions[] = [];
+	const partialToolUpdates: Array<{ id: string; update: any }> = [];
 	const pendingExec = new Set<Promise<any>>();
 	const paneMetadataCalls: string[][] = [];
 	const sentUserMessages: Array<[text: string, options?: { deliverAs: "followUp" }]> = [];
@@ -81,18 +85,19 @@ async function harness(options: {
 		},
 		sendMessage(message: any, messageOptions: any) { sentMessages.push({ message, options: messageOptions }); },
 		sendUserMessage(...args: [string, { deliverAs: "followUp" }?]) { sentUserMessages.push(args); },
-		exec(_command: string, args: string[]) {
-			const call = execute(args);
+		exec(_command: string, args: string[], callOptions: ExecOptions) {
+			const call = execute(args, callOptions);
 			pendingExec.add(call);
 			void call.then(() => pendingExec.delete(call), () => pendingExec.delete(call));
 			return call;
 		},
 	};
-	async function execute(args: string[]) {
+	async function execute(args: string[], callOptions: ExecOptions) {
 		execCalls.push(args);
+		execOptions.push(callOptions);
 		if (args[0] === "pane" && args[1] === "report-metadata") paneMetadataCalls.push(args);
 		timeline.push(`exec:${args[0]}:${args[1] ?? ""}`);
-		const overridden = await options.execOverride?.(args);
+		const overridden = await options.execOverride?.(args, callOptions);
 		if (overridden !== undefined) {
 			if (args[0] === "agent" && args[1] === "start" && overridden.code === 0) startedAgents.add(args[2]);
 			return overridden;
@@ -146,6 +151,13 @@ async function harness(options: {
 		events, tools, commands, handlers, entries, sessionEntries, timeline, execCalls, agentGetTargets,
 		writtenEnvelopes, sentMessages, ctx, pi, herdrWorker, activeTools: () => activeTools,
 		branch, sentUserMessages, notifications, statusUpdates, paneMetadataCalls, activeToolUpdates,
+		execOptions, partialToolUpdates,
+		executeTool(name: string, params: Record<string, unknown>, signal: AbortSignal = ctx.signal, id = "call") {
+			return tools.get(name).execute(id, params, signal, (update: any) => {
+				partialToolUpdates.push({ id, update: structuredClone(update) });
+				timeline.push(`update:${name}`);
+			}, ctx);
+		},
 		async settleExec() {
 			while (pendingExec.size) await Promise.all([...pendingExec]);
 		},
@@ -737,6 +749,624 @@ test("tree restoration clears a removed relationship title and shutdown clears s
 	assert.deepEqual(h.statusUpdates.at(-1), { key: "herdr-worker", text: undefined });
 	assert.equal(h.events.listenerCount(), 0);
 });
+
+// Public expectations in this section are fixed to 112410c, before service rewiring.
+const CREATE_PROGRESS = { content: [{ type: "text", text: "Splitting pane and starting worker\u2026" }], details: {} };
+const BRIEF_DELIVERED = "Initial brief delivered; its report will arrive as an [agent] message on a later turn.";
+const BUILDER_UNTASKED = 'No initial brief given; use SendToAgent({ target_id: "agent-builder", \u2026 }) to task it.';
+const SCOUT_UNTASKED = 'No initial brief given; use SendToAgent({ target_id: "agent-scout", \u2026 }) to task it.';
+
+test("baseline tool definitions preserve names, descriptions, prompt guidance, and public JSON schemas", async (t) => {
+	const h = await commandHarness(t);
+	assert.deepEqual([...h.tools.keys()].sort(), ["CreateAgentPanel", "ReportWorkerRun", "SendToAgent"]);
+	const create = h.tools.get("CreateAgentPanel");
+	assert.deepEqual({ name: create.name, label: create.label, description: create.description, promptSnippet: create.promptSnippet, promptGuidelines: create.promptGuidelines }, {
+		name: "CreateAgentPanel", label: "Create Agent Panel",
+		description: "Create a new team member: splits a herdr pane next to you and starts a pi worker there that is orchestrated by you. Workers are named agent-<name> (default agent-<type> or agent-N). Use `type` to describe the kind of agent (explore, research, review, implement, test, \u2026) and `purpose` for a one-line charter (e.g. 'explore only, never edit files'). `model` defaults to your own model, except explore/research default to xai/grok-4.6. `initial_prompt` is delivered as the worker's first brief right after startup. Returns the worker's id for SendToAgent.",
+		promptSnippet: "Spawn a new orchestrated pi worker in a neighboring herdr pane (type, purpose, model, initial brief)",
+		promptGuidelines: ["Use CreateAgentPanel when the user asks for a new team member / worker / agent panel, or when a task benefits from a separate agent (e.g. an explore-only scout). Give it a concrete initial_prompt."],
+	});
+	assert.deepEqual(JSON.parse(JSON.stringify(create.parameters)), {
+		type: "object", properties: {
+			name: { type: "string", description: "Short name; becomes agent-<name>. Defaults to the type or a number." },
+			direction: { type: "string", enum: ["right", "down", "left", "up"], description: "Side of your pane to place the worker (default right). Further workers on that side stack." },
+			type: { type: "string", description: "Kind of agent: explore | research | review | implement | test | <anything>" },
+			purpose: { type: "string", description: "One-line charter for this worker, e.g. 'explore only, report findings, never edit files'" },
+			model: { type: "string", description: "provider/id, e.g. xai/grok-4.6 or anthropic/claude-sonnet-4-5. Default: your model (explore/research: xai/grok-4.6)." },
+			thinking: { type: "string", enum: ["off", "minimal", "low", "medium", "high", "xhigh", "max"], description: "Thinking level for the worker (default: model default)" },
+			initial_prompt: { type: "string", description: "First brief for the worker (Markdown). Self-contained: goal, context, constraints, what to report back." },
+		},
+	});
+	const send = h.tools.get("SendToAgent");
+	assert.deepEqual({ name: send.name, label: send.label, description: send.description, promptSnippet: send.promptSnippet, promptGuidelines: send.promptGuidelines }, {
+		name: "SendToAgent", label: "Send To Agent",
+		description: "Send a message to another of your user's agents running in a herdr pane (an orchestrator or a worker). The message is delivered asynchronously and shows up in their chat as an '[agent] ...' custom message; replies come back the same way on a later turn. target_id is the herdr agent name (e.g. a worker name) or pane id. priority=true steers the target mid-task (interrupts its current turn); priority=false queues a follow-up after its current work finishes.",
+		promptSnippet: "Message another herdr-hosted agent (orchestrator \u2194 worker) asynchronously",
+		promptGuidelines: [
+			"Use SendToAgent for questions and ordinary communication. A bound worker must use ReportWorkerRun for terminal completion or failure.",
+			"When delegating to workers, write self-contained messages with goal, context, constraints, and what to report back.",
+			"SendToAgent is fire-and-forget: do not wait or poll for a reply \u2014 end your turn and react when the '[agent]' message arrives.",
+		],
+	});
+	assert.deepEqual(JSON.parse(JSON.stringify(send.parameters)), {
+		type: "object", required: ["message", "target_id"], properties: {
+			message: { type: "string", description: "Full message body (Markdown). Self-contained: the recipient does not see your conversation." },
+			target_id: { type: "string", description: "Herdr agent name or pane id of the recipient" },
+			priority: { type: "boolean", description: "true = steer (interrupt recipient's current turn). false/omitted = follow-up after its current work.", default: false },
+		},
+	});
+	const report = h.tools.get("ReportWorkerRun");
+	assert.deepEqual({ name: report.name, label: report.label, description: report.description, promptSnippet: report.promptSnippet, promptGuidelines: report.promptGuidelines }, {
+		name: "ReportWorkerRun", label: "Report Worker Run",
+		description: "Report an authoritative message, successful completion, or failure for the worker's currently bound assignment. Identity and ordering are supplied by the extension.",
+		promptSnippet: "Report progress or the explicit outcome of the current worker assignment",
+		promptGuidelines: [
+			"ReportWorkerRun is the only terminal reporting path for a bound assignment. Use SendToAgent only for questions and ordinary communication.",
+			"Report completed only after the assignment is actually complete, with a non-empty result and any artifact or verification references. Report failed with a concrete error when it cannot be completed.",
+		],
+	});
+});
+
+for (const row of [
+	{ label: "empty", state: {}, active: [] },
+	{ label: "enabled orchestrator", state: { teamMode: true }, active: ["CreateAgentPanel"] },
+	{ label: "owned roster without team mode", state: { workers: ["agent-scout"] }, active: ["SendToAgent"] },
+	{ label: "enabled with workers", state: { teamMode: true, workers: ["agent-scout"] }, active: ["CreateAgentPanel", "SendToAgent"] },
+	{ label: "worker", state: { orchestratedBy: "boss" }, active: ["SendToAgent"] },
+	{ label: "mixed roster and bound worker", state: { teamMode: true, workers: ["agent-scout"], orchestratedBy: "boss", activeRun: ACTIVE_RUN }, active: ["SendToAgent", "ReportWorkerRun"] },
+	{ label: "binding without ownership", state: { teamMode: true, activeRun: ACTIVE_RUN }, active: ["CreateAgentPanel"] },
+	{ label: "noninteractive", state: { teamMode: true, workers: ["agent-scout"], orchestratedBy: "boss", activeRun: ACTIVE_RUN }, mode: "rpc", active: [] },
+]) {
+	test(`baseline tool activation for ${row.label} preserves unrelated tools and shutdown behavior`, async (t) => {
+		const h = await commandHarness(t, { branch: teamBranch(row.state), mode: row.mode, activeTools: ["read", "CreateAgentPanel", "SendToAgent", "ReportWorkerRun", "bash"] });
+		const expectedActive: string[] = row.active;
+		assert.deepEqual(h.activeTools(), ["read", ...expectedActive, "bash"]);
+		if (!expectedActive.includes("CreateAgentPanel")) {
+			await assert.rejects(h.executeTool("CreateAgentPanel", {}), { message: "CreateAgentPanel is only available to an orchestrator (run /team here first)." });
+			assert.deepEqual(h.partialToolUpdates, []);
+		}
+		if (!expectedActive.includes("ReportWorkerRun") && !("activeRun" in row.state && "orchestratedBy" in row.state)) {
+			await assert.rejects(h.executeTool("ReportWorkerRun", { status: "message", message: "Progress" }), { message: "No active worker run is bound." });
+		}
+		const before = [...h.activeTools()];
+		await h.handlers.get("session_shutdown")![0]();
+		assert.deepEqual(h.activeTools(), before, "shutdown does not itself refresh the host tool list");
+		await assert.rejects(h.executeTool("CreateAgentPanel", {}), { message: "CreateAgentPanel is only available to an orchestrator (run /team here first)." });
+		assert.deepEqual(h.partialToolUpdates, []);
+		assert.equal(h.events.listenerCount(), 0);
+	});
+}
+
+type AdapterHarness = Awaited<ReturnType<typeof harness>>;
+
+function assertCreation(h: AdapterHarness, result: any, expected: {
+	name: string; paneId?: string; model?: string; type?: string; purpose?: string; cwd?: string;
+	how?: string; adopted?: boolean; initial_prompt?: string; text: string;
+}, assignment: Record<string, string>) {
+	const { text, ...details } = expected;
+	assert.deepEqual(result, { content: [{ type: "text", text }], details: {
+		runId: result.details.runId, correlationId: undefined, paneId: "new-pane", model: undefined, type: undefined,
+		purpose: undefined, cwd: "/tmp", how: "new column right", adopted: false, initial_prompt: undefined, ...details,
+	} });
+	assert.match(result.details.runId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+	assert.deepEqual(h.partialToolUpdates, [{ id: "call", update: CREATE_PROGRESS }]);
+	const registration = h.entries.find((entry) => entry.type === RUN_REGISTRATION_ENTRY)?.data;
+	assert.ok(Number.isFinite(registration?.registeredAt));
+	assert.deepEqual({ ...registration, registeredAt: 0 }, {
+		version: 1, runId: result.details.runId, sessionId: "session", registeredAt: 0, lifecycleProtocol: 2, assignment,
+	});
+	const endpoint = h.entries.find((entry) => entry.type === RUN_ENDPOINT_BINDING_ENTRY)?.data;
+	assert.ok(Number.isFinite(endpoint?.observedAt));
+	assert.deepEqual({ ...endpoint, observedAt: 0 }, {
+		version: 1, runId: result.details.runId, sessionId: "session", agentName: expected.name,
+		paneId: expected.paneId ?? "new-pane", observedAt: 0,
+	});
+	const meta = h.entries.filter((entry) => entry.type === "herdr-worker").at(-1)?.data.meta[expected.name];
+	assert.equal(meta.runId, result.details.runId);
+	assert.equal(meta.paneId, result.details.paneId);
+	assert.equal(meta.lifecycleProtocol, 2);
+	assert.ok(h.timeline.indexOf("update:CreateAgentPanel") < h.timeline.indexOf(`append:${RUN_REGISTRATION_ENTRY}`));
+	assert.ok(h.timeline.indexOf(`append:${RUN_REGISTRATION_ENTRY}`) < h.timeline.indexOf(`append:${RUN_ENDPOINT_BINDING_ENTRY}`));
+	for (const { envelope } of h.writtenEnvelopes) {
+		if (envelope.type === "message") assert.equal(envelope.runId, result.details.runId);
+		if (envelope.action === "bind-run") assert.deepEqual(envelope.binding, { protocol: 2, runId: result.details.runId });
+	}
+	for (const entry of h.entries.filter((entry) => entry.type === LIFECYCLE_JOURNAL_ENTRY)) {
+		assert.equal(entry.data.event.runId, result.details.runId);
+		assert.deepEqual(entry.data.event.worker, { name: expected.name, paneId: result.details.paneId });
+	}
+}
+
+const newWorkerCases: Array<{
+	label: string; params: Record<string, unknown>; options?: Parameters<typeof harness>[0];
+	expected: Parameters<typeof assertCreation>[2]; assignment: Record<string, string>; launch: string[];
+}> = [
+	{
+		label: "all omitted", params: {},
+		expected: { name: "agent-1", model: "test/model", text: 'Worker agent-1 ready in pane new-pane (new column right).\nModel: test/model\nNo initial brief given; use SendToAgent({ target_id: "agent-1", \u2026 }) to task it.' },
+		assignment: { cwd: "/tmp", model: "test/model" }, launch: ["--model", "test/model"],
+	},
+	{
+		label: "automatic name collision", params: {}, options: { agents: [{ pane_id: "taken", name: "agent-1" }] },
+		expected: { name: "agent-2", model: "test/model", text: 'Worker agent-2 ready in pane new-pane (new column right).\nModel: test/model\nNo initial brief given; use SendToAgent({ target_id: "agent-2", \u2026 }) to task it.' },
+		assignment: { cwd: "/tmp", model: "test/model" }, launch: ["--model", "test/model"],
+	},
+	{
+		label: "every optional argument", params: { name: "  BuIlDeR  ", direction: "left", type: " Research ", purpose: "  Map the code  ", model: " other/explicit ", thinking: "high", initial_prompt: "  Inspect auth\nReport findings  " },
+		expected: { name: "agent-builder", model: "other/explicit", type: "research", purpose: "Map the code", how: "new column left", initial_prompt: "  Inspect auth\nReport findings  ", text: "Worker agent-builder ready in pane new-pane (new column left).\nRole: research \u2014 Map the code\nModel: other/explicit\n" + BRIEF_DELIVERED },
+		assignment: { cwd: "/tmp", model: "other/explicit", role: "research" }, launch: ["--model", "other/explicit:high", "--team-role", "research: Map the code"],
+	},
+	{
+		label: "research type name and default model", params: { name: "  ", type: " ReSeArCh ", model: "  " },
+		expected: { name: "agent-research", model: "xai/grok-4.6", type: "research", text: 'Worker agent-research ready in pane new-pane (new column right).\nRole: research\nModel: xai/grok-4.6\nNo initial brief given; use SendToAgent({ target_id: "agent-research", \u2026 }) to task it.' },
+		assignment: { cwd: "/tmp", model: "xai/grok-4.6", role: "research" }, launch: ["--model", "xai/grok-4.6", "--team-role", "research"],
+	},
+	{
+		label: "explore default without context model", params: { type: " Explore " }, options: { model: null },
+		expected: { name: "agent-explore", model: "xai/grok-4.6", type: "explore", text: 'Worker agent-explore ready in pane new-pane (new column right).\nRole: explore\nModel: xai/grok-4.6\nNo initial brief given; use SendToAgent({ target_id: "agent-explore", \u2026 }) to task it.' },
+		assignment: { cwd: "/tmp", model: "xai/grok-4.6", role: "explore" }, launch: ["--model", "xai/grok-4.6", "--team-role", "explore"],
+	},
+	{
+		label: "custom type with context model", params: { name: "agent-builder", type: " CuStOm ", purpose: "  " }, options: { model: { provider: "context", id: "selected" } },
+		expected: { name: "agent-builder", model: "context/selected", type: "custom", text: "Worker agent-builder ready in pane new-pane (new column right).\nRole: custom\nModel: context/selected\n" + BUILDER_UNTASKED },
+		assignment: { cwd: "/tmp", model: "context/selected", role: "custom" }, launch: ["--model", "context/selected", "--team-role", "custom"],
+	},
+	{
+		label: "absent model ignores thinking with purpose only", params: { name: "builder", type: " ", purpose: "  Check auth  ", thinking: "max", initial_prompt: "" }, options: { model: null },
+		expected: { name: "agent-builder", purpose: "Check auth", initial_prompt: "", text: "Worker agent-builder ready in pane new-pane (new column right).\nRole: Check auth\n" + BUILDER_UNTASKED },
+		assignment: { cwd: "/tmp" }, launch: ["--team-role", "Check auth"],
+	},
+	{
+		label: "owned name collision", params: { name: "scout" }, options: { branch: teamBranch({ teamMode: true, workers: ["agent-scout"] }), agents: [{ pane_id: "worker-pane", name: "agent-scout" }, { pane_id: "taken", name: "agent-scout-2" }] },
+		expected: { name: "agent-scout-3", model: "test/model", text: 'Worker agent-scout-3 ready in pane new-pane (new column right).\nModel: test/model\nNo initial brief given; use SendToAgent({ target_id: "agent-scout-3", \u2026 }) to task it.' },
+		assignment: { cwd: "/tmp", model: "test/model" }, launch: ["--model", "test/model"],
+	},
+	{
+		label: "whitespace brief echoed but not delivered", params: { name: "builder", initial_prompt: " \n " },
+		expected: { name: "agent-builder", model: "test/model", initial_prompt: " \n ", text: "Worker agent-builder ready in pane new-pane (new column right).\nModel: test/model\n" + BRIEF_DELIVERED },
+		assignment: { cwd: "/tmp", model: "test/model" }, launch: ["--model", "test/model"],
+	},
+];
+
+for (const row of newWorkerCases) {
+	test(`baseline tool creation: ${row.label}`, async (t) => {
+		const h = await commandHarness(t, { branch: teamBranch({ teamMode: true }), listening: true, ...row.options });
+		const result = await h.executeTool("CreateAgentPanel", row.params);
+		assertCreation(h, result, row.expected, row.assignment);
+		const split = h.execCalls.find((args) => args[1] === "split");
+		assert.deepEqual(split, ["pane", "split", "self-pane", "--direction", "right", "--cwd", "/tmp", "--no-focus"]);
+		const startIndex = h.execCalls.findIndex((args) => args[1] === "start");
+		assert.deepEqual(h.execCalls[startIndex], ["agent", "start", row.expected.name, "--kind", "pi", "--pane", "new-pane", "--timeout", "60000", "--", "--orchestrated-by", "orchestrator", "--worker-run-id", result.details.runId, "--worker-lifecycle-protocol", "2", ...row.launch]);
+		assert.equal(h.execOptions[startIndex].timeout, 70000);
+		assert.equal(h.execOptions[h.execCalls.indexOf(split!)].timeout, 15000);
+		assert.deepEqual(h.execCalls.filter((args) => args[1] === "swap"), row.params.direction === "left" ? [["pane", "swap", "--source-pane", "self-pane", "--target-pane", "new-pane"]] : []);
+		assert.deepEqual(h.writtenEnvelopes.map(({ paneId, envelope }) => ({ paneId, envelope: { ...envelope, ts: 0 } })), row.label === "every optional argument" ? [{
+			paneId: "new-pane", envelope: { type: "message", from: { id: "orchestrator", paneId: "self-pane", name: "orchestrator", role: "orchestrator" }, message: "  Inspect auth\nReport findings  ", priority: false, ts: 0, runId: result.details.runId },
+		}] : []);
+		assert.deepEqual(h.entries.filter((entry) => entry.type === "herdr-worker").at(-1)?.data.meta[row.expected.name], {
+			type: row.expected.type, purpose: row.expected.purpose, model: row.expected.model, paneId: "new-pane", runId: result.details.runId,
+			correlationId: undefined, requestId: undefined, providerInstanceId: undefined, lifecycleProtocol: 2,
+		});
+	});
+}
+
+for (const row of [
+	{ direction: "right", native: "right", how: "new column right", swap: false },
+	{ direction: "down", native: "down", how: "new row down", swap: false },
+	{ direction: "left", native: "right", how: "new column left", swap: true },
+	{ direction: "up", native: "down", how: "new row up", swap: true },
+]) {
+	test(`baseline tool direction ${row.direction} uses native split and optional swap`, async (t) => {
+		const h = await commandHarness(t, { branch: teamBranch({ teamMode: true }), model: null });
+		const result = await h.executeTool("CreateAgentPanel", { name: "builder", direction: row.direction });
+		assertCreation(h, result, { name: "agent-builder", how: row.how, text: `Worker agent-builder ready in pane new-pane (${row.how}).\n` + BUILDER_UNTASKED }, { cwd: "/tmp" });
+		assert.deepEqual(h.execCalls.filter((args) => ["split", "swap"].includes(args[1])), [
+			["pane", "split", "self-pane", "--direction", row.native, "--cwd", "/tmp", "--no-focus"],
+			...(row.swap ? [["pane", "swap", "--source-pane", "self-pane", "--target-pane", "new-pane"]] : []),
+		]);
+	});
+}
+
+for (const thinking of ["off", "minimal", "low", "medium", "high", "xhigh", "max"]) {
+	test(`baseline tool thinking ${thinking} changes launch but not returned model`, async (t) => {
+		const h = await commandHarness(t, { branch: teamBranch({ teamMode: true }) });
+		const result = await h.executeTool("CreateAgentPanel", { name: "builder", thinking });
+		assertCreation(h, result, { name: "agent-builder", model: "test/model", text: "Worker agent-builder ready in pane new-pane (new column right).\nModel: test/model\n" + BUILDER_UNTASKED }, { cwd: "/tmp", model: "test/model" });
+		const start = h.execCalls.find((args) => args[1] === "start")!;
+		assert.deepEqual(start.slice(start.indexOf("--model")), ["--model", `test/model:${thinking}`]);
+	});
+}
+
+for (const saved of [false, true]) {
+	for (const brief of [undefined, "", "  Map auth\nReport findings  ", " \n "]) {
+		test(`baseline tool re-adoption preserves ${saved ? "stored" : "absent"} metadata and brief ${JSON.stringify(brief)}`, async (t) => {
+			const prior = saved ? { type: "review", purpose: "Keep the charter", model: "saved/model", paneId: "old-pane", runId: "old-run", correlationId: "old-correlation", requestId: "old-request", providerInstanceId: "old-provider", lifecycleProtocol: 1 } : undefined;
+			const h = await commandHarness(t, { branch: teamBranch({ teamMode: true, ...(saved ? { meta: { "agent-scout": prior } } : {}) }), listening: true, workerCwd: "/workspace/live" });
+			const result = await h.executeTool("CreateAgentPanel", { name: " ScOuT ", direction: "up", type: " Research ", purpose: "Replace charter", model: "replace/model", thinking: "max", ...(brief === undefined ? {} : { initial_prompt: brief }) });
+			assertCreation(h, result, {
+				name: "agent-scout", paneId: "worker-pane", cwd: "/workspace/live", adopted: true, how: "re-adopted existing pane",
+				type: saved ? "review" : undefined, purpose: saved ? "Keep the charter" : undefined, model: saved ? "saved/model" : undefined, initial_prompt: brief,
+				text: "Worker agent-scout ready in pane worker-pane (re-adopted existing pane).\n" + (saved ? "Role: review \u2014 Keep the charter\nModel: saved/model\n" : "") + (brief ? BRIEF_DELIVERED : SCOUT_UNTASKED),
+			}, { cwd: "/tmp", model: "replace/model", role: "research" });
+			assert.deepEqual(h.entries.filter((entry) => entry.type === "herdr-worker").at(-1)?.data.meta["agent-scout"], {
+				...prior, paneId: "worker-pane", runId: result.details.runId, correlationId: undefined, requestId: undefined, providerInstanceId: undefined, lifecycleProtocol: 2,
+			});
+			assert.deepEqual(h.execCalls.filter((args) => ["split", "swap", "start", "prompt"].includes(args[1])), []);
+			assert.deepEqual(h.entries.filter((entry) => entry.type === LIFECYCLE_JOURNAL_ENTRY), []);
+			assert.deepEqual(h.writtenEnvelopes.map(({ paneId, envelope }) => ({ paneId, envelope: { ...envelope, ts: 0 } })), [
+				{ paneId: "worker-pane", envelope: { type: "control", action: "orchestrated-by", from: { id: "orchestrator", paneId: "self-pane", name: "orchestrator", role: "orchestrator" }, ts: 0 } },
+				{ paneId: "worker-pane", envelope: { type: "control", action: "bind-run", from: { id: "orchestrator", paneId: "self-pane", name: "orchestrator", role: "orchestrator" }, ts: 0, binding: { protocol: 2, runId: result.details.runId } } },
+				...(brief ? [{ paneId: "worker-pane", envelope: { type: "message", from: { id: "orchestrator", paneId: "self-pane", name: "orchestrator", role: "orchestrator" }, message: brief, priority: false, ts: 0, runId: result.details.runId } }] : []),
+			]);
+		});
+	}
+}
+
+for (const row of [
+	{ label: "missing", workerCwd: null, cwd: "/tmp" },
+	{ label: "empty", workerCwd: "", cwd: "/tmp" },
+	{ label: "blank", workerCwd: " \t ", cwd: "/tmp" },
+	{ label: "untrimmed", workerCwd: " /workspace/live ", cwd: " /workspace/live " },
+]) {
+	test(`baseline tool re-adoption uses ${row.label} live CWD contract`, async (t) => {
+		const h = await commandHarness(t, { branch: teamBranch({ teamMode: true }), workerCwd: row.workerCwd });
+		const result = await h.executeTool("CreateAgentPanel", { name: "scout" });
+		assertCreation(h, result, { name: "agent-scout", paneId: "worker-pane", cwd: row.cwd, adopted: true, how: "re-adopted existing pane", text: "Worker agent-scout ready in pane worker-pane (re-adopted existing pane).\n" + SCOUT_UNTASKED }, { cwd: "/tmp", model: "test/model" });
+		assert.deepEqual(h.writtenEnvelopes, [], "a non-listening existing worker can still be re-adopted");
+	});
+}
+
+test("baseline tool name truncation leaves room for collision suffixes", async (t) => {
+	const h = await commandHarness(t, {
+		branch: teamBranch({ teamMode: true }), model: null,
+		agents: [{ pane_id: "taken", name: "agent-abcdefghijklmnopqrstuvwxyz" }],
+	});
+	const result = await h.executeTool("CreateAgentPanel", { name: "abcdefghijklmnopqrstuvwxyz123456" });
+	assertCreation(h, result, {
+		name: "agent-abcdefghijklmnopqrstuvwx-2",
+		text: 'Worker agent-abcdefghijklmnopqrstuvwx-2 ready in pane new-pane (new column right).\nNo initial brief given; use SendToAgent({ target_id: "agent-abcdefghijklmnopqrstuvwx-2", \u2026 }) to task it.',
+	}, { cwd: "/tmp" });
+	assert.equal(h.execCalls.find((args) => args[1] === "start")?.[2], "agent-abcdefghijklmnopqrstuvwx-2");
+});
+
+test("baseline tool does not re-adopt a requested worker in another tab", async (t) => {
+	const h = await commandHarness(t, {
+		branch: teamBranch({ teamMode: true }), model: null,
+		agents: [{ pane_id: "foreign-pane", name: "agent-scout", tab_id: "other-tab" }],
+		execOverride: (args) => args[1] === "get" && args[2] === "agent-scout"
+			? { code: 0, stdout: '{"result":{"agent":{"pane_id":"foreign-pane","name":"agent-scout","tab_id":"other-tab"}}}', stderr: "" }
+			: undefined,
+	});
+	const result = await h.executeTool("CreateAgentPanel", { name: "scout" });
+	assertCreation(h, result, {
+		name: "agent-scout-2",
+		text: 'Worker agent-scout-2 ready in pane new-pane (new column right).\nNo initial brief given; use SendToAgent({ target_id: "agent-scout-2", \u2026 }) to task it.',
+	}, { cwd: "/tmp" });
+	assert.deepEqual(h.writtenEnvelopes, []);
+});
+
+test("baseline tool creation names an unnamed orchestrator before launching its worker", async (t) => {
+	let renamed = false;
+	const h = await commandHarness(t, {
+		branch: teamBranch({ teamMode: true }), selfName: "", model: null,
+		execOverride: (args) => {
+			if (args[1] === "rename") renamed = true;
+			if (renamed && args[1] === "get" && args[2] === "self-pane") {
+				return { code: 0, stdout: '{"result":{"agent":{"pane_id":"self-pane","name":"orchestrator","tab_id":"tab-1"}}}', stderr: "" };
+			}
+		},
+	});
+	const result = await h.executeTool("CreateAgentPanel", { name: "builder" });
+	assertCreation(h, result, { name: "agent-builder", text: "Worker agent-builder ready in pane new-pane (new column right).\n" + BUILDER_UNTASKED }, { cwd: "/tmp" });
+	assert.deepEqual(h.execCalls.find((args) => args[1] === "rename"), ["agent", "rename", "self-pane", "orchestrator"]);
+	const start = h.execCalls.find((args) => args[1] === "start")!;
+	assert.equal(start[start.indexOf("--orchestrated-by") + 1], "orchestrator");
+	assert.ok(h.timeline.indexOf("exec:agent:rename") < h.timeline.indexOf("exec:pane:split"));
+});
+
+for (const row of [
+	{ label: "invalid name", params: { name: "  Bad Name  " }, message: 'Invalid worker name "bad name" (use [a-z][a-z0-9_-]{0,31}; not add/list/release/from/status/help/adopt/right/down/left/up)' },
+	{ label: "overlong name", params: { name: "abcdefghijklmnopqrstuvwxyz1234567" }, message: 'Invalid worker name "abcdefghijklmnopqrstuvwxyz1234567" (use [a-z][a-z0-9_-]{0,31}; not add/list/release/from/status/help/adopt/right/down/left/up)' },
+	{ label: "reserved type name", params: { type: " UP " }, message: 'Invalid worker name "up" (use [a-z][a-z0-9_-]{0,31}; not add/list/release/from/status/help/adopt/right/down/left/up)' },
+	{ label: "relative CWD", params: {}, contextCwd: "relative", message: "Worker cwd must be an absolute accessible directory." },
+	{ label: "missing CWD", params: {}, contextCwd: "/no-such-team-contract-directory", message: "Worker cwd must be an absolute accessible directory." },
+	{ label: "file CWD", params: {}, contextCwd: fileURLToPath(import.meta.url), message: "Worker cwd must be an absolute accessible directory." },
+]) {
+	test(`baseline tool rejects ${row.label} after progress but before registration`, async (t) => {
+		const h = await commandHarness(t, { branch: teamBranch({ teamMode: true }), contextCwd: row.contextCwd });
+		const before = h.execCalls.length;
+		await assert.rejects(h.executeTool("CreateAgentPanel", row.params), { message: row.message });
+		assert.deepEqual(h.partialToolUpdates, [{ id: "call", update: CREATE_PROGRESS }]);
+		assert.deepEqual(h.entries, []);
+		assert.deepEqual(h.execCalls.slice(before), []);
+		assert.deepEqual(h.writtenEnvelopes, []);
+	});
+}
+
+for (const row of [
+	{ label: "split stderr", stage: "split", response: { code: 1, stdout: "ignored stdout", stderr: "split failed: private path /tmp/worker" }, message: "split failed: private path /tmp/worker", lifecycle: [["uncertain", "pane_creation"]] },
+	{ label: "structured split error", stage: "split", response: { code: 1, stdout: "", stderr: '{"error":{"code":"SPLIT_DENIED","message":"private split detail"}}' }, message: "SPLIT_DENIED: private split detail", lifecycle: [["uncertain", "pane_creation"]] },
+	{ label: "split stdout fallback", stage: "split", response: { code: 1, stdout: "stdout split detail", stderr: "" }, message: "stdout split detail", lifecycle: [["uncertain", "pane_creation"]] },
+	{ label: "split exit fallback", stage: "split", response: { code: 9, stdout: "", stderr: "" }, message: "herdr pane split failed (exit 9)", lifecycle: [["uncertain", "pane_creation"]] },
+	{ label: "missing split identity", stage: "split", response: { code: 0, stdout: '{"result":{"unexpected":"detail"}}', stderr: "" }, message: 'pane split returned no pane id: {"result":{"unexpected":"detail"}}', lifecycle: [["uncertain", "pane_creation"]] },
+	{ label: "start", stage: "start", response: { code: 1, stdout: "", stderr: "start failed: private launch detail" }, message: "Started pane new-pane but agent start failed: start failed: private launch detail. Check `herdr pane read new-pane`.", lifecycle: [["uncertain", "agent_start"]] },
+	{ label: "new assignment", writeEnvelopeErrorForType: "message", message: "mailbox write failed", lifecycle: [["started", undefined], ["uncertain", "assignment_delivery"]] },
+	{ label: "re-adopted assignment", name: "scout", writeEnvelopeErrorForType: "message", message: "mailbox write failed", lifecycle: [["uncertain", "assignment_delivery"]] },
+]) {
+	test(`baseline tool preserves detailed ${row.label} failure`, async (t) => {
+		const h = await commandHarness(t, {
+			branch: teamBranch({ teamMode: true }), listening: true, writeEnvelopeErrorForType: row.writeEnvelopeErrorForType,
+			execOverride: (args) => row.stage && args[1] === row.stage ? row.response : undefined,
+		});
+		await assert.rejects(h.executeTool("CreateAgentPanel", { name: row.name ?? "builder", initial_prompt: "Do the work" }), { message: row.message });
+		assert.deepEqual(h.partialToolUpdates, [{ id: "call", update: CREATE_PROGRESS }]);
+		assert.equal(h.entries.filter((entry) => entry.type === RUN_REGISTRATION_ENTRY).length, 1);
+		assert.deepEqual(h.entries.filter((entry) => entry.type === LIFECYCLE_JOURNAL_ENTRY).map(({ data }) => [data.event.status, data.event.evidence.scope]), row.lifecycle);
+		assert.equal(h.execCalls.some((args) => ["close", "stop", "kill"].includes(args[1])), false);
+	});
+}
+
+test("baseline tool already-aborted creation emits progress but registers no run", async (t) => {
+	const h = await commandHarness(t, { branch: teamBranch({ teamMode: true }) });
+	const controller = new AbortController();
+	controller.abort(new Error("tool cancelled before registration"));
+	const before = h.execCalls.length;
+	await assert.rejects(h.executeTool("CreateAgentPanel", { name: "builder" }, controller.signal), { message: "tool cancelled before registration" });
+	assert.deepEqual(h.partialToolUpdates, [{ id: "call", update: CREATE_PROGRESS }]);
+	assert.deepEqual(h.entries, []);
+	assert.deepEqual(h.execCalls.slice(before), []);
+});
+
+test("baseline tool creation does not forward a distinct tool signal after queue entry", async (t) => {
+	const controller = new AbortController();
+	const h = await commandHarness(t, {
+		branch: teamBranch({ teamMode: true }), listening: true,
+		execOverride: (args, options) => {
+			if (args[1] === "split") {
+				controller.abort(new Error("tool cancelled during split"));
+				assert.equal(options.signal.aborted, false);
+			}
+		},
+	});
+	const result = await h.executeTool("CreateAgentPanel", { name: "builder", initial_prompt: "Continue assignment" }, controller.signal);
+	assertCreation(h, result, { name: "agent-builder", model: "test/model", initial_prompt: "Continue assignment", text: "Worker agent-builder ready in pane new-pane (new column right).\nModel: test/model\n" + BRIEF_DELIVERED }, { cwd: "/tmp", model: "test/model" });
+	assert.equal(h.execOptions.every((options) => !options.signal.aborted), true);
+	assert.equal(h.writtenEnvelopes.at(-1)?.envelope.message, "Continue assignment");
+});
+
+const SEND_MESSAGE = "  Inspect auth\nReport findings  ";
+const FRAMED_SEND_MESSAGE = '[agent] A message just arrived from another of your user\'s agents: Orchestrator "orchestrator" in pane self-pane.\nThis is another agent reaching out \u2014 not the user typing here. It arrived asynchronously, and your user can already see it in this chat.\n\nInspect auth\nReport findings\n\nIf it needs a reply or an action, handle it: reply to Orchestrator with SendToAgent (their id: orchestrator), which reaches them on a later turn \u2014 not a live back-and-forth. If it is just an FYI with nothing for you to do, it is fine to stay silent \u2014 no need to reply just to acknowledge it.';
+
+for (const fails of [false, true]) {
+	test(`baseline tool re-adopted brief uses prompt fallback, failure=${fails}`, async (t) => {
+		const h = await commandHarness(t, {
+			branch: teamBranch({ teamMode: true }),
+			execOverride: (args) => fails && args[1] === "prompt" ? { code: 1, stdout: "", stderr: "assignment prompt failed: private detail" } : undefined,
+		});
+		const creation = h.executeTool("CreateAgentPanel", { name: "scout", initial_prompt: SEND_MESSAGE });
+		if (fails) {
+			await assert.rejects(creation, { message: "assignment prompt failed: private detail" });
+			assert.deepEqual(h.partialToolUpdates, [{ id: "call", update: CREATE_PROGRESS }]);
+			assert.deepEqual(h.entries.filter((entry) => entry.type === LIFECYCLE_JOURNAL_ENTRY).map(({ data }) => [data.event.status, data.event.evidence.scope]), [["uncertain", "assignment_delivery"]]);
+		} else {
+			assertCreation(h, await creation, {
+				name: "agent-scout", paneId: "worker-pane", adopted: true, how: "re-adopted existing pane", initial_prompt: SEND_MESSAGE,
+				text: "Worker agent-scout ready in pane worker-pane (re-adopted existing pane).\n" + BRIEF_DELIVERED,
+			}, { cwd: "/tmp", model: "test/model" });
+		}
+		assert.deepEqual(h.execCalls.filter((args) => args[1] === "prompt"), [["agent", "prompt", "worker-pane", FRAMED_SEND_MESSAGE]]);
+		assert.deepEqual(h.writtenEnvelopes, []);
+	});
+}
+
+test("baseline tool bodies and purpose do not acquire RPC string limits", async (t) => {
+	const h = await commandHarness(t, { branch: teamBranch({ teamMode: true }), listening: true, model: null });
+	const purpose = "p".repeat(1025);
+	const body = "b".repeat(65537);
+	const created = await h.executeTool("CreateAgentPanel", { name: "builder", purpose, initial_prompt: body });
+	assertCreation(h, created, {
+		name: "agent-builder", purpose, initial_prompt: body,
+		text: "Worker agent-builder ready in pane new-pane (new column right).\nRole: " + purpose + "\n" + BRIEF_DELIVERED,
+	}, { cwd: "/tmp" });
+	const sent = await h.executeTool("SendToAgent", { target_id: "agent-builder", message: body });
+	assert.deepEqual(sent, {
+		content: [{ type: "text", text: "Delivered to agent-builder (pane new-pane, idle) via inbox as follow-up. Replies arrive on a later turn." }],
+		details: { target: "agent-builder", message: body, priority: false, status: "Delivered to agent-builder (pane new-pane, idle) via inbox as follow-up. Replies arrive on a later turn." },
+	});
+	assert.equal(h.writtenEnvelopes.length, 2);
+	assert.equal(h.writtenEnvelopes[0].envelope.message, body);
+	assert.equal(h.writtenEnvelopes[1].envelope.message, body);
+});
+
+for (const priority of [undefined, false, true]) {
+	for (const listening of [false, true]) {
+		for (const target of ["agent-scout", "worker-pane"]) {
+			test(`baseline tool send selector=${target} priority=${priority} listening=${listening}`, async (t) => {
+				const h = await commandHarness(t, { branch: teamBranch({ workers: ["agent-scout"] }), listening });
+				const result = await h.executeTool("SendToAgent", { target_id: target, message: SEND_MESSAGE, ...(priority === undefined ? {} : { priority }) });
+				const text = listening
+					? priority ? "Delivered to agent-scout (pane worker-pane, idle) via inbox as steer (priority). Replies arrive on a later turn." : "Delivered to agent-scout (pane worker-pane, idle) via inbox as follow-up. Replies arrive on a later turn."
+					: "Typed into agent-scout (pane worker-pane, pi, no inbox listener) via `herdr agent prompt`. Priority flag not applicable there.";
+				assert.deepEqual(result, { content: [{ type: "text", text }], details: { target, priority: priority ?? false, message: SEND_MESSAGE, status: text } });
+				assert.deepEqual(h.partialToolUpdates, []);
+				assert.deepEqual(h.entries, [], "ordinary messaging creates no assignment or terminal evidence");
+				if (listening) {
+					assert.deepEqual(h.writtenEnvelopes.map(({ paneId, envelope }) => ({ paneId, envelope: { ...envelope, ts: 0 } })), [{
+						paneId: "worker-pane", envelope: { type: "message", from: { id: "orchestrator", paneId: "self-pane", name: "orchestrator", role: "orchestrator" }, message: SEND_MESSAGE, priority: priority ?? false, ts: 0 },
+					}]);
+					assert.deepEqual(h.execCalls.filter((args) => args[1] === "prompt"), []);
+				} else {
+					assert.deepEqual(h.writtenEnvelopes, []);
+					const index = h.execCalls.findIndex((args) => args[1] === "prompt");
+					assert.deepEqual(h.execCalls[index], ["agent", "prompt", "worker-pane", FRAMED_SEND_MESSAGE]);
+					assert.equal(h.execOptions[index].timeout, 20000);
+				}
+			});
+		}
+	}
+}
+
+for (const row of [
+	{ label: "missing status", agent: { pane_id: "worker-pane", name: "agent-scout", agent: "pi" }, listening: true, text: "Delivered to agent-scout (pane worker-pane, unknown) via inbox as follow-up. Replies arrive on a later turn." },
+	{ label: "missing kind and name", agent: { pane_id: "worker-pane" }, listening: true, text: "Typed into worker-pane (pane worker-pane, agent, no inbox listener) via `herdr agent prompt`. Priority flag not applicable there." },
+	{ label: "other agent kind", agent: { pane_id: "worker-pane", name: "agent-scout", agent: "claude" }, listening: true, text: "Typed into agent-scout (pane worker-pane, claude, no inbox listener) via `herdr agent prompt`. Priority flag not applicable there." },
+]) {
+	test(`baseline tool send receipt handles ${row.label}`, async (t) => {
+		const h = await commandHarness(t, {
+			branch: teamBranch({ workers: ["worker-pane"] }), listening: row.listening,
+			execOverride: (args) => args[1] === "get" && args[2] === "worker-pane" ? { code: 0, stdout: JSON.stringify({ result: { agent: row.agent } }), stderr: "" } : undefined,
+		});
+		const result = await h.executeTool("SendToAgent", { target_id: "worker-pane", message: "FYI" });
+		assert.deepEqual(result, { content: [{ type: "text", text: row.text }], details: { target: "worker-pane", message: "FYI", priority: false, status: row.text } });
+		assert.equal(h.writtenEnvelopes.length, row.label === "missing status" ? 1 : 0);
+	});
+}
+
+for (const row of [
+	{ label: "missing target with empty roster", target: "missing", state: {}, agents: [], message: 'No live herdr agent "missing". Known agents: (none)' },
+	{ label: "missing target with team context", target: "missing", state: { workers: ["agent-scout"], orchestratedBy: "boss" }, agents: [{ pane_id: "worker-pane", name: "agent-scout" }, { pane_id: "unnamed-pane" }], message: 'No live herdr agent "missing". Known agents: agent-scout, unnamed-pane. Your workers: agent-scout. Your orchestrator: boss' },
+	{ label: "self", target: "self-pane", state: { workers: ["agent-scout"] }, message: "Refusing to send a message to yourself." },
+	{ label: "outside empty team", target: "agent-scout", state: {}, message: '"agent-scout" is not in your team (it would drop the message anyway). Workers: (none); orchestrator: (none). Use /team add or /team adopt first.' },
+	{ label: "outside populated team", target: "agent-scout", state: { workers: ["agent-other"], orchestratedBy: "boss" }, message: '"agent-scout" is not in your team (it would drop the message anyway). Workers: agent-other; orchestrator: boss. Use /team add or /team adopt first.' },
+	{ label: "Herdr prompt failure", target: "agent-scout", state: { workers: ["agent-scout"] }, fail: true, message: "PROMPT_FAILED: private prompt detail" },
+]) {
+	test(`baseline tool send exposes detailed ${row.label} error`, async (t) => {
+		const h = await commandHarness(t, {
+			branch: teamBranch(row.state), agents: row.agents,
+			execOverride: (args) => row.fail && args[1] === "prompt" ? { code: 1, stdout: "", stderr: '{"error":{"code":"PROMPT_FAILED","message":"private prompt detail"}}' } : undefined,
+		});
+		await assert.rejects(h.executeTool("SendToAgent", { target_id: row.target, message: "FYI" }), { message: row.message });
+		assert.deepEqual(h.partialToolUpdates, []);
+		assert.deepEqual(h.writtenEnvelopes, []);
+		assert.deepEqual(h.entries, []);
+	});
+}
+
+for (const listening of [true, false]) {
+	test(`baseline tool already-aborted send preserves ${listening ? "inbox publication" : "lookup then prompt cancellation"}`, async (t) => {
+		const h = await commandHarness(t, { branch: teamBranch({ workers: ["agent-scout"] }), listening });
+		const controller = new AbortController();
+		controller.abort(new Error("send cancelled"));
+		const before = h.execCalls.length;
+		const send = h.executeTool("SendToAgent", { target_id: "agent-scout", message: "FYI" }, controller.signal);
+		if (listening) {
+			assert.deepEqual(await send, {
+				content: [{ type: "text", text: "Delivered to agent-scout (pane worker-pane, idle) via inbox as follow-up. Replies arrive on a later turn." }],
+				details: { target: "agent-scout", message: "FYI", priority: false, status: "Delivered to agent-scout (pane worker-pane, idle) via inbox as follow-up. Replies arrive on a later turn." },
+			});
+			assert.equal(h.writtenEnvelopes.length, 1);
+		} else {
+			await assert.rejects(send, { message: "send cancelled" });
+			assert.deepEqual(h.writtenEnvelopes, []);
+		}
+		assert.deepEqual(h.execCalls.slice(before), [["agent", "get", "agent-scout"]]);
+		assert.equal(h.execOptions.at(-1)?.signal.aborted, false, "target lookup uses context signal, not tool signal");
+	});
+}
+
+test("baseline tool send forwards cancellation to an in-progress prompt fallback", async (t) => {
+	const controller = new AbortController();
+	const h = await commandHarness(t, {
+		branch: teamBranch({ workers: ["agent-scout"] }),
+		execOverride: (args, options) => {
+			if (args[1] !== "prompt") return;
+			assert.equal(options.timeout, 20000);
+			assert.equal(options.signal.aborted, false);
+			controller.abort(new Error("cancel prompt now"));
+			assert.equal(options.signal.aborted, true);
+			assert.equal(options.signal.reason, controller.signal.reason);
+			return { code: 0, stdout: '{"result":{}}', stderr: "" };
+		},
+	});
+	await assert.rejects(h.executeTool("SendToAgent", { target_id: "agent-scout", message: SEND_MESSAGE }, controller.signal), { message: "cancel prompt now" });
+	assert.deepEqual(h.execCalls.find((args) => args[1] === "prompt"), ["agent", "prompt", "worker-pane", FRAMED_SEND_MESSAGE]);
+	assert.equal(h.ctx.signal.aborted, false);
+	assert.deepEqual(h.entries, []);
+});
+
+type ThemeCall = ["bold", string] | ["fg", string, string];
+function rendererTheme() {
+	const calls: ThemeCall[] = [];
+	return {
+		calls,
+		theme: {
+			bold(text: string) { calls.push(["bold", text]); return `<bold>${text}</bold>`; },
+			fg(token: string, text: string) { calls.push(["fg", token, text]); return `<${token}>${text}</${token}>`; },
+		},
+	};
+}
+
+function assertRendered(component: { render(width: number): string[] }, expected: string) {
+	// Text pads each line to the host width. Keep extension text, including spaces, exact.
+	assert.deepEqual(component.render(4096), expected ? expected.split("\n").map((line) => line.padEnd(4096)) : []);
+}
+
+for (const row of [
+	{ tool: "CreateAgentPanel", label: "default call", args: {}, text: "<toolTitle><bold>CreateAgentPanel</bold></toolTitle> <accent>agent-N</accent>", calls: [["bold", "CreateAgentPanel"], ["fg", "toolTitle", "<bold>CreateAgentPanel</bold>"], ["fg", "accent", "agent-N"]] },
+	{ tool: "CreateAgentPanel", label: "type call", args: { type: "explore" }, text: "<toolTitle><bold>CreateAgentPanel</bold></toolTitle> <accent>agent-explore</accent> <muted>type=explore</muted>", calls: [["bold", "CreateAgentPanel"], ["fg", "toolTitle", "<bold>CreateAgentPanel</bold>"], ["fg", "accent", "agent-explore"], ["fg", "muted", "type=explore"]] },
+	{ tool: "CreateAgentPanel", label: "un-normalized explicit call", args: { name: "agent-Mixed", direction: "up", type: " Research ", model: "other/model", purpose: "hidden", thinking: "high", initial_prompt: "hidden" }, text: "<toolTitle><bold>CreateAgentPanel</bold></toolTitle> <accent>agent-agent-Mixed</accent> <muted>up</muted> <muted>type= Research </muted> <dim>other/model</dim>", calls: [["bold", "CreateAgentPanel"], ["fg", "toolTitle", "<bold>CreateAgentPanel</bold>"], ["fg", "accent", "agent-agent-Mixed"], ["fg", "muted", "up"], ["fg", "muted", "type= Research "], ["fg", "dim", "other/model"]] },
+	{ tool: "SendToAgent", label: "normal call", args: { target_id: "agent-scout", message: "hidden", priority: false }, text: "<toolTitle><bold>SendToAgent</bold></toolTitle><muted> \u2192 </muted><accent>agent-scout</accent>", calls: [["fg", "muted", " \u2192 "], ["bold", "SendToAgent"], ["fg", "toolTitle", "<bold>SendToAgent</bold>"], ["fg", "accent", "agent-scout"]] },
+	{ tool: "SendToAgent", label: "priority call", args: { target_id: "worker-pane", priority: true }, text: "<toolTitle><bold>SendToAgent</bold></toolTitle><warning> \u21e8 </warning><accent>worker-pane</accent><warning> (priority / steer)</warning>", calls: [["fg", "warning", " \u21e8 "], ["bold", "SendToAgent"], ["fg", "toolTitle", "<bold>SendToAgent</bold>"], ["fg", "accent", "worker-pane"], ["fg", "warning", " (priority / steer)"]] },
+	{ tool: "SendToAgent", label: "missing target call", args: {}, text: "<toolTitle><bold>SendToAgent</bold></toolTitle><muted> \u2192 </muted><accent>\u2026</accent>", calls: [["fg", "muted", " \u2192 "], ["bold", "SendToAgent"], ["fg", "toolTitle", "<bold>SendToAgent</bold>"], ["fg", "accent", "\u2026"]] },
+]) {
+	test(`baseline tool renderer ${row.tool} ${row.label}`, async (t) => {
+		const h = await commandHarness(t);
+		const { theme, calls } = rendererTheme();
+		assertRendered(h.tools.get(row.tool).renderCall(row.args, theme), row.text);
+		assert.deepEqual(calls, row.calls);
+	});
+}
+
+for (const row of [
+	{ tool: "CreateAgentPanel", label: "partial overrides error", result: CREATE_PROGRESS, isPartial: true, isError: true, text: "<dim>starting worker\u2026</dim>", calls: [["fg", "dim", "starting worker\u2026"]] },
+	{ tool: "SendToAgent", label: "partial overrides error", result: {}, isPartial: true, isError: true, text: "<dim>sending\u2026</dim>", calls: [["fg", "dim", "sending\u2026"]] },
+	{ tool: "CreateAgentPanel", label: "multi-block error", result: { content: [{ type: "text", text: "split failed" }, { type: "image" }, { type: "text", text: "private detail" }], details: { initial_prompt: "not shown", purpose: "not shown" } }, isError: true, text: "<error>split failed\n\nprivate detail</error>", calls: [["fg", "error", "split failed\n\nprivate detail"]] },
+	{ tool: "SendToAgent", label: "multi-block error", result: { content: [{ type: "text", text: "send failed" }, { type: "image" }, { type: "text", text: "private detail" }], details: { message: "not shown", status: "not shown" } }, isError: true, text: "<error>send failed\n\nprivate detail</error>", calls: [["fg", "error", "send failed\n\nprivate detail"]] },
+	{ tool: "SendToAgent", label: "missing error content", result: {}, isError: true, text: "<error>failed</error>", calls: [["fg", "error", "failed"]] },
+	{ tool: "CreateAgentPanel", label: "missing error content", result: {}, isError: true, text: "<error></error>", calls: [["fg", "error", ""]] },
+	{ tool: "CreateAgentPanel", label: "success without details", result: { content: [{ type: "text", text: "Ready" }] }, text: "<success>Ready</success>", calls: [["fg", "success", "Ready"]] },
+	{ tool: "SendToAgent", label: "message fallback from context", result: { details: { status: "Receipt" } }, args: { message: "Context line\nSecond" }, text: "<accent>\u2502 </accent>Context line\n<accent>\u2502 </accent>Second\n<dim>Receipt</dim>", calls: [["fg", "accent", "\u2502 "], ["fg", "accent", "\u2502 "], ["fg", "dim", "Receipt"]] },
+	{ tool: "SendToAgent", label: "empty details message wins over context", result: { details: { message: "" } }, args: { message: "Not shown" }, text: "<accent>\u2502 </accent>", calls: [["fg", "accent", "\u2502 "]] },
+	{ tool: "SendToAgent", label: "absent message and context", result: {}, text: "<accent>\u2502 </accent>", calls: [["fg", "accent", "\u2502 "]] },
+] as Array<{ tool: string; label: string; result: any; args?: any; isPartial?: boolean; isError?: boolean; text: string; calls: string[][] }>) {
+	test(`baseline tool renderer ${row.tool} ${row.label}`, async (t) => {
+		const h = await commandHarness(t);
+		const { theme, calls } = rendererTheme();
+		assertRendered(h.tools.get(row.tool).renderResult(row.result, { expanded: false, isPartial: row.isPartial ?? false }, theme, { args: row.args, isError: row.isError ?? false }), row.text);
+		assert.deepEqual(calls, row.calls);
+	});
+}
+
+const RENDER_LINES = ["first", "", "third", "fourth", "fifth", "sixth", "seventh", "eighth", "ninth", "tenth", "eleventh", "twelfth", "thirteenth", "fourteenth", ""];
+for (const tool of ["CreateAgentPanel", "SendToAgent"]) {
+	for (const expanded of [false, true]) {
+		for (const { length, collapsedLines, omitted } of tool === "CreateAgentPanel"
+			? [{ length: 8, collapsedLines: 8, omitted: 0 }, { length: 9, collapsedLines: 8, omitted: 1 }, { length: 15, collapsedLines: 8, omitted: 7 }]
+			: [{ length: 12, collapsedLines: 12, omitted: 0 }, { length: 13, collapsedLines: 12, omitted: 1 }, { length: 15, collapsedLines: 12, omitted: 3 }]) {
+			test(`baseline tool renderer ${tool} ${expanded ? "expanded" : "collapsed"} ${length}-line result`, async (t) => {
+				const h = await commandHarness(t);
+				const { theme, calls } = rendererTheme();
+				const lines = RENDER_LINES.slice(0, length);
+				const create = tool === "CreateAgentPanel";
+				const shown = lines.slice(0, expanded ? length : collapsedLines);
+				const body = shown.map((line) => `<accent>\u2502 </accent>${line}`).join("\n");
+				const more = expanded ? 0 : omitted;
+				const result = create
+					? { content: [{ type: "text", text: "Worker ready" }], details: { purpose: "Map auth", initial_prompt: lines.join("\n") } }
+					: { content: [{ type: "text", text: "Not the displayed body" }], details: { message: lines.join("\n"), status: "Delivered" } };
+				assertRendered(h.tools.get(tool).renderResult(result, { expanded, isPartial: false }, theme, { args: { message: "Not used" }, isError: false }),
+					(create ? "<success>Worker ready</success>\n<muted>purpose: Map auth</muted>\n" : "") + body
+					+ (more ? `\n<dim>\u2502 \u2026 ${more} more lines</dim>` : "") + (create ? "" : "\n<dim>Delivered</dim>"));
+				assert.deepEqual(calls, [
+					...(create ? [["fg", "success", "Worker ready"], ["fg", "muted", "purpose: Map auth"]] : []),
+					...shown.map(() => ["fg", "accent", "\u2502 "]),
+					...(more ? [["fg", "dim", `\u2502 \u2026 ${more} more lines`]] : []),
+					...(create ? [] : [["fg", "dim", "Delivered"]]),
+				]);
+			});
+		}
+	}
+}
 
 test("registers once, exposes live availability, and disposes on shutdown", async () => {
 	const h = await harness();
