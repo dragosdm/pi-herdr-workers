@@ -2,6 +2,16 @@
 
 The Herdr worker extension exposes a versioned JSON request/reply protocol over Pi's process-local `pi.events` bus. It lets another extension discover one provider and call worker operations without a model turn. This is an event-bus contract, not a package import API or a network protocol.
 
+## Shared operations and adapter contracts
+
+The extension's closure-local `workerService` owns spawn, send, and inspect. `CreateAgentPanel` and `SendToAgent` call that service directly; the RPC server calls a thin `rpcService` adapter. Spawn uses the existing `spawnWorker` implementation and one creation queue for both entry points. Registration still occurs before queue entry, and a rejected creation does not block later requests. Team state, journals, mailbox delivery, and lifecycle rules remain inside their existing components.
+
+`/team add` submits the existing instruction for a later model tool call, with follow-up delivery when Pi is busy. It does not call the service directly. Relationship commands keep their existing handlers. Tool activation and RPC availability remain separate policies; a ready interactive provider need not have team mode enabled.
+
+Local tools preserve detailed errors and presentation fields. Creation details include `how` and the original snake-case `initial_prompt`. Send details are exactly `{ target, priority, message, status }`, where `target` is the original selector and `status` is receipt text. They do not acquire a nested delivery receipt or the RPC string limits.
+
+The RPC spawn adapter explicitly returns required fields `runId`, `name`, `paneId`, `cwd`, and `adopted`, plus `correlationId`, `model`, `type`, and `purpose` only when defined. It never spreads the internal creation result. Wire replies omit `how`, `initial_prompt`, `initialPrompt`, and message-body echoes. Result validation accepts unknown fields and does not strip them, so this allowlist is required. The existing `WorkerRpcService.spawn(input, provenance, signal?)` signature stays unchanged; the adapter maps it to the internal argument order. The server supplies no cancellation signal.
+
 ## Channels and replies
 
 Protocol 1 defines five request channels:
@@ -192,7 +202,7 @@ All payloads are runtime validated before dispatch. IDs (`requestId` and `provid
 
 The character limits are structural protocol-v1 constraints. Because UTF-8 uses one to four bytes per character, `message` and `initialPrompt` also have an explicit 65,536-byte UTF-8 ceiling. Requests must satisfy both limits before provider routing, availability checks, or service dispatch.
 
-Unknown object fields are ignored for forward compatibility. Known fields retain their version-1 meaning and limits. New protocol versions should be added to probe negotiation rather than silently changing version-1 behavior.
+Unknown request fields validate for forward compatibility and are dropped when the server constructs service inputs. Result validators also accept unknown fields but do not remove them; the concrete RPC adapter must project public fields explicitly. Known fields retain their version-1 meaning and limits. New protocol versions should be added to probe negotiation rather than silently changing version-1 behavior.
 
 Successful probe, spawn, send, and inspect data is runtime validated against its operation-specific protocol-v1 shape. Providers validate service results before emitting them; malformed internal results become the fixed `INTERNAL_ERROR` response. The bundled client validates successful data independently before returning it. A malformed addressed success rejects with a client-only `RpcProtocolError` whose code is `INVALID_RESPONSE` and whose fixed message is `The worker provider returned an invalid response.` Provider payload details and schema diagnostics are not exposed.
 
@@ -226,3 +236,16 @@ const result = await new Promise((resolve, reject) => {
 ```
 
 Validate replies in the calling extension, select an available provider, then repeat the listener-before-emit pattern on the chosen operation channel.
+
+## Compatibility verification
+
+The baseline is checkout `112410ca26e8a95b0c4f3b4e5b9fa81899313e4a`, not all historical releases. Registered-adapter tests preserve command/tool expectations and compare shared effects using fresh fixtures, mocked Herdr, journals, mailbox callbacks, and the process-local bus. They exercise mixed tool/RPC queue ordering, continuation after rejection, queued tool abort, and a real `WorkerRpcClient` abort followed by provider completion and a late reply. Existing cases protect inspect authorization, fixed provider capabilities, reload generations, stale-provider no-ops, and listener disposal.
+
+```sh
+node --import tsx --test tests/extensions/herdr-worker-adapter.test.ts tests/rpc/*.test.ts
+npm run typecheck
+npm test
+git diff --check
+```
+
+This tests the generic process-local protocol, not an external `pi-rpi` integration. The real-Pi 0.84.4 suite covers queues and storage separately, without synthetic model tool calls. A live Herdr release check requires explicit pane-creation approval and a separate record of revision, Pi/Herdr versions, environment, and results. It remains pending until approved and performed; automated verification is not evidence that it passed.

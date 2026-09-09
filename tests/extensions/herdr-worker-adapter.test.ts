@@ -5,7 +5,8 @@ import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { LIFECYCLE_JOURNAL_ENTRY } from "../../lifecycle/acceptor.js";
 import { LIFECYCLE_CHANNELS, type AcceptedLifecycleEvent } from "../../lifecycle/protocol.js";
-import { CHANNELS, replyChannel, type DeliveryReceipt, type Inspection, type RpcReply, type WorkerReference } from "../../rpc/protocol.js";
+import { RpcAbortError, WorkerRpcClient } from "../../rpc/client.js";
+import { CHANNELS, replyChannel, type DeliveryReceipt, type Inspection, type ProbeData, type RpcReply, type SendInput, type SpawnInput, type WorkerReference } from "../../rpc/protocol.js";
 import { RECONCILIATION_CHANNELS, reconciliationReplyChannel, type ReconciliationReply } from "../../reconciliation/protocol.js";
 import { RUN_QUERY_CHANNELS, runQueryReplyChannel, type RunQueryReply, type WorkerRunRecordV1 } from "../../runs/protocol.js";
 import { RUN_ENDPOINT_BINDING_ENTRY, RUN_REGISTRATION_ENTRY } from "../../runs/registry.js";
@@ -36,6 +37,8 @@ async function harness(options: {
 	mode?: string;
 	model?: { provider: string; id: string } | null;
 	activeTools?: string[];
+	splitPaneIds?: string[];
+	onAppend?: (type: string, data: any) => void;
 } = {}) {
 	const { default: herdrWorker } = await import("../../extensions/herdr-worker.js");
 	const timeline: string[] = [];
@@ -58,7 +61,8 @@ async function harness(options: {
 	const writtenEnvelopes: Array<{ paneId: string; envelope: any }> = [];
 	const sentMessages: Array<{ message: any; options: any }> = [];
 	const agentGetTargets: string[] = [];
-	const startedAgents = new Set<string>();
+	const startedAgents = new Map<string, string>();
+	let splitCount = 0;
 	let inboxHandler: ((envelope: unknown, envelopeId: string) => Promise<void>) | undefined;
 	let activeTools: string[] = [...(options.activeTools ?? [])];
 	const pi: any = {
@@ -82,6 +86,7 @@ async function harness(options: {
 			entries.push({ type, data });
 			sessionEntries.push({ type: "custom", customType: type, data });
 			timeline.push(`append:${type}`);
+			options.onAppend?.(type, data);
 		},
 		sendMessage(message: any, messageOptions: any) { sentMessages.push({ message, options: messageOptions }); },
 		sendUserMessage(...args: [string, { deliverAs: "followUp" }?]) { sentUserMessages.push(args); },
@@ -99,11 +104,11 @@ async function harness(options: {
 		timeline.push(`exec:${args[0]}:${args[1] ?? ""}`);
 		const overridden = await options.execOverride?.(args, callOptions);
 		if (overridden !== undefined) {
-			if (args[0] === "agent" && args[1] === "start" && overridden.code === 0) startedAgents.add(args[2]);
+			if (args[0] === "agent" && args[1] === "start" && overridden.code === 0) startedAgents.set(args[2], args[args.indexOf("--pane") + 1]);
 			return overridden;
 		}
 		if (args[0] === "pane" && args[1] === "layout") return { code: 0, stdout: JSON.stringify({ result: { layout: { panes: [] } } }), stderr: "" };
-		if (args[0] === "pane" && args[1] === "split") return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "new-pane" } } }), stderr: "" };
+		if (args[0] === "pane" && args[1] === "split") return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: options.splitPaneIds?.[splitCount++] ?? "new-pane" } } }), stderr: "" };
 		if (args[0] === "agent" && args[1] === "get") {
 			const target = args[2];
 			agentGetTargets.push(target);
@@ -111,7 +116,7 @@ async function harness(options: {
 				? { pane_id: "self-pane", tab_id: "tab-1", name: options.selfName ?? "orchestrator", agent: "pi", cwd: "/tmp" }
 				: (target === "agent-scout" || target === "worker-pane" || startedAgents.has(target)) && !options.missingAgents?.includes(target)
 					? {
-						pane_id: startedAgents.has(target) ? "new-pane" : "worker-pane", tab_id: "tab-1", name: startedAgents.has(target) ? target : "agent-scout", agent: "pi", agent_status: "idle",
+						pane_id: startedAgents.get(target) ?? "worker-pane", tab_id: "tab-1", name: startedAgents.has(target) ? target : "agent-scout", agent: "pi", agent_status: "idle",
 						...(options.workerCwd === null ? {} : { cwd: options.workerCwd ?? "/tmp" }),
 					}
 					: target === "boss" && !options.missingAgents?.includes(target)
@@ -120,7 +125,7 @@ async function harness(options: {
 			return { code: agent ? 0 : 1, stdout: agent ? JSON.stringify({ result: { agent } }) : "", stderr: agent ? "" : "missing" };
 		}
 		if (args[0] === "agent" && args[1] === "list") return { code: 0, stdout: JSON.stringify({ result: { agents: options.agents ?? [] } }), stderr: "" };
-		if (args[0] === "agent" && args[1] === "start") startedAgents.add(args[2]);
+		if (args[0] === "agent" && args[1] === "start") startedAgents.set(args[2], args[args.indexOf("--pane") + 1]);
 		return { code: 0, stdout: JSON.stringify({ result: {} }), stderr: "" };
 	}
 	const ctx: any = {
@@ -2210,4 +2215,514 @@ test("reload replaces the provider instance and stale addressed requests are no-
 	unsubscribe();
 	assert.equal(replied, false);
 	assert.equal(h.events.listenerCount(), 11);
+});
+
+type EntryAdapter = "tool" | "rpc";
+
+async function rpcAdapter(h: AdapterHarness) {
+	let sequence = 0;
+	const client = new WorkerRpcClient({ events: h.events, createRequestId: () => `paired-${++sequence}` });
+	const provider = await client.probe();
+	assert.equal(provider.available, true);
+	return { client, provider };
+}
+
+function spawnVia(h: AdapterHarness, rpc: Awaited<ReturnType<typeof rpcAdapter>>, adapter: EntryAdapter, input: SpawnInput, signal?: AbortSignal): Promise<any> {
+	if (adapter === "rpc") return rpc.client.spawn(input, rpc.provider, { signal });
+	const { cwd, correlationId, initialPrompt, ...params } = input;
+	assert.equal(cwd, h.ctx.cwd, "paired tool uses the same contextual CWD as RPC");
+	assert.equal(correlationId, undefined, "tool does not expose correlation");
+	return h.executeTool("CreateAgentPanel", { ...params, ...(initialPrompt === undefined ? {} : { initial_prompt: initialPrompt }) }, signal);
+}
+
+function externalCalls(h: AdapterHarness) {
+	return h.execCalls.filter((args) => (args[0] === "pane" && ["split", "swap"].includes(args[1]))
+		|| (args[0] === "agent" && ["rename", "start", "prompt"].includes(args[1])));
+}
+
+// Compare journals and effects only after checking the adapter-specific provenance.
+function sharedEffects(h: AdapterHarness, provider: ProbeData, adapter: EntryAdapter, correlationId?: string) {
+	const registrations = h.entries.filter((entry) => entry.type === RUN_REGISTRATION_ENTRY);
+	assert.ok(registrations.length <= 1);
+	const runId = registrations[0]?.data.runId;
+	const request = h.events.emissions.find(({ channel }) => channel === CHANNELS.spawn)?.payload as any;
+	if (request) {
+		assert.equal(adapter, "rpc");
+		assert.equal(request.providerInstanceId, provider.providerInstanceId);
+		assert.equal(request.correlationId, correlationId);
+	}
+	if (runId) {
+		assert.match(runId, /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+		assert.equal(registrations[0].data.requestId, request?.requestId);
+		assert.equal(Object.hasOwn(registrations[0].data, "requestId"), adapter === "rpc");
+		assert.equal(registrations[0].data.correlationId, correlationId);
+		for (const { data } of h.entries.filter((entry) => entry.type === "herdr-worker")) {
+			for (const meta of Object.values(data.meta ?? {}) as any[]) {
+				if (meta.runId !== runId) continue;
+				assert.equal(meta.requestId, request?.requestId);
+				assert.equal(meta.providerInstanceId, adapter === "rpc" ? provider.providerInstanceId : undefined);
+				assert.equal(meta.correlationId, correlationId);
+			}
+		}
+	}
+	const eventIds = new Map<string, string>();
+	function normalize(value: any, key?: string): any {
+		if (["registeredAt", "observedAt", "at", "ts"].includes(key ?? "")) {
+			assert.equal(typeof value, "number");
+			assert.ok(Number.isFinite(value));
+			return 0;
+		}
+		if (key === "runId") { assert.equal(value, runId); return "<run>"; }
+		if (key === "sourceInstanceId") { assert.equal(value, provider.providerInstanceId); return "<provider>"; }
+		if (key === "eventId") {
+			assert.match(value, /^[0-9a-f-]{36}$/);
+			if (!eventIds.has(value)) eventIds.set(value, `<event-${eventIds.size + 1}>`);
+			return eventIds.get(value);
+		}
+		if (Array.isArray(value)) return value.map((item) => normalize(item));
+		if (value && typeof value === "object") {
+			return Object.fromEntries(Object.entries(value).flatMap(([field, item]) => {
+				if (["requestId", "providerInstanceId", "correlationId"].includes(field)) {
+					assert.equal(item, field === "requestId" ? request?.requestId : field === "providerInstanceId" ? request?.providerInstanceId : correlationId);
+					return [];
+				}
+				return [[field, normalize(item, field)]];
+			}));
+		}
+		return value;
+	}
+	const calls = externalCalls(h).map((args) => {
+		const normalized = [...args];
+		if (args[1] === "start") {
+			assert.equal(args[args.indexOf("--worker-run-id") + 1], runId);
+			normalized[args.indexOf("--worker-run-id") + 1] = "<run>";
+			const index = args.indexOf("--worker-correlation-id");
+			assert.equal(index !== -1, correlationId !== undefined);
+			if (index !== -1) {
+				assert.equal(args[index + 1], correlationId);
+				normalized.splice(index, 2);
+			}
+		}
+		return normalized;
+	});
+	return {
+		entries: normalize(h.entries), calls, envelopes: normalize(h.writtenEnvelopes),
+		lifecycle: normalize(h.events.emissions.filter(({ channel }) => Object.values(LIFECYCLE_CHANNELS).includes(channel as any))),
+		timeline: h.timeline.filter((item) => item.startsWith("append:") || item.startsWith("publish:") || item.startsWith("envelope:")
+			|| ["exec:pane:split", "exec:pane:swap", "exec:agent:start", "exec:agent:prompt", "exec:agent:rename"].includes(item)
+			|| Object.values(LIFECYCLE_CHANNELS).some((channel) => item === `emit:${channel}`)),
+	};
+}
+
+function assertBefore(h: AdapterHarness, earlier: string, later: string) {
+	const first = h.timeline.indexOf(earlier);
+	const second = h.timeline.indexOf(later);
+	assert.ok(first >= 0 && second > first, `${earlier} must precede ${later}`);
+}
+
+function assertWireSpawn(result: WorkerReference, tool: any, correlationId?: string) {
+	assert.deepEqual(result, {
+		runId: result.runId, name: tool.details.name, paneId: tool.details.paneId, cwd: tool.details.cwd, adopted: tool.details.adopted,
+		...(correlationId === undefined ? {} : { correlationId }),
+		...(tool.details.model === undefined ? {} : { model: tool.details.model }),
+		...(tool.details.type === undefined ? {} : { type: tool.details.type }),
+		...(tool.details.purpose === undefined ? {} : { purpose: tool.details.purpose }),
+	});
+	assert.deepEqual(Object.keys(tool.details).sort(), ["runId", "correlationId", "name", "paneId", "cwd", "adopted", "model", "type", "purpose", "how", "initial_prompt"].sort());
+}
+
+for (const direction of ["right", "down", "left", "up"] as const) {
+	for (const stacked of [false, true]) {
+		test(`shared effects: fresh ${direction} creation, stacked=${stacked}`, async (t) => {
+			const vertical = direction === "left" || direction === "right";
+			const x = direction === "left" ? -10 : direction === "right" ? 10 : 0;
+			const y = direction === "up" ? -10 : direction === "down" ? 10 : 0;
+			const panes = stacked ? [
+				{ pane_id: "self-pane", rect: { x: 0, y: 0, width: 10, height: 10 } },
+				{ pane_id: "stack-first", rect: { x, y, width: 10, height: 10 } },
+				{ pane_id: "stack-last", rect: { x: vertical ? x : x + 10, y: vertical ? y + 10 : y, width: 10, height: 10 } },
+			] : [];
+			const input: SpawnInput = { cwd: "/", direction, type: " Research ", purpose: "  Map auth  ", thinking: "high", initialPrompt: SEND_MESSAGE };
+			const effects: ReturnType<typeof sharedEffects>[] = [];
+			let tool: any;
+			for (const adapter of ["tool", "rpc"] as const) {
+				const h = await commandHarness(t, {
+					branch: teamBranch({ teamMode: true }), contextCwd: "/", listening: true,
+					agents: panes.slice(1).map(({ pane_id }, index) => ({ pane_id, name: `agent-stack-${index}`, tab_id: "tab-1" })),
+					execOverride: (args) => args[1] === "layout" ? { code: 0, stdout: JSON.stringify({ result: { layout: { panes } } }), stderr: "" } : undefined,
+				});
+				const rpc = await rpcAdapter(h);
+				const correlationId = adapter === "rpc" ? "dispatch-paired" : undefined;
+				const result = await spawnVia(h, rpc, adapter, { ...input, ...(correlationId ? { correlationId } : {}) });
+				const details = adapter === "tool" ? result.details : result;
+				assert.equal(details.name, "agent-research");
+				assert.equal(details.model, "xai/grok-4.6");
+				assert.equal(details.type, "research");
+				assert.equal(details.purpose, "Map auth");
+				assert.deepEqual(h.entries.find(({ type }) => type === RUN_REGISTRATION_ENTRY)?.data.assignment, { cwd: "/", model: "xai/grok-4.6", role: "research" });
+				const endpoint = h.entries.find(({ type }) => type === RUN_ENDPOINT_BINDING_ENTRY)?.data;
+				assert.deepEqual([endpoint.runId, endpoint.agentName, endpoint.paneId], [details.runId, details.name, details.paneId]);
+				const start = h.execCalls.find((args) => args[1] === "start")!;
+				assert.deepEqual(start.slice(start.indexOf("--model")), ["--model", "xai/grok-4.6:high", "--team-role", "research: Map auth"]);
+				assert.deepEqual(h.execCalls.filter((args) => ["split", "swap"].includes(args[1])), [
+					["pane", "split", stacked ? "stack-last" : "self-pane", "--direction", stacked ? vertical ? "down" : "right" : vertical ? "right" : "down", "--cwd", "/", "--no-focus"],
+					...(!stacked && ["left", "up"].includes(direction) ? [["pane", "swap", "--source-pane", "self-pane", "--target-pane", "new-pane"]] : []),
+				]);
+				assertBefore(h, `append:${RUN_REGISTRATION_ENTRY}`, "exec:pane:split");
+				assertBefore(h, "exec:pane:split", `append:${RUN_ENDPOINT_BINDING_ENTRY}`);
+				assertBefore(h, `append:${RUN_ENDPOINT_BINDING_ENTRY}`, "exec:agent:start");
+				assertBefore(h, "exec:agent:start", `append:${LIFECYCLE_JOURNAL_ENTRY}`);
+				assertBefore(h, `append:${LIFECYCLE_JOURNAL_ENTRY}`, "envelope:message");
+				assert.equal(h.writtenEnvelopes[0].envelope.message, SEND_MESSAGE);
+				assert.equal(h.writtenEnvelopes[0].envelope.runId, details.runId);
+				if (adapter === "tool") tool = result;
+				else assertWireSpawn(result, tool, correlationId);
+				effects.push(sharedEffects(h, rpc.provider, adapter, correlationId));
+			}
+			assert.deepEqual(effects[1], effects[0]);
+		});
+	}
+}
+
+for (const row of [
+	{ label: "automatic collision and explicit model", input: { model: " other/model ", thinking: "max" }, options: { agents: [{ name: "agent-1", pane_id: "taken" }] }, name: "agent-2", model: "other/model" },
+	{ label: "context model and normalized name", input: { name: " BuIlDeR " }, options: {}, name: "agent-builder", model: "test/model" },
+	{ label: "no model or role", input: { thinking: "high" }, options: { model: null }, name: "agent-1", model: undefined },
+] satisfies Array<{ label: string; input: SpawnInput; options: Parameters<typeof harness>[0]; name: string; model?: string }>) {
+	test(`shared effects: ${row.label}`, async (t) => {
+		const effects = [];
+		let tool: any;
+		for (const adapter of ["tool", "rpc"] as const) {
+			const h = await commandHarness(t, { branch: teamBranch({ teamMode: true }), ...row.options });
+			const rpc = await rpcAdapter(h);
+			const result = await spawnVia(h, rpc, adapter, { cwd: "/tmp", ...row.input });
+			const details = adapter === "tool" ? result.details : result;
+			assert.equal(details.name, row.name);
+			assert.equal(details.model, row.model);
+			if (adapter === "tool") tool = result;
+			else assertWireSpawn(result, tool);
+			effects.push(sharedEffects(h, rpc.provider, adapter));
+		}
+		assert.deepEqual(effects[1], effects[0]);
+	});
+}
+
+for (const workerCwd of ["/workspace/live", null, "  "]) {
+	for (const saved of [false, true]) {
+		test(`shared effects: re-adoption cwd=${JSON.stringify(workerCwd)}, saved=${saved}`, async (t) => {
+			const effects = [];
+			let tool: any;
+			for (const adapter of ["tool", "rpc"] as const) {
+				const prior = { type: "review", purpose: "Keep charter", model: "saved/model" };
+				const h = await commandHarness(t, { contextCwd: "/", workerCwd, listening: true, branch: teamBranch({ teamMode: true, ...(saved ? { meta: { "agent-scout": prior } } : {}) }) });
+				const rpc = await rpcAdapter(h);
+				const correlationId = adapter === "rpc" ? "dispatch-adopted" : undefined;
+				const result = await spawnVia(h, rpc, adapter, { cwd: "/", name: " ScOuT ", type: "research", purpose: "Replace charter", model: "replace/model", initialPrompt: SEND_MESSAGE, ...(correlationId ? { correlationId } : {}) });
+				const details = adapter === "tool" ? result.details : result;
+				assert.equal(details.adopted, true);
+				assert.equal(details.cwd, workerCwd?.trim() ? workerCwd : "/");
+				assert.equal(details.paneId, "worker-pane");
+				assert.equal(details.model, saved ? prior.model : undefined);
+				assert.equal(details.type, saved ? prior.type : undefined);
+				assert.equal(details.purpose, saved ? prior.purpose : undefined);
+				assert.deepEqual(externalCalls(h), []);
+				assert.deepEqual(h.entries.filter(({ type }) => type === LIFECYCLE_JOURNAL_ENTRY), []);
+				assertBefore(h, `append:${RUN_REGISTRATION_ENTRY}`, `append:${RUN_ENDPOINT_BINDING_ENTRY}`);
+				assertBefore(h, `append:${RUN_ENDPOINT_BINDING_ENTRY}`, "append:herdr-worker");
+				assert.deepEqual(h.writtenEnvelopes.map(({ envelope }) => envelope.action ?? envelope.type), ["orchestrated-by", "bind-run", "message"]);
+				assert.equal(h.writtenEnvelopes[1].envelope.binding.runId, details.runId);
+				assert.equal(h.writtenEnvelopes[2].envelope.runId, details.runId);
+				if (adapter === "tool") tool = result;
+				else { assertWireSpawn(result, tool, correlationId); assert.notEqual(result.runId, tool.details.runId); }
+				effects.push(sharedEffects(h, rpc.provider, adapter, correlationId));
+			}
+			assert.deepEqual(effects[1], effects[0]);
+		});
+	}
+}
+
+for (const listening of [false, true]) {
+	for (const row of [
+		{ label: "default", input: {}, priority: false },
+		{ label: "legacy priority", input: { priority: true }, priority: true },
+		{ label: "follow-up overrides priority", input: { mode: "follow-up", priority: true }, priority: false },
+		{ label: "steer overrides priority", input: { mode: "steer", priority: false }, priority: true },
+	] satisfies Array<{ label: string; input: Partial<SendInput>; priority: boolean }>) {
+		test(`shared effects: send ${row.label}, listening=${listening}`, async (t) => {
+			const effects = [];
+			for (const adapter of ["tool", "rpc"] as const) {
+				const h = await commandHarness(t, { listening, branch: teamBranch({ workers: ["agent-scout"] }) });
+				const rpc = await rpcAdapter(h);
+				if (adapter === "tool") {
+					const result = await h.executeTool("SendToAgent", { target_id: "worker-pane", message: SEND_MESSAGE, priority: row.priority });
+					const status = listening
+						? `Delivered to agent-scout (pane worker-pane, idle) via inbox as ${row.priority ? "steer (priority)" : "follow-up"}. Replies arrive on a later turn.`
+						: "Typed into agent-scout (pane worker-pane, pi, no inbox listener) via `herdr agent prompt`. Priority flag not applicable there.";
+					assert.deepEqual(result, { content: [{ type: "text", text: status }], details: { target: "worker-pane", priority: row.priority, message: SEND_MESSAGE, status } });
+				} else {
+					assert.deepEqual(await rpc.client.send({ target: "worker-pane", message: SEND_MESSAGE, ...row.input }, rpc.provider), {
+						target: "agent-scout", paneId: "worker-pane", kind: "pi", status: "idle", transport: listening ? "inbox" : "herdr-prompt", requestedMode: row.priority ? "steer" : "follow-up", priorityApplied: listening && row.priority,
+					});
+				}
+				assert.deepEqual(h.entries, []);
+				assert.deepEqual(h.events.emissions.filter(({ channel }) => Object.values(LIFECYCLE_CHANNELS).includes(channel as any)), []);
+				if (listening) {
+					assert.equal(h.writtenEnvelopes[0].envelope.priority, row.priority);
+					assert.equal(h.writtenEnvelopes[0].envelope.message, SEND_MESSAGE);
+				} else assert.deepEqual(externalCalls(h), [["agent", "prompt", "worker-pane", FRAMED_SEND_MESSAGE]]);
+				effects.push(sharedEffects(h, rpc.provider, adapter));
+			}
+			assert.deepEqual(effects[1], effects[0]);
+		});
+	}
+}
+
+for (const row of [
+	{ label: "invalid name", input: { name: "bad name" }, error: 'Invalid worker name "bad name" (use [a-z][a-z0-9_-]{0,31}; not add/list/release/from/status/help/adopt/right/down/left/up)', statuses: [] },
+	{ label: "invalid cwd", cwd: "relative", error: "Worker cwd must be an absolute accessible directory.", statuses: [] },
+	{ label: "split failure", stage: "split", response: { code: 1, stdout: "", stderr: "private split failure" }, error: "private split failure", statuses: [["uncertain", "pane_creation"]] },
+	{ label: "missing pane identity", stage: "split", response: { code: 0, stdout: '{"result":{"private":"detail"}}', stderr: "" }, error: 'pane split returned no pane id: {"result":{"private":"detail"}}', statuses: [["uncertain", "pane_creation"]] },
+	{ label: "start failure", stage: "start", response: { code: 1, stdout: "", stderr: "private start failure" }, error: "Started pane new-pane but agent start failed: private start failure. Check `herdr pane read new-pane`.", statuses: [["uncertain", "agent_start"]] },
+	{ label: "assignment delivery", failDelivery: true, error: "mailbox write failed", statuses: [["started", undefined], ["uncertain", "assignment_delivery"]] },
+	{ label: "re-adopted assignment delivery", input: { name: "scout" }, failDelivery: true, error: "mailbox write failed", statuses: [["uncertain", "assignment_delivery"]] },
+]) {
+	test(`shared effects: ${row.label} retains detailed local and safe wire errors`, async (t) => {
+		const effects = [];
+		for (const adapter of ["tool", "rpc"] as const) {
+			const h = await commandHarness(t, {
+				branch: teamBranch({ teamMode: true }), contextCwd: row.cwd ?? "/tmp", listening: true,
+				writeEnvelopeErrorForType: row.failDelivery ? "message" : undefined,
+				execOverride: (args) => row.stage && args[1] === row.stage ? row.response : undefined,
+			});
+			const rpc = await rpcAdapter(h);
+			await assert.rejects(spawnVia(h, rpc, adapter, { cwd: h.ctx.cwd, name: "builder", initialPrompt: SEND_MESSAGE, ...row.input }), adapter === "tool"
+				? { message: row.error }
+				: { name: "RpcResponseError", code: "INTERNAL_ERROR", message: "The worker operation failed." });
+			if (adapter === "rpc") assert.deepEqual(h.events.emissions.find(({ channel }) => channel === replyChannel(CHANNELS.spawn, "paired-2"))?.payload, {
+				requestId: "paired-2", protocol: 1, success: false, error: { code: "INTERNAL_ERROR", message: "The worker operation failed." },
+			});
+			assert.deepEqual(h.entries.filter(({ type }) => type === LIFECYCLE_JOURNAL_ENTRY).map(({ data }) => [data.event.status, data.event.evidence.scope]), row.statuses);
+			if (row.statuses.length === 0) { assert.deepEqual(h.entries, []); assert.deepEqual(externalCalls(h), []); }
+			else assertBefore(h, `append:${RUN_REGISTRATION_ENTRY}`, `append:${LIFECYCLE_JOURNAL_ENTRY}`);
+			effects.push(sharedEffects(h, rpc.provider, adapter));
+		}
+		assert.deepEqual(effects[1], effects[0]);
+	});
+}
+
+function promiseGate() {
+	let release!: () => void;
+	const promise = new Promise<void>((resolve) => { release = resolve; });
+	return { promise, release };
+}
+
+for (const row of [
+	{ target: "missing", workers: ["agent-scout"], message: 'No live herdr agent "missing". Known agents: (none). Your workers: agent-scout', code: "NOT_FOUND", safe: "Target agent was not found." },
+	{ target: "self-pane", workers: ["agent-scout"], message: "Refusing to send a message to yourself.", code: "NOT_TEAM_MEMBER", safe: "Target is not a team member." },
+	{ target: "agent-scout", workers: [], message: '"agent-scout" is not in your team (it would drop the message anyway). Workers: (none); orchestrator: (none). Use /team add or /team adopt first.', code: "NOT_TEAM_MEMBER", safe: "Target is not a team member." },
+	{ target: "agent-scout", workers: ["agent-scout"], fail: true, message: "private prompt failure", code: "INTERNAL_ERROR", safe: "The worker operation failed." },
+]) {
+	test(`shared effects: send error ${row.code} for ${row.target}, prompt failure=${!!row.fail}`, async (t) => {
+		const effects = [];
+		for (const adapter of ["tool", "rpc"] as const) {
+			const h = await commandHarness(t, {
+				branch: teamBranch({ workers: row.workers }),
+				execOverride: (args) => row.fail && args[1] === "prompt" ? { code: 1, stdout: "", stderr: "private prompt failure" } : undefined,
+			});
+			const rpc = await rpcAdapter(h);
+			if (adapter === "tool") await assert.rejects(h.executeTool("SendToAgent", { target_id: row.target, message: SEND_MESSAGE }), { message: row.message });
+			else {
+				await assert.rejects(rpc.client.send({ target: row.target, message: SEND_MESSAGE }, rpc.provider), { code: row.code, message: row.safe });
+				assert.deepEqual(h.events.emissions.find(({ channel }) => channel === replyChannel(CHANNELS.send, "paired-2"))?.payload, {
+					requestId: "paired-2", protocol: 1, success: false, error: { code: row.code, message: row.safe },
+				});
+			}
+			assert.deepEqual(h.entries, []);
+			assert.deepEqual(h.writtenEnvelopes, []);
+			effects.push(sharedEffects(h, rpc.provider, adapter));
+		}
+		assert.deepEqual(effects[1], effects[0]);
+	});
+}
+
+for (const initialPrompt of [undefined, " \n ", SEND_MESSAGE]) {
+	test(`shared effects: re-adoption without an inbox, brief=${JSON.stringify(initialPrompt)}`, async (t) => {
+		const effects = [];
+		let tool: any;
+		for (const adapter of ["tool", "rpc"] as const) {
+			const h = await commandHarness(t, { branch: teamBranch({ teamMode: true }) });
+			const rpc = await rpcAdapter(h);
+			const result = await spawnVia(h, rpc, adapter, { cwd: "/tmp", name: "scout", ...(initialPrompt === undefined ? {} : { initialPrompt }) });
+			assert.deepEqual(h.writtenEnvelopes, []);
+			assert.equal(externalCalls(h).length, initialPrompt ? 1 : 0);
+			if (initialPrompt === SEND_MESSAGE) assert.deepEqual(externalCalls(h), [["agent", "prompt", "worker-pane", FRAMED_SEND_MESSAGE]]);
+			assert.deepEqual(h.entries.filter(({ type }) => type === LIFECYCLE_JOURNAL_ENTRY), []);
+			if (adapter === "tool") tool = result;
+			else assertWireSpawn(result, tool);
+			effects.push(sharedEffects(h, rpc.provider, adapter));
+		}
+		assert.deepEqual(effects[1], effects[0]);
+	});
+}
+
+for (const firstAdapter of ["tool", "rpc"] as const) {
+	for (const rejectFirst of [false, true]) {
+		test(`shared queue: ${firstAdapter} first, rejection=${rejectFirst}`, { timeout: 15_000 }, async (t) => {
+			const entered = promiseGate();
+			const blocked = promiseGate();
+			const registeredSecond = promiseGate();
+			let registrations = 0;
+			const h = await commandHarness(t, {
+				branch: teamBranch({ teamMode: true }), listening: true, splitPaneIds: ["first-pane", "second-pane"],
+				onAppend: (type) => { if (type === RUN_REGISTRATION_ENTRY && ++registrations === 2) registeredSecond.release(); },
+				execOverride: async (args) => {
+					if (args[1] === "start" && args[2] === "agent-first") {
+						entered.release();
+						await blocked.promise;
+						return { code: rejectFirst ? 1 : 0, stdout: '{"result":{}}', stderr: rejectFirst ? "first start failed" : "" };
+					}
+				},
+			});
+			const rpc = await rpcAdapter(h);
+			const operations: Promise<any>[] = [];
+			try {
+				operations.push(spawnVia(h, rpc, firstAdapter, { cwd: "/tmp", name: "first", initialPrompt: "First assignment" }).then(
+					(value) => { h.timeline.push("first:resolved"); return { value }; },
+					(error) => { h.timeline.push("first:rejected"); return { error }; },
+				));
+				await entered.promise;
+				operations.push(spawnVia(h, rpc, firstAdapter === "tool" ? "rpc" : "tool", { cwd: "/tmp", name: "second", initialPrompt: "Second assignment" }));
+				await registeredSecond.promise;
+				await new Promise<void>((resolve) => setImmediate(resolve));
+				assert.equal(h.entries.filter(({ type }) => type === RUN_REGISTRATION_ENTRY).length, 2, "both runs register before entering the queue");
+				assert.deepEqual(h.execCalls.filter((args) => args[1] === "split").map((args) => args[2]), ["self-pane"]);
+				assert.deepEqual(h.execCalls.filter((args) => args[1] === "start").map((args) => args[2]), ["agent-first"]);
+				blocked.release();
+				const [first, second] = await Promise.all(operations);
+				assert.equal("error" in first, rejectFirst);
+				assert.equal((firstAdapter === "tool" ? second : second.details).name, "agent-second");
+				const endpoints = h.entries.filter(({ type }) => type === RUN_ENDPOINT_BINDING_ENTRY).map(({ data }) => data);
+				assert.deepEqual(endpoints.map(({ agentName, paneId }) => [agentName, paneId]), [["agent-first", "first-pane"], ["agent-second", "second-pane"]]);
+				assert.notEqual(endpoints[0].runId, endpoints[1].runId);
+				assert.deepEqual(h.entries.filter(({ type }) => type === LIFECYCLE_JOURNAL_ENTRY).map(({ data }) => [data.event.runId, data.event.status, data.event.evidence.scope]), [
+					[endpoints[0].runId, rejectFirst ? "uncertain" : "started", rejectFirst ? "agent_start" : undefined],
+					[endpoints[1].runId, "started", undefined],
+				]);
+				const splitPositions = h.timeline.flatMap((item, index) => item === "exec:pane:split" ? [index] : []);
+				const firstSettled = h.timeline.indexOf(rejectFirst ? "first:rejected" : "first:resolved");
+				assert.ok(firstSettled >= 0 && splitPositions[1] > firstSettled);
+				assert.deepEqual(h.writtenEnvelopes.filter(({ envelope }) => envelope.type === "message").map(({ paneId, envelope }) => [paneId, envelope.runId, envelope.message]), [
+					...(rejectFirst ? [] : [["first-pane", endpoints[0].runId, "First assignment"]]),
+					["second-pane", endpoints[1].runId, "Second assignment"],
+				]);
+			} finally {
+				blocked.release();
+				await Promise.allSettled(operations);
+			}
+		});
+	}
+}
+
+test("shared queue: tool aborted while waiting keeps registration but never enters creation", { timeout: 15_000 }, async (t) => {
+	const entered = promiseGate();
+	const blocked = promiseGate();
+	const registeredSecond = promiseGate();
+	let registrations = 0;
+	const h = await commandHarness(t, {
+		branch: teamBranch({ teamMode: true }), listening: true,
+		onAppend: (type) => { if (type === RUN_REGISTRATION_ENTRY && ++registrations === 2) registeredSecond.release(); },
+		execOverride: async (args) => { if (args[1] === "split") { entered.release(); await blocked.promise; } },
+	});
+	const rpc = await rpcAdapter(h);
+	const controller = new AbortController();
+	const first = rpc.client.spawn({ name: "first" }, rpc.provider);
+	let rejected: Promise<void> | undefined;
+	try {
+		await entered.promise;
+		const second = h.executeTool("CreateAgentPanel", { name: "second" }, controller.signal);
+		rejected = assert.rejects(second, { message: "cancel queued tool" });
+		await registeredSecond.promise;
+		const queuedRun = h.entries.filter(({ type }) => type === RUN_REGISTRATION_ENTRY)[1].data.runId;
+		controller.abort(new Error("cancel queued tool"));
+		blocked.release();
+		await Promise.all([first, rejected]);
+		assert.equal(h.entries.filter(({ type }) => type === RUN_REGISTRATION_ENTRY).length, 2);
+		assert.equal(h.entries.some(({ type, data }) => type === RUN_ENDPOINT_BINDING_ENTRY && data.runId === queuedRun), false);
+		assert.equal(h.entries.some(({ type, data }) => type === LIFECYCLE_JOURNAL_ENTRY && data.event.runId === queuedRun), false);
+		assert.deepEqual(h.execCalls.filter((args) => args[1] === "start").map((args) => args[2]), ["agent-first"]);
+		assert.equal(h.execCalls.filter((args) => args[1] === "split").length, 1);
+		assert.deepEqual(h.partialToolUpdates, [{ id: "call", update: CREATE_PROGRESS }]);
+	} finally { blocked.release(); await Promise.allSettled([first, ...(rejected ? [rejected] : [])]); }
+});
+
+test("shared service: RPC client abort cleans its listener while provider finishes and replies later", { timeout: 15_000 }, async (t) => {
+	const entered = promiseGate();
+	const blocked = promiseGate();
+	let providerSignal: AbortSignal | undefined;
+	const h = await commandHarness(t, {
+		listening: true,
+		execOverride: async (args, options) => {
+			if (args[1] === "split") { providerSignal = options.signal; entered.release(); await blocked.promise; }
+		},
+	});
+	const rpc = await rpcAdapter(h);
+	const controller = new AbortController();
+	const waiting = rpc.client.spawn({ name: "builder", initialPrompt: SEND_MESSAGE }, rpc.provider, { signal: controller.signal });
+	const rejected = assert.rejects(waiting, RpcAbortError);
+	const channel = replyChannel(CHANNELS.spawn, "paired-2");
+	let unsubscribe = () => {};
+	let lateReply: Promise<RpcReply<WorkerReference>> | undefined;
+	try {
+		await entered.promise;
+		assert.equal(h.events.listenerCount(channel), 1);
+		controller.abort();
+		await rejected;
+		assert.equal(h.events.listenerCount(channel), 0);
+		assert.equal(h.events.listenerCount(), 11);
+		assert.equal(providerSignal?.aborted, false);
+		assert.equal(h.writtenEnvelopes.length, 0);
+		lateReply = new Promise((resolve) => { unsubscribe = h.events.on(channel, (reply) => resolve(reply as RpcReply<WorkerReference>)); });
+		blocked.release();
+		const reply = await lateReply;
+		assert.equal(reply.success, true);
+		if (!reply.success) assert.fail("provider should finish after caller abort");
+		assert.equal(h.writtenEnvelopes.at(-1)?.envelope.runId, reply.data.runId);
+		assert.equal(h.writtenEnvelopes.at(-1)?.envelope.message, SEND_MESSAGE);
+		assert.deepEqual(h.entries.filter(({ type }) => type === LIFECYCLE_JOURNAL_ENTRY).map(({ data }) => data.event.status), ["started"]);
+		assertBefore(h, "envelope:message", `emit:${channel}`);
+		assert.equal(providerSignal?.aborted, false);
+	} finally {
+		blocked.release();
+		await rejected;
+		if (lateReply) await lateReply;
+		unsubscribe();
+	}
+	assert.equal(h.events.listenerCount(channel), 0);
+});
+
+test("shared service: fixed probe facts and readiness stay independent of team mode across reload", async (t) => {
+	const h = await commandHarness(t, { activeTools: ["read"] });
+	const first = await rpcAdapter(h);
+	assert.deepEqual(first.provider, { protocol: 1, provider: "herdr", providerInstanceId: first.provider.providerInstanceId, available: true, capabilities: ["spawn", "send", "steer", "inspect"], constraints: { requiresHerdrPane: true, requiresInteractivePi: true } });
+	assert.deepEqual(h.activeTools(), ["read"]);
+	await first.client.spawn({ name: "scout" }, first.provider);
+	assert.ok(h.activeTools().includes("CreateAgentPanel"));
+	await h.handlers.get("session_shutdown")![0]();
+	assert.equal(h.events.listenerCount(), 0);
+	h.herdrWorker(h.pi, { disableInbox: true, isListening: () => false });
+	t.after(async () => { await h.handlers.get("session_shutdown")![1](); });
+	await h.handlers.get("session_start")![1]({ reason: "startup" }, h.ctx);
+	const second = await rpcAdapter(h);
+	assert.notEqual(second.provider.providerInstanceId, first.provider.providerInstanceId);
+	const before = { calls: h.execCalls.length, entries: h.entries.length, envelopes: h.writtenEnvelopes.length };
+	for (const [channel, input] of [[CHANNELS.spawn, { name: "builder" }], [CHANNELS.send, { target: "agent-scout", message: "stale" }], [CHANNELS.inspect, { target: "agent-scout" }]] as const) {
+		const requestId = `stale-${channel.split(":").at(-1)}`;
+		h.events.emit(channel, { requestId, providerInstanceId: first.provider.providerInstanceId, protocol: 1, ...input });
+		await new Promise<void>((resolve) => setImmediate(resolve));
+		assert.equal(h.events.emissions.some((item) => item.channel === replyChannel(channel, requestId)), false);
+	}
+	assert.deepEqual({ calls: h.execCalls.length, entries: h.entries.length, envelopes: h.writtenEnvelopes.length }, before);
+	assert.equal(h.events.listenerCount(), 11);
+	await h.handlers.get("session_shutdown")![1]();
+	assert.equal(h.events.listenerCount(), 0);
 });
