@@ -24,13 +24,36 @@ Turns this pane into an orchestrator and puts other Pi agents in neighboring Her
 
 | Command | Effect |
 |---|---|
+| `/team` | Enable team mode on an unowned pane and show the saved team |
 | `/team add [right\|down\|left\|up] [type] [purpose…]` | Enable team mode and have the LLM create a worker with `CreateAgentPanel` |
-| `/team list` | Show workers / orchestrator |
+| `/team list` or `/team status` | Show saved workers / orchestrator, even if a peer is no longer live |
 | `/team release <name>` | Stop orchestrating that worker (pane stays open) |
 | `/team adopt <name>` | Control an existing Herdr agent without creating a pane |
 | `/team from <id>` | Worker: adopt an orchestrator after startup |
+| `/orchestrated-by <id>` | Set an orchestrator using the full trimmed argument, without enabling team mode |
+| `/team help` | Show command usage |
 
-`/team` once flips **team mode**: status shows `Orchestrator …`, the system prompt gets the orchestrator brief, and `CreateAgentPanel` appears. The pane is renamed `orchestrator` if it has no Herdr agent name.
+On a fresh, unowned pane, bare `/team` enables team mode and displays `team · orchestrator`. The system prompt gets the orchestrator brief and `CreateAgentPanel` becomes active. Bare `/team` does not rename the pane. During creation, an unnamed pane is renamed `orchestrator`.
+
+```text
+/team
+/team add right explore inspect the authentication system
+/team list
+/team release agent-explore
+```
+
+`/team add` submits an instruction asking the model to call `CreateAgentPanel` with a charter and concrete initial brief. If Pi is busy, that instruction queues as a follow-up. The command itself does not split a pane, start an agent, or register an assignment. Only the later tool call creates the worker. Use the actual returned worker name when listing, messaging, or releasing it; collisions can change the name.
+
+The direction defaults to right. Bare `right`, `down`, `left`, and `up` are aliases after `/team`. The first recognized direction can appear after the type, as in `/team add explore down inspect auth`. Verbs, directions, and command type hints are case-sensitive. Arguments split on whitespace, not shell quoting; purpose text loses only its outermost leading/trailing quote characters. `adopt`, `release`, and `from` use their first argument and ignore extra words.
+
+Adoption and release change the saved relationship without creating or closing a pane. Release removes worker metadata but preserves assignment and lifecycle history; it does not report completion, failure, or a stopped process. Worker panes cannot add team members or use `CreateAgentPanel`. Commands require an interactive TUI session in a Herdr pane.
+
+Command compatibility tests characterize checkout `112410ca26e8a95b0c4f3b4e5b9fa81899313e4a`, not every historical release. They invoke the registered commands and check exact prompts, notifications, completions, relationship records, tool activation, and mocked host UI/Herdr arguments. They do not run a live model-to-worker workflow. Run these checks with:
+
+```sh
+node --import tsx --test tests/extensions/herdr-worker-adapter.test.ts
+npm run typecheck
+```
 
 ### `CreateAgentPanel`
 

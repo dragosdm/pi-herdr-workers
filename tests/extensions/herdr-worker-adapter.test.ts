@@ -1,5 +1,8 @@
 import assert from "node:assert/strict";
-import test from "node:test";
+import { execFile } from "node:child_process";
+import test, { type TestContext } from "node:test";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import { LIFECYCLE_JOURNAL_ENTRY } from "../../lifecycle/acceptor.js";
 import { LIFECYCLE_CHANNELS, type AcceptedLifecycleEvent } from "../../lifecycle/protocol.js";
 import { CHANNELS, replyChannel, type DeliveryReceipt, type Inspection, type RpcReply, type WorkerReference } from "../../rpc/protocol.js";
@@ -8,9 +11,11 @@ import { RUN_QUERY_CHANNELS, runQueryReplyChannel, type RunQueryReply, type Work
 import { RUN_ENDPOINT_BINDING_ENTRY, RUN_REGISTRATION_ENTRY } from "../../runs/registry.js";
 import { FakeIsolatedEventBus } from "../support/fake-isolated-event-bus.js";
 
-process.env.HERDR_ENV = "1";
-process.env.HERDR_PANE_ID = "self-pane";
-process.env.HERDR_TAB_ID = "tab-1";
+if (!process.env.TEAM_COMMAND_ENV_CASE) {
+	process.env.HERDR_ENV = "1";
+	process.env.HERDR_PANE_ID = "self-pane";
+	process.env.HERDR_TAB_ID = "tab-1";
+}
 
 async function harness(options: {
 	listening?: boolean;
@@ -24,6 +29,11 @@ async function harness(options: {
 	agents?: any[];
 	execOverride?: (args: string[]) => Promise<any> | any;
 	writeEnvelopeErrorForType?: string;
+	isIdle?: boolean;
+	hasUI?: boolean;
+	mode?: string;
+	model?: { provider: string; id: string } | null;
+	activeTools?: string[];
 } = {}) {
 	const { default: herdrWorker } = await import("../../extensions/herdr-worker.js");
 	const timeline: string[] = [];
@@ -32,14 +42,21 @@ async function harness(options: {
 	const commands = new Map<string, any>();
 	const handlers = new Map<string, Array<(...args: any[]) => any>>();
 	const entries: Array<{ type: string; data: any }> = [];
-	const sessionEntries = options.sessionEntries ?? [];
+	const sessionEntries = structuredClone(options.sessionEntries ?? []);
+	const branch = structuredClone(options.branch ?? []);
 	const execCalls: string[][] = [];
+	const pendingExec = new Set<Promise<any>>();
+	const paneMetadataCalls: string[][] = [];
+	const sentUserMessages: Array<[text: string, options?: { deliverAs: "followUp" }]> = [];
+	const notifications: Array<{ text: string; level: string }> = [];
+	const statusUpdates: Array<{ key: string; text: string | undefined }> = [];
+	const activeToolUpdates: string[][] = [];
 	const writtenEnvelopes: Array<{ paneId: string; envelope: any }> = [];
 	const sentMessages: Array<{ message: any; options: any }> = [];
 	const agentGetTargets: string[] = [];
 	const startedAgents = new Set<string>();
 	let inboxHandler: ((envelope: unknown, envelopeId: string) => Promise<void>) | undefined;
-	let activeTools: string[] = [];
+	let activeTools: string[] = [...(options.activeTools ?? [])];
 	const pi: any = {
 		events,
 		registerFlag() {},
@@ -52,58 +69,73 @@ async function harness(options: {
 			handlers.set(name, list);
 		},
 		getActiveTools() { return activeTools; },
-		setActiveTools(value: string[]) { activeTools = value; },
+		setActiveTools(value: string[]) {
+			activeTools = [...value];
+			activeToolUpdates.push([...value]);
+			timeline.push("tools");
+		},
 		appendEntry(type: string, data: any) {
 			entries.push({ type, data });
 			sessionEntries.push({ type: "custom", customType: type, data });
 			timeline.push(`append:${type}`);
 		},
 		sendMessage(message: any, messageOptions: any) { sentMessages.push({ message, options: messageOptions }); },
-		sendUserMessage() {},
-		async exec(_command: string, args: string[]) {
-			execCalls.push(args);
-			timeline.push(`exec:${args[0]}:${args[1] ?? ""}`);
-			const overridden = await options.execOverride?.(args);
-			if (overridden !== undefined) {
-				if (args[0] === "agent" && args[1] === "start" && overridden.code === 0) startedAgents.add(args[2]);
-				return overridden;
-			}
-			if (args[0] === "pane" && args[1] === "layout") return { code: 0, stdout: JSON.stringify({ result: { layout: { panes: [] } } }), stderr: "" };
-			if (args[0] === "pane" && args[1] === "split") return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "new-pane" } } }), stderr: "" };
-			if (args[0] === "agent" && args[1] === "get") {
-				const target = args[2];
-				agentGetTargets.push(target);
-				const agent = target === "self-pane"
-					? { pane_id: "self-pane", tab_id: "tab-1", name: options.selfName ?? "orchestrator", agent: "pi", cwd: "/tmp" }
-					: (target === "agent-scout" || target === "worker-pane" || startedAgents.has(target)) && !options.missingAgents?.includes(target)
-						? {
-							pane_id: startedAgents.has(target) ? "new-pane" : "worker-pane", tab_id: "tab-1", name: startedAgents.has(target) ? target : "agent-scout", agent: "pi", agent_status: "idle",
-							...(options.workerCwd === null ? {} : { cwd: options.workerCwd ?? "/tmp" }),
-						}
-						: target === "boss" && !options.missingAgents?.includes(target)
-							? { pane_id: "boss-pane", tab_id: "tab-1", name: "boss", agent: "pi", agent_status: "busy", cwd: "/workspace" }
-						: undefined;
-				return { code: agent ? 0 : 1, stdout: agent ? JSON.stringify({ result: { agent } }) : "", stderr: agent ? "" : "missing" };
-			}
-			if (args[0] === "agent" && args[1] === "list") return { code: 0, stdout: JSON.stringify({ result: { agents: options.agents ?? [] } }), stderr: "" };
-			if (args[0] === "agent" && args[1] === "start") startedAgents.add(args[2]);
-			return { code: 0, stdout: JSON.stringify({ result: {} }), stderr: "" };
+		sendUserMessage(...args: [string, { deliverAs: "followUp" }?]) { sentUserMessages.push(args); },
+		exec(_command: string, args: string[]) {
+			const call = execute(args);
+			pendingExec.add(call);
+			void call.then(() => pendingExec.delete(call), () => pendingExec.delete(call));
+			return call;
 		},
 	};
+	async function execute(args: string[]) {
+		execCalls.push(args);
+		if (args[0] === "pane" && args[1] === "report-metadata") paneMetadataCalls.push(args);
+		timeline.push(`exec:${args[0]}:${args[1] ?? ""}`);
+		const overridden = await options.execOverride?.(args);
+		if (overridden !== undefined) {
+			if (args[0] === "agent" && args[1] === "start" && overridden.code === 0) startedAgents.add(args[2]);
+			return overridden;
+		}
+		if (args[0] === "pane" && args[1] === "layout") return { code: 0, stdout: JSON.stringify({ result: { layout: { panes: [] } } }), stderr: "" };
+		if (args[0] === "pane" && args[1] === "split") return { code: 0, stdout: JSON.stringify({ result: { pane: { pane_id: "new-pane" } } }), stderr: "" };
+		if (args[0] === "agent" && args[1] === "get") {
+			const target = args[2];
+			agentGetTargets.push(target);
+			const agent = target === "self-pane"
+				? { pane_id: "self-pane", tab_id: "tab-1", name: options.selfName ?? "orchestrator", agent: "pi", cwd: "/tmp" }
+				: (target === "agent-scout" || target === "worker-pane" || startedAgents.has(target)) && !options.missingAgents?.includes(target)
+					? {
+						pane_id: startedAgents.has(target) ? "new-pane" : "worker-pane", tab_id: "tab-1", name: startedAgents.has(target) ? target : "agent-scout", agent: "pi", agent_status: "idle",
+						...(options.workerCwd === null ? {} : { cwd: options.workerCwd ?? "/tmp" }),
+					}
+					: target === "boss" && !options.missingAgents?.includes(target)
+						? { pane_id: "boss-pane", tab_id: "tab-1", name: "boss", agent: "pi", agent_status: "busy", cwd: "/workspace" }
+					: undefined;
+			return { code: agent ? 0 : 1, stdout: agent ? JSON.stringify({ result: { agent } }) : "", stderr: agent ? "" : "missing" };
+		}
+		if (args[0] === "agent" && args[1] === "list") return { code: 0, stdout: JSON.stringify({ result: { agents: options.agents ?? [] } }), stderr: "" };
+		if (args[0] === "agent" && args[1] === "start") startedAgents.add(args[2]);
+		return { code: 0, stdout: JSON.stringify({ result: {} }), stderr: "" };
+	}
 	const ctx: any = {
-		mode: "tui",
+		mode: options.mode ?? "tui",
 		cwd: options.contextCwd ?? "/tmp",
-		hasUI: false,
-		model: { provider: "test", id: "model" },
+		hasUI: options.hasUI ?? false,
+		model: options.model === null ? undefined : options.model ?? { provider: "test", id: "model" },
 		signal: new AbortController().signal,
-		sessionManager: { getSessionId: () => "session", getBranch: () => options.branch ?? [], getEntries: () => sessionEntries },
-		ui: { setStatus() {}, notify() {} },
-		isIdle: () => true,
+		sessionManager: { getSessionId: () => "session", getBranch: () => branch, getEntries: () => sessionEntries },
+		ui: {
+			setStatus(key: string, text: string | undefined) { statusUpdates.push({ key, text }); },
+			notify(text: string, level: string) { notifications.push({ text, level }); timeline.push("notify"); },
+		},
+		isIdle: () => options.isIdle ?? true,
 	};
 	herdrWorker(pi, {
 		disableInbox: true,
 		isListening: () => options.listening ?? false,
 		writeEnvelope: (paneId, envelope) => {
+			timeline.push(`publish:${envelope.type}`);
 			if (envelope.type === options.writeEnvelopeErrorForType) throw new Error("mailbox write failed");
 			writtenEnvelopes.push({ paneId, envelope });
 			timeline.push(`envelope:${envelope.type}`);
@@ -113,6 +145,10 @@ async function harness(options: {
 	return {
 		events, tools, commands, handlers, entries, sessionEntries, timeline, execCalls, agentGetTargets,
 		writtenEnvelopes, sentMessages, ctx, pi, herdrWorker, activeTools: () => activeTools,
+		branch, sentUserMessages, notifications, statusUpdates, paneMetadataCalls, activeToolUpdates,
+		async settleExec() {
+			while (pendingExec.size) await Promise.all([...pendingExec]);
+		},
 		deliverInbox: (envelope: unknown, envelopeId: string) => inboxHandler!(envelope, envelopeId),
 	};
 }
@@ -164,6 +200,543 @@ function workerReport(runId: string, overrides: Record<string, unknown> = {}) {
 		...overrides,
 	};
 }
+
+async function commandHarness(t: TestContext, options: Parameters<typeof harness>[0] = {}) {
+	const h = await harness(options);
+	t.after(async () => {
+		try { await h.settleExec(); }
+		finally { await h.handlers.get("session_shutdown")![0](); }
+	});
+	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
+	await h.settleExec();
+	return h;
+}
+
+async function command(h: Awaited<ReturnType<typeof harness>>, args: string, name = "team") {
+	await h.commands.get(name).handler(args, h.ctx);
+	await h.settleExec();
+}
+
+function assertRelationshipOnly(h: Awaited<ReturnType<typeof harness>>) {
+	assert.deepEqual(h.execCalls.filter((args) => !(
+		(args[0] === "agent" && ["get", "list"].includes(args[1]))
+		|| (args[0] === "pane" && args[1] === "report-metadata")
+	)), [], "commands do not create, rename, start, stop, close, or prompt agents");
+	assert.equal(h.entries.every((entry) => entry.type === "herdr-worker"), true,
+		"relationship commands append no assignment, endpoint, operation, or lifecycle journal");
+}
+
+const TEAM_HELP = "/team add [right|down|left|up] [type] [purpose\u2026] | list | release <name> | adopt <name> | from <id>";
+const CLEAR_TITLE = ["pane", "report-metadata", "self-pane", "--source", "pi-herdr-worker", "--clear-title"];
+
+for (const args of ["", "  \t\n", "list", "status"]) {
+	for (const row of [
+		{ label: "empty orchestrator", state: {}, text: "team \u00b7 orchestrator", tools: ["read", "CreateAgentPanel"] },
+		{ label: "worker", state: { orchestratedBy: "boss" }, text: "team \u21d0 boss", tools: ["read", "SendToAgent"] },
+		{
+			label: "saved roster with missing live peers",
+			state: { workers: ["agent-scout", "agent-gone"], meta: { "agent-scout": { paneId: "saved-pane" } } },
+			text: "team \u00b7 2 workers \u00b7 /team list\nagent-scout \u00b7 saved-pane\nagent-gone",
+			tools: ["read", "SendToAgent", "CreateAgentPanel"],
+		},
+		{
+			label: "combined worker and roster",
+			state: { workers: ["agent-scout"], orchestratedBy: "boss" },
+			text: "team \u00b7 1 worker \u00b7 /team list \u00b7 team \u21d0 boss\nagent-scout",
+			tools: ["read", "SendToAgent"],
+		},
+	]) {
+		test(`team ${JSON.stringify(args)} lists ${row.label} without refreshing the roster`, async (t) => {
+			const h = await commandHarness(t, { branch: teamBranch(row.state), missingAgents: ["agent-scout", "agent-gone"], activeTools: ["read"] });
+			const before = h.execCalls.length;
+			await command(h, args);
+			assert.deepEqual(h.notifications, [{ text: row.text, level: "info" }]);
+			assert.deepEqual(h.execCalls.slice(before), []);
+			assert.deepEqual(h.activeTools(), row.tools);
+			assert.deepEqual(h.entries, "orchestratedBy" in row.state ? [] : [{
+				type: "herdr-worker", data: { ...teamBranch(row.state)[0].data, teamMode: true },
+			}]);
+			assert.deepEqual(h.sentUserMessages, []);
+			assertRelationshipOnly(h);
+		});
+	}
+}
+
+for (const row of [
+	{ args: "help", text: TEAM_HELP, level: "info" },
+	{ args: "unknown", text: `Unknown subcommand "unknown". Usage: ${TEAM_HELP}`, level: "error" },
+	{ args: "ADD right", text: `Unknown subcommand "ADD". Usage: ${TEAM_HELP}`, level: "error" },
+	{ args: "Right explore", text: `Unknown subcommand "Right". Usage: ${TEAM_HELP}`, level: "error" },
+	{ args: "release", text: 'Not orchestrating "". Workers: (none)', level: "error" },
+	{ args: "adopt", text: 'No live herdr agent "" to adopt.', level: "error" },
+	{ args: "from", text: "Usage: /orchestrated-by <agent name or pane id>", level: "error" },
+]) {
+	test(`team ${row.args} preserves exact help/errors after enabling mode`, async (t) => {
+		const h = await commandHarness(t, { activeTools: ["read"] });
+		await command(h, row.args);
+		assert.deepEqual(h.notifications, [{ text: row.text, level: row.level }]);
+		assert.deepEqual(h.entries, [{ type: "herdr-worker", data: { workers: [], teamMode: true, version: 1, sessionId: "session" } }]);
+		assert.deepEqual(h.activeToolUpdates, [["read", "CreateAgentPanel"]]);
+		assert.ok(h.timeline.indexOf("append:herdr-worker") < h.timeline.indexOf("tools"));
+		assert.ok(h.timeline.indexOf("tools") < h.timeline.indexOf("notify"));
+		assert.deepEqual(h.sentUserMessages, []);
+		assertRelationshipOnly(h);
+	});
+}
+
+const ADD_PREFIX = "Add a team member now using the CreateAgentPanel tool (do not use herdr CLI commands for this).\n";
+const ADD_SUFFIX = "\n- initial_prompt: write a concrete first brief from the current conversation context and the purpose. If there is genuinely nothing to do yet, a short orientation brief (repo, cwd, purpose, how to report back) is fine.\nThen tell me briefly who was created and what you asked it to do.";
+const SAME_MODEL = "\n- model: default (same as yours) unless there is a reason otherwise";
+
+const addCases = [
+	{
+		args: "add",
+		lines: "- direction: right\n- type: (none given \u2014 pick one that fits, or leave it generic)\n- purpose: (not given \u2014 write a one-line charter)" + SAME_MODEL,
+		notice: "Asked the orchestrator to create a team member",
+	},
+	{
+		args: "add right",
+		lines: "- direction: right\n- type: (none given \u2014 pick one that fits, or leave it generic)\n- purpose: (not given \u2014 write a one-line charter)" + SAME_MODEL,
+		notice: "Asked the orchestrator to create a team member (right)",
+	},
+	{
+		args: "add right explore inspect the authentication system",
+		lines: "- direction: right\n- type: explore (Explore only: read, search, run read-only commands, and report findings. Do not create, edit, or delete files, and do not commit.)\n- purpose: inspect the authentication system\n- model: default for explore is xai/grok-4.6",
+		notice: "Asked the orchestrator to create a explore team member (right)",
+	},
+	{
+		args: "add research",
+		lines: "- direction: right\n- type: research (Research only: gather facts, read code/docs, and report. No file modifications.)\n- purpose: (not given \u2014 write a one-line charter for a research agent)\n- model: default for research is xai/grok-4.6",
+		notice: "Asked the orchestrator to create a research team member",
+	},
+	{
+		args: "right review inspect auth",
+		lines: "- direction: right\n- type: review (Review only: read diffs/code and report actionable findings. Do not modify files.)\n- purpose: inspect auth" + SAME_MODEL,
+		notice: "Asked the orchestrator to create a review team member (right)",
+	},
+	{
+		args: "down implement fix auth",
+		lines: "- direction: down\n- type: implement (Implement: make the requested code changes, verify them, and report what changed and how it was tested.)\n- purpose: fix auth" + SAME_MODEL,
+		notice: "Asked the orchestrator to create a implement team member (down)",
+	},
+	{
+		args: "left test check auth",
+		lines: "- direction: left\n- type: test (Testing: write/run tests, report failures with repro steps. Avoid unrelated changes.)\n- purpose: check auth" + SAME_MODEL,
+		notice: "Asked the orchestrator to create a test team member (left)",
+	},
+	{
+		args: "up custom inspect auth",
+		lines: "- direction: up\n- type: custom\n- purpose: inspect auth" + SAME_MODEL,
+		notice: "Asked the orchestrator to create a custom team member (up)",
+	},
+	{
+		args: "add explore down inspect auth",
+		lines: "- direction: down\n- type: explore (Explore only: read, search, run read-only commands, and report findings. Do not create, edit, or delete files, and do not commit.)\n- purpose: inspect auth\n- model: default for explore is xai/grok-4.6",
+		notice: "Asked the orchestrator to create a explore team member (down)",
+	},
+	{
+		args: "add custom inspect up auth",
+		lines: "- direction: up\n- type: custom\n- purpose: inspect auth" + SAME_MODEL,
+		notice: "Asked the orchestrator to create a custom team member (up)",
+	},
+	{
+		args: "add right down explore left",
+		lines: "- direction: right\n- type: down\n- purpose: explore left" + SAME_MODEL,
+		notice: "Asked the orchestrator to create a down team member (right)",
+	},
+	{
+		args: "add right custom right up",
+		lines: "- direction: right\n- type: custom\n- purpose: right up" + SAME_MODEL,
+		notice: "Asked the orchestrator to create a custom team member (right)",
+	},
+	{
+		args: "add Right explore",
+		lines: "- direction: right\n- type: Right\n- purpose: explore" + SAME_MODEL,
+		notice: "Asked the orchestrator to create a Right team member",
+	},
+	{
+		args: "add Explore inspect auth",
+		lines: "- direction: right\n- type: Explore\n- purpose: inspect auth" + SAME_MODEL,
+		notice: "Asked the orchestrator to create a Explore team member",
+	},
+	{
+		args: " \tadd\nleft\tcustom   'inspect   auth'  ",
+		lines: "- direction: left\n- type: custom\n- purpose: inspect auth" + SAME_MODEL,
+		notice: "Asked the orchestrator to create a custom team member (left)",
+	},
+	{
+		args: 'add custom "inspect auth"',
+		lines: "- direction: right\n- type: custom\n- purpose: inspect auth" + SAME_MODEL,
+		notice: "Asked the orchestrator to create a custom team member",
+	},
+	{
+		args: `add custom "inspect 'auth' again'`,
+		lines: "- direction: right\n- type: custom\n- purpose: inspect 'auth' again" + SAME_MODEL,
+		notice: "Asked the orchestrator to create a custom team member",
+	},
+	{
+		args: 'add "custom type" "inspect auth"',
+		lines: '- direction: right\n- type: "custom\n- purpose: type" "inspect auth' + SAME_MODEL,
+		notice: 'Asked the orchestrator to create a "custom team member',
+	},
+	{
+		args: `add custom ''`,
+		lines: "- direction: right\n- type: custom\n- purpose: (not given \u2014 write a one-line charter for a custom agent)" + SAME_MODEL,
+		notice: "Asked the orchestrator to create a custom team member",
+	},
+];
+
+for (const row of addCases) {
+	for (const isIdle of [true, false]) {
+		test(`team ${JSON.stringify(row.args)} submits exact ${isIdle ? "idle" : "follow-up"} intent without creating a worker`, async (t) => {
+			const h = await commandHarness(t, { isIdle, activeTools: ["read"], model: isIdle ? { provider: "other", id: "active-model" } : null });
+			await command(h, row.args);
+			const text = ADD_PREFIX + row.lines + ADD_SUFFIX;
+			assert.deepEqual(h.sentUserMessages, [isIdle ? [text] : [text, { deliverAs: "followUp" }]]);
+			assert.deepEqual(h.notifications, [{ text: row.notice + (isIdle ? "." : " (queued as follow-up)."), level: "info" }]);
+			assert.deepEqual(h.entries, [{ type: "herdr-worker", data: { workers: [], teamMode: true, version: 1, sessionId: "session" } }]);
+			assert.deepEqual(h.activeToolUpdates, [["read", "CreateAgentPanel"]]);
+			assert.deepEqual(h.writtenEnvelopes, []);
+			assert.deepEqual(h.sentMessages, []);
+			assertRelationshipOnly(h);
+		});
+	}
+}
+
+for (const args of ["add", "right explore", "down", "left", "up"]) {
+	test(`worker rejects team ${args} and keeps the creation tool gated`, async (t) => {
+		const h = await commandHarness(t, { branch: teamBranch({ teamMode: true, orchestratedBy: "boss" }), activeTools: ["read"] });
+		await command(h, args);
+		assert.deepEqual(h.notifications, [{ text: "This pane is a worker of boss; only orchestrators add team members.", level: "error" }]);
+		assert.deepEqual(h.activeTools(), ["read", "SendToAgent"]);
+		await assert.rejects(h.tools.get("CreateAgentPanel").execute("gate", {}, h.ctx.signal, undefined, h.ctx), {
+			message: "CreateAgentPanel is only available to an orchestrator (run /team here first).",
+		});
+		assert.deepEqual(h.entries, []);
+		assert.deepEqual(h.sentUserMessages, []);
+		assertRelationshipOnly(h);
+	});
+}
+
+for (const [name, args] of [["team", ""], ["team", "unknown"], ["team", "add"], ["team", "adopt agent-scout"], ["team", "release agent-scout"], ["team", "from boss"], ["orchestrated-by", "boss"]]) {
+	test(`${name} ${args} rejects non-TUI context before mutation`, async (t) => {
+		const h = await commandHarness(t, { mode: "rpc", hasUI: true, branch: teamBranch({ workers: ["agent-scout"], teamMode: true }), activeTools: ["read", "CreateAgentPanel", "SendToAgent"] });
+		await command(h, args, name);
+		assert.deepEqual(h.notifications, [{ text: "Teams require an interactive pi in Herdr.", level: "error" }]);
+		assert.deepEqual(h.entries, []);
+		assert.deepEqual(h.activeTools(), ["read"]);
+		assert.deepEqual(h.execCalls, []);
+		assert.deepEqual(h.statusUpdates, []);
+		assert.deepEqual(h.sentUserMessages, []);
+	});
+}
+
+if (process.env.TEAM_COMMAND_ENV_CASE) {
+	test("isolated environment command gate", async (t) => {
+		const h = await commandHarness(t, { hasUI: true, activeTools: ["read", "CreateAgentPanel", "SendToAgent"] });
+		for (const [name, args] of [["team", ""], ["team", "add"], ["team", "unknown"], ["orchestrated-by", "boss"]]) {
+			await command(h, args, name);
+		}
+		assert.deepEqual(h.notifications, Array.from({ length: 4 }, () => ({ text: "Teams require an interactive pi in Herdr.", level: "error" })));
+		assert.deepEqual(h.entries, []);
+		assert.deepEqual(h.execCalls, []);
+		assert.deepEqual(h.sentUserMessages, []);
+		assert.deepEqual(h.activeTools(), ["read"]);
+		assert.deepEqual(h.statusUpdates, []);
+	});
+} else {
+	for (const variable of ["HERDR_ENV", "HERDR_PANE_ID"]) {
+		test(`commands reject absent ${variable} captured at module load`, async () => {
+			const env: NodeJS.ProcessEnv = { ...process.env, TEAM_COMMAND_ENV_CASE: variable };
+			delete env[variable];
+			// A child test runner must not inherit the parent's worker IPC context.
+			delete env.NODE_TEST_CONTEXT;
+			const { stdout } = await promisify(execFile)(process.execPath, [
+				"--import", "tsx", "--test", "--test-reporter=tap", "--test-name-pattern=^isolated environment command gate$", fileURLToPath(import.meta.url),
+			], { env, timeout: 30_000 });
+			assert.match(stdout, /ok \d+ - isolated environment command gate/);
+			assert.match(stdout, /# pass 1\b/);
+			assert.match(stdout, /# fail 0\b/);
+		});
+	}
+}
+
+for (const row of [
+	{ label: "listening", listening: true, text: "Adopted existing agent agent-scout (pane worker-pane) as worker.", level: "info" },
+	{ label: "not listening", listening: false, text: "Adopted agent-scout (pane worker-pane) \u2014 it is not a listening pi; run `/orchestrated-by orchestrator` inside it (or it can't SendToAgent back).", level: "info" },
+	{ label: "failed control publication", listening: true, writeEnvelopeErrorForType: "control", text: "mailbox write failed", level: "error" },
+]) {
+	test(`adoption with ${row.label} persists before control publication and does not duplicate the relationship`, async (t) => {
+		const branch = teamBranch({ teamMode: true, meta: { "agent-scout": { purpose: "Saved charter", paneId: "saved-pane" } } });
+		const h = await commandHarness(t, { ...row, branch, hasUI: true, activeTools: ["read"] });
+		for (const args of ["adopt agent-scout ignored words", "adopt agent-scout"]) {
+			const before = h.timeline.length;
+			await command(h, args);
+			assert.deepEqual(h.entries.at(-1), { type: "herdr-worker", data: { ...branch[0].data, workers: ["agent-scout"] } });
+			assert.deepEqual(h.notifications.at(-1), { text: row.text, level: row.level });
+			const timeline = h.timeline.slice(before);
+			if (row.listening) {
+				assert.ok(timeline.indexOf("publish:control") > timeline.indexOf("append:herdr-worker"));
+			}
+			assert.deepEqual(h.activeTools(), ["read", "CreateAgentPanel", "SendToAgent"]);
+			assert.deepEqual(h.statusUpdates.at(-1), { key: "herdr-worker", text: "team \u00b7 1 worker \u00b7 /team list" });
+			assert.deepEqual(h.paneMetadataCalls.at(-1), ["pane", "report-metadata", "self-pane", "--source", "pi-herdr-worker", "--title", "orchestrating agent-scout"]);
+		}
+		assert.equal(h.agentGetTargets.includes("ignored"), false);
+		assert.deepEqual(h.activeToolUpdates, [["read", "CreateAgentPanel"], ["read", "CreateAgentPanel", "SendToAgent"]]);
+		if (row.listening && !row.writeEnvelopeErrorForType) {
+			assert.deepEqual(h.writtenEnvelopes.map(({ paneId, envelope }) => ({ paneId, envelope: { ...envelope, ts: 0 } })), [0, 1].map(() => ({
+				paneId: "worker-pane", envelope: { type: "control", action: "orchestrated-by", from: { id: "orchestrator", paneId: "self-pane", name: "orchestrator", role: "orchestrator" }, ts: 0 },
+			})));
+		} else assert.deepEqual(h.writtenEnvelopes, []);
+		assert.deepEqual(branch[0].data.workers, [], "fixture inputs stay isolated");
+		assertRelationshipOnly(h);
+	});
+}
+
+for (const row of [
+	{ args: "adopt self-pane", text: "That is this pane." },
+	{ args: "adopt missing", text: 'No live herdr agent "missing" to adopt.' },
+	{ args: "adopt agent-scout", text: 'No live herdr agent "agent-scout" to adopt.', missingAgents: ["agent-scout"] },
+]) {
+	test(`${row.args} preserves adoption rejection`, async (t) => {
+		const h = await commandHarness(t, { ...row, branch: teamBranch({ teamMode: true }) });
+		await command(h, row.args);
+		assert.deepEqual(h.notifications, [{ text: row.text, level: "error" }]);
+		assert.deepEqual(h.entries, []);
+		assert.deepEqual(h.writtenEnvelopes, []);
+		assertRelationshipOnly(h);
+	});
+}
+
+test("adoption stores the supplied pane identifier and release retains other workers and metadata", async (t) => {
+	const branch = teamBranch({ teamMode: true, workers: ["agent-other"], meta: { "agent-other": { paneId: "other-pane", purpose: "Keep working" } } });
+	const h = await commandHarness(t, { branch, listening: true, hasUI: true });
+	await command(h, "adopt worker-pane ignored");
+	assert.deepEqual(h.entries.at(-1)?.data, { ...branch[0].data, workers: ["agent-other", "worker-pane"] });
+	assert.deepEqual(h.notifications.at(-1), { text: "Adopted existing agent worker-pane (pane worker-pane) as worker.", level: "info" });
+	await command(h, "release agent-scout");
+	assert.deepEqual(h.notifications.at(-1), { text: 'Not orchestrating "agent-scout". Workers: agent-other, worker-pane', level: "error" });
+	await command(h, "release worker-pane ignored");
+	assert.deepEqual(h.entries.at(-1)?.data, branch[0].data);
+	assert.deepEqual(h.notifications.at(-1), { text: "Released worker-pane. Its pane stays open.", level: "info" });
+	assert.deepEqual(h.activeTools(), ["SendToAgent", "CreateAgentPanel"]);
+	assert.deepEqual(h.statusUpdates.at(-1), { key: "herdr-worker", text: "team \u00b7 1 worker \u00b7 /team list" });
+	assert.deepEqual(h.paneMetadataCalls.at(-1), ["pane", "report-metadata", "self-pane", "--source", "pi-herdr-worker", "--title", "orchestrating agent-other"]);
+	assertRelationshipOnly(h);
+});
+
+const ACTIVE_RUN = { protocol: 2, runId: "run-owned", correlationId: "dispatch-owned", sourceInstanceId: "worker-source", sourceSequence: 4 };
+for (const row of [
+	{ name: "team", args: "from boss ignored words", id: "boss", same: true },
+	{ name: "team", args: "from new-boss ignored words", id: "new-boss", same: false },
+	{ name: "orchestrated-by", args: "  boss  ", id: "boss", same: true },
+	{ name: "orchestrated-by", args: "  boss extra words  ", id: "boss extra words", same: false },
+]) {
+	test(`${row.name} ${row.args} ${row.same ? "preserves" : "clears"} the active binding`, async (t) => {
+		const data = { orchestratedBy: "boss", activeRun: ACTIVE_RUN };
+		const h = await commandHarness(t, { branch: teamBranch(data), activeTools: ["read"], hasUI: true });
+		const before = h.execCalls.length;
+		await command(h, row.args, row.name);
+		assert.deepEqual(h.entries, [{ type: "herdr-worker", data: {
+			...teamBranch(data)[0].data, orchestratedBy: row.id, activeRun: row.same ? ACTIVE_RUN : undefined,
+		} }]);
+		assert.deepEqual(h.notifications, [{ text: `This agent is now orchestrated by ${row.id}.`, level: "info" }]);
+		assert.deepEqual(h.activeTools(), row.same ? ["read", "SendToAgent", "ReportWorkerRun"] : ["read", "SendToAgent"]);
+		assert.deepEqual(h.execCalls.slice(before), [["pane", "report-metadata", "self-pane", "--source", "pi-herdr-worker", "--title", `orchestrator \u21d0 ${row.id}`]]);
+		assert.deepEqual(h.writtenEnvelopes, []);
+		assertRelationshipOnly(h);
+	});
+}
+
+for (const row of [
+	{ name: "team", args: "from boss extra words", id: "boss", teamMode: true },
+	{ name: "orchestrated-by", args: "  boss extra words  ", id: "boss extra words", teamMode: false },
+]) {
+	test(`fresh ${row.name} uses its argument contract and ${row.teamMode ? "enables" : "does not enable"} team mode`, async (t) => {
+		const h = await commandHarness(t, { activeTools: ["read"] });
+		await command(h, row.args, row.name);
+		const base = { workers: [], version: 1, sessionId: "session" };
+		assert.deepEqual(h.entries, [
+			...(row.teamMode ? [{ type: "herdr-worker", data: { ...base, teamMode: true } }] : []),
+			{ type: "herdr-worker", data: { ...base, ...(row.teamMode ? { teamMode: true } : {}), activeRun: undefined, orchestratedBy: row.id } },
+		]);
+		assert.deepEqual(h.notifications, [{ text: `This agent is now orchestrated by ${row.id}.`, level: "info" }]);
+		assert.deepEqual(h.activeToolUpdates, row.teamMode ? [["read", "CreateAgentPanel"], ["read", "SendToAgent"]] : [["read", "SendToAgent"]]);
+		assert.deepEqual(h.execCalls, [["agent", "get", "self-pane"]], "ownership accepts unvalidated identifiers");
+		assertRelationshipOnly(h);
+	});
+}
+
+test("orchestrated-by rejects blank input without enabling mode or dropping a binding", async (t) => {
+	const h = await commandHarness(t, { branch: teamBranch({ orchestratedBy: "boss", activeRun: ACTIVE_RUN }) });
+	await command(h, "  \t ", "orchestrated-by");
+	assert.deepEqual(h.notifications, [{ text: "Usage: /orchestrated-by <agent name or pane id>", level: "error" }]);
+	assert.deepEqual(h.entries, []);
+	assert.deepEqual(h.activeTools(), ["SendToAgent", "ReportWorkerRun"]);
+});
+
+for (const failControl of [false, true]) {
+	test(`release removes metadata and refreshes tools/UI while preserving run history, control failure=${failControl}`, async (t) => {
+		const history = [
+			{ type: "custom", customType: RUN_REGISTRATION_ENTRY, data: { version: 1, runId: "run-release", sessionId: "session", registeredAt: 10, lifecycleProtocol: 2, assignment: { cwd: "/tmp" } } },
+			{ type: "custom", customType: RUN_ENDPOINT_BINDING_ENTRY, data: { version: 1, runId: "run-release", sessionId: "session", agentName: "agent-scout", paneId: "worker-pane", observedAt: 20 } },
+			{ type: "custom", customType: LIFECYCLE_JOURNAL_ENTRY, data: { version: 1, sessionId: "session", event: {
+				protocol: 2, eventId: "ready-event", runId: "run-release", sourceInstanceId: "worker-source", sourceSequence: 1,
+				observedAt: 30, acceptedSequence: 1, status: "started", source: "worker", worker: { name: "agent-scout", paneId: "worker-pane" },
+				evidence: { kind: "worker_ready", readiness: "confirmed" },
+			} } },
+		];
+		const h = await commandHarness(t, {
+			hasUI: true, listening: true, activeTools: ["read"], sessionEntries: history,
+			writeEnvelopeErrorForType: failControl ? "control" : undefined,
+			branch: teamBranch({ teamMode: true, workers: ["agent-scout"], meta: { "agent-scout": { paneId: "worker-pane", runId: "run-release", lifecycleProtocol: 2 } } }),
+		});
+		for (const args of ["release worker-pane", "release AGENT-SCOUT", "release"]) await command(h, args);
+		assert.deepEqual(h.notifications, [
+			{ text: 'Not orchestrating "worker-pane". Workers: agent-scout', level: "error" },
+			{ text: 'Not orchestrating "AGENT-SCOUT". Workers: agent-scout', level: "error" },
+			{ text: 'Not orchestrating "". Workers: agent-scout', level: "error" },
+		]);
+		assert.deepEqual(h.entries, []);
+		await command(h, "release agent-scout ignored words");
+		assert.deepEqual(h.notifications.at(-1), { text: "Released agent-scout. Its pane stays open.", level: "info" });
+		assert.deepEqual(h.entries, [{ type: "herdr-worker", data: { version: 1, sessionId: "session", teamMode: true, workers: [], meta: {} } }]);
+		assert.deepEqual(h.sessionEntries.filter((entry) => entry.customType !== "herdr-worker"), history);
+		assert.deepEqual(h.activeToolUpdates, [["read", "SendToAgent", "CreateAgentPanel"], ["read", "CreateAgentPanel"]]);
+		assert.deepEqual(h.statusUpdates.at(-1), { key: "herdr-worker", text: "team \u00b7 orchestrator" });
+		assert.deepEqual(h.paneMetadataCalls.at(-1), CLEAR_TITLE);
+		assert.ok(h.timeline.indexOf("publish:control") > h.timeline.indexOf("append:herdr-worker"));
+		if (failControl) assert.deepEqual(h.writtenEnvelopes, []);
+		else assert.deepEqual(h.writtenEnvelopes.map(({ paneId, envelope }) => ({ paneId, envelope: { ...envelope, ts: 0 } })), [{
+			paneId: "worker-pane", envelope: { type: "control", action: "released", from: { id: "orchestrator", paneId: "self-pane", name: "orchestrator", role: "agent" }, ts: 0 },
+		}]);
+		for (const channel of [LIFECYCLE_CHANNELS.completed, LIFECYCLE_CHANNELS.failed, LIFECYCLE_CHANNELS.stopped]) {
+			assert.equal(h.events.emissions.some((event) => event.channel === channel), false);
+		}
+		const probe = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.probe, "release-history-probe", { requestId: "release-history-probe", supportedProtocols: [2] });
+		assert.equal(probe.success, true);
+		const record = await emitRunQueryForReply<any>(h.events, RUN_QUERY_CHANNELS.get, "release-history", {
+			requestId: "release-history", providerInstanceId: probe.success ? probe.data.providerInstanceId : "", protocol: 2, runId: "run-release",
+		});
+		assert.equal(record.success, true);
+		assert.equal(record.success && record.data.lifecycle.status, "started");
+		assert.equal(record.success && record.data.lifecycle.acceptedSequence, 1);
+		assertRelationshipOnly(h);
+	});
+}
+
+const BASE_COMPLETIONS = [
+	{ value: "add ", label: "add [direction] [type] [purpose\u2026]", description: "Have the orchestrator create a worker (default: stack right)" },
+	{ value: "add right ", label: "add right [type] [purpose\u2026]", description: "Worker right of this pane" },
+	{ value: "add down ", label: "add down [type] [purpose\u2026]", description: "Worker down of this pane" },
+	{ value: "add left ", label: "add left [type] [purpose\u2026]", description: "Worker left of this pane" },
+	{ value: "add up ", label: "add up [type] [purpose\u2026]", description: "Worker up of this pane" },
+	{ value: "add right explore ", label: "add right explore [purpose\u2026]", description: "Explore-only scout on xai/grok-4.6" },
+	{ value: "list", label: "list", description: "Show workers / orchestrator" },
+];
+const END_COMPLETIONS = [
+	{ value: "from ", label: "from <id>", description: "Mark this pi as a worker of <id>" },
+	{ value: "adopt ", label: "adopt <name>", description: "Control an existing herdr agent without creating a pane" },
+];
+const RELEASE_COMPLETIONS = [
+	{ value: "release agent-z", label: "release agent-z", description: "Stop orchestrating this worker" },
+	{ value: "release agent-scout", label: "release agent-scout", description: "Stop orchestrating this worker" },
+];
+for (const row of [
+	{ prefix: "", expected: [...BASE_COMPLETIONS, ...RELEASE_COMPLETIONS, ...END_COMPLETIONS] },
+	{ prefix: "a", expected: [...BASE_COMPLETIONS.slice(0, 6), END_COMPLETIONS[1]] },
+	{ prefix: "add right", expected: [BASE_COMPLETIONS[1], BASE_COMPLETIONS[5]] },
+	{ prefix: "release agent-", expected: RELEASE_COMPLETIONS },
+	{ prefix: "release agent-s", expected: [RELEASE_COMPLETIONS[1]] },
+	...(["help", "status", "right", "down", "left", "up", "Add", " add", "missing"].map((prefix) => ({ prefix, expected: null }))),
+]) {
+	test(`team completion ${JSON.stringify(row.prefix)} preserves objects, ordering, and prefix filtering`, async (t) => {
+		const h = await commandHarness(t, { branch: teamBranch({ workers: ["agent-z", "agent-scout"] }) });
+		assert.deepEqual(h.commands.get("team").getArgumentCompletions(row.prefix), row.expected);
+		assert.deepEqual(h.entries, []);
+	});
+}
+
+test("release completions follow adoption and release without static aliases", async (t) => {
+	const h = await commandHarness(t);
+	const complete = h.commands.get("team").getArgumentCompletions;
+	assert.deepEqual(complete(""), [...BASE_COMPLETIONS, ...END_COMPLETIONS]);
+	assert.equal(complete("release"), null);
+	await command(h, "adopt agent-scout");
+	assert.deepEqual(complete("release"), [RELEASE_COMPLETIONS[1]]);
+	await command(h, "release agent-scout");
+	assert.equal(complete("release"), null);
+});
+
+for (const row of [
+	{ label: "empty", state: {}, status: undefined, title: CLEAR_TITLE },
+	{ label: "enabled without workers", state: { teamMode: true }, status: "team \u00b7 orchestrator", title: CLEAR_TITLE },
+	{ label: "one worker", state: { workers: ["agent-scout"] }, status: "team \u00b7 1 worker \u00b7 /team list", title: ["pane", "report-metadata", "self-pane", "--source", "pi-herdr-worker", "--title", "orchestrating agent-scout"] },
+	{ label: "two workers", state: { workers: ["agent-z", "agent-scout"] }, status: "team \u00b7 2 workers \u00b7 /team list", title: ["pane", "report-metadata", "self-pane", "--source", "pi-herdr-worker", "--title", "orchestrating agent-z, agent-scout"] },
+	{ label: "worker", state: { orchestratedBy: "boss" }, status: "team \u21d0 boss", title: ["pane", "report-metadata", "self-pane", "--source", "pi-herdr-worker", "--title", "orchestrator \u21d0 boss"] },
+	{ label: "unnamed worker", state: { orchestratedBy: "boss" }, selfName: "", status: "team \u21d0 boss", title: ["pane", "report-metadata", "self-pane", "--source", "pi-herdr-worker", "--title", "\u21d0 boss"] },
+	{ label: "combined", state: { workers: ["agent-scout"], orchestratedBy: "boss" }, status: "team \u00b7 1 worker \u00b7 /team list \u00b7 team \u21d0 boss", title: ["pane", "report-metadata", "self-pane", "--source", "pi-herdr-worker", "--title", "orchestrator \u21d0 boss"] },
+]) {
+	for (const hasUI of [true, false]) {
+		test(`${row.label} status and pane metadata respect hasUI=${hasUI}`, async (t) => {
+			const h = await commandHarness(t, { branch: teamBranch(row.state), selfName: row.selfName, hasUI });
+			assert.deepEqual(h.statusUpdates, hasUI ? [{ key: "herdr-worker", text: row.status }] : []);
+			assert.deepEqual(h.paneMetadataCalls, hasUI ? [row.title] : []);
+			assertRelationshipOnly(h);
+		});
+	}
+}
+
+test("only status sanitizes controls and truncates the orchestrator identifier", async (t) => {
+	const id = "boss\x00\x1f\x7f\x85\x9f0123456789012345678901234567890123456789";
+	const h = await commandHarness(t, { hasUI: true });
+	await command(h, id, "orchestrated-by");
+	assert.deepEqual(h.statusUpdates.at(-1), { key: "herdr-worker", text: "team \u21d0 boss     0123456789012345678901234567890" });
+	assert.deepEqual(h.paneMetadataCalls.at(-1), ["pane", "report-metadata", "self-pane", "--source", "pi-herdr-worker", "--title", `orchestrator \u21d0 ${id}`]);
+	assert.deepEqual(h.notifications, [{ text: `This agent is now orchestrated by ${id}.`, level: "info" }]);
+	assert.equal(h.entries.at(-1)?.data.orchestratedBy, id);
+	await command(h, "list");
+	assert.deepEqual(h.notifications.at(-1), { text: "team \u21d0 boss     0123456789012345678901234567890", level: "info" });
+});
+
+test("bare team enables an unnamed pane without renaming it and ignores metadata failure", async (t) => {
+	const h = await commandHarness(t, { hasUI: true, selfName: "", execOverride: (args) => args[1] === "report-metadata" ? { code: 1, stdout: "", stderr: "metadata failed" } : undefined });
+	await command(h, "");
+	assert.deepEqual(h.notifications, [{ text: "team \u00b7 orchestrator", level: "info" }]);
+	assert.deepEqual(h.paneMetadataCalls.at(-1), CLEAR_TITLE);
+	assert.deepEqual(h.activeTools(), ["CreateAgentPanel"]);
+	assertRelationshipOnly(h);
+});
+
+test("commands still notify and refresh tools with hasUI false without setting status or pane titles", async (t) => {
+	const h = await commandHarness(t, { hasUI: false, listening: true, activeTools: ["read"] });
+	await command(h, "adopt agent-scout");
+	await command(h, "release agent-scout");
+	assert.deepEqual(h.notifications, [
+		{ text: "Adopted existing agent agent-scout (pane worker-pane) as worker.", level: "info" },
+		{ text: "Released agent-scout. Its pane stays open.", level: "info" },
+	]);
+	assert.deepEqual(h.activeToolUpdates, [["read", "CreateAgentPanel"], ["read", "CreateAgentPanel", "SendToAgent"], ["read", "CreateAgentPanel"]]);
+	assert.deepEqual(h.statusUpdates, []);
+	assert.deepEqual(h.paneMetadataCalls, []);
+	assertRelationshipOnly(h);
+});
+
+test("tree restoration clears a removed relationship title and shutdown clears status", async (t) => {
+	const h = await commandHarness(t, { hasUI: true, branch: teamBranch({ orchestratedBy: "boss" }) });
+	h.branch.splice(0);
+	await h.handlers.get("session_tree")![0]({}, h.ctx);
+	await h.settleExec();
+	assert.deepEqual(h.statusUpdates.at(-1), { key: "herdr-worker", text: undefined });
+	assert.deepEqual(h.paneMetadataCalls.at(-1), CLEAR_TITLE);
+	assert.deepEqual(h.activeTools(), []);
+	await command(h, "from boss");
+	assert.deepEqual(h.statusUpdates.at(-1), { key: "herdr-worker", text: "team \u21d0 boss" });
+	await h.handlers.get("session_shutdown")![0]();
+	assert.deepEqual(h.statusUpdates.at(-1), { key: "herdr-worker", text: undefined });
+	assert.equal(h.events.listenerCount(), 0);
+});
 
 test("registers once, exposes live availability, and disposes on shutdown", async () => {
 	const h = await harness();
@@ -928,7 +1501,7 @@ test("live endpoint observation enriches exact matches and fails closed without 
 		assert.equal(result.data.endpoint?.herdrStatus, item.enriched ? "busy" : undefined, item.label);
 		assert.equal(item.enriched ? (result.data.endpoint?.observedAt ?? 0) >= 20 : result.data.endpoint?.observedAt, item.enriched ? true : 20, item.label);
 		assert.equal(h.entries.length, 0, item.label);
-		assert.deepEqual(sessionEntries, [registration, endpoint], item.label);
+		assert.deepEqual(h.sessionEntries, [registration, endpoint], item.label);
 	}
 });
 
@@ -979,7 +1552,7 @@ test("session tree replaces inspect authority without replacing the provider ins
 	const h = await harness({ branch });
 	await h.handlers.get("session_start")![0]({ reason: "startup" }, h.ctx);
 	const first = await emitForReply<any>(h.events, CHANNELS.probe, "first-generation", { requestId: "first-generation", supportedProtocols: [1] });
-	branch[0].data.workers = [];
+	h.branch[0].data.workers = [];
 	await h.handlers.get("session_tree")![0]({}, h.ctx);
 	const second = await emitForReply<any>(h.events, CHANNELS.probe, "same-generation", { requestId: "same-generation", supportedProtocols: [1] });
 	assert.equal(first.success && second.success && first.data.providerInstanceId, second.success && second.data.providerInstanceId);
