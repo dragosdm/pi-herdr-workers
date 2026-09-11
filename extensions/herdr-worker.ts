@@ -691,7 +691,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		async execute(_id, params, signal) {
 			let receipt: DeliveryReceipt;
 			try {
-				receipt = await service.send({ target: params.target_id, message: params.message, priority: params.priority ?? false }, signal);
+				receipt = await workerService.send({ target: params.target_id, message: params.message, priority: params.priority ?? false }, signal);
 			} catch (error) {
 				if (error instanceof SendServiceError) throw new Error(error.toolMessage);
 				throw error;
@@ -838,6 +838,12 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		cwd: string;
 		how: string;
 		adopted: boolean;
+	}
+
+	interface WorkerService {
+		spawn(input: SpawnInput, signal?: AbortSignal, provenance?: SpawnProvenance): Promise<CreateResult>;
+		send(input: SendInput, signal?: AbortSignal): Promise<DeliveryReceipt>;
+		inspect(input: InspectInput, signal?: AbortSignal): Promise<Inspection>;
 	}
 
 	function bindLifecycleRun(opts: CreateOpts, name: string, paneId: string): boolean {
@@ -1123,21 +1129,8 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			const result = await pending;
 			return result;
 	}
-	const service: WorkerRpcService = {
-		async spawn(input, provenance, signal) {
-			const result = await spawnWorker(input, signal, provenance);
-			return {
-				runId: result.runId,
-				...(result.correlationId === undefined ? {} : { correlationId: result.correlationId }),
-				name: result.name,
-				paneId: result.paneId,
-				cwd: result.cwd,
-				adopted: result.adopted,
-				...(result.model === undefined ? {} : { model: result.model }),
-				...(result.type === undefined ? {} : { type: result.type }),
-				...(result.purpose === undefined ? {} : { purpose: result.purpose }),
-			};
-		},
+	const workerService: WorkerService = {
+		spawn: spawnWorker,
 		async send(input: SendInput, signal?: AbortSignal): Promise<DeliveryReceipt> {
 			const priority = input.mode === undefined ? input.priority ?? false : input.mode === "steer";
 			return send(input.target, input.message, priority, signal, input.runId);
@@ -1182,7 +1175,25 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			};
 		},
 	};
-	const rpcServer = registerWorkerRpcServer({ events: pi.events, service, getProviderState: providerState });
+	const rpcService: WorkerRpcService = {
+		async spawn(input, provenance, signal) {
+			const result = await workerService.spawn(input, signal, provenance);
+			return {
+				runId: result.runId,
+				...(result.correlationId === undefined ? {} : { correlationId: result.correlationId }),
+				name: result.name,
+				paneId: result.paneId,
+				cwd: result.cwd,
+				adopted: result.adopted,
+				...(result.model === undefined ? {} : { model: result.model }),
+				...(result.type === undefined ? {} : { type: result.type }),
+				...(result.purpose === undefined ? {} : { purpose: result.purpose }),
+			};
+		},
+		send: workerService.send,
+		inspect: workerService.inspect,
+	};
+	const rpcServer = registerWorkerRpcServer({ events: pi.events, service: rpcService, getProviderState: providerState });
 
 	async function release(name: string): Promise<string> {
 		if (!state.workers.includes(name)) throw new Error(`Not orchestrating "${name}". Workers: ${state.workers.join(", ") || "(none)"}`);
@@ -1229,7 +1240,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		async execute(_id, params, _signal, onUpdate, ctx) {
 			if (!isOrchestrator()) throw new Error("CreateAgentPanel is only available to an orchestrator (run /team here first).");
 			onUpdate?.({ content: [{ type: "text", text: "Splitting pane and starting worker…" }], details: {} });
-			const create = () => spawnWorker(
+			const create = () => workerService.spawn(
 				{ name: params.name, direction: params.direction as Direction | undefined, type: params.type, purpose: params.purpose, model: params.model, thinking: params.thinking, initialPrompt: params.initial_prompt },
 				_signal,
 			);

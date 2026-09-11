@@ -24,13 +24,40 @@ Turns this pane into an orchestrator and puts other Pi agents in neighboring Her
 
 | Command | Effect |
 |---|---|
+| `/team` | Enable team mode on an unowned pane and show the saved team |
 | `/team add [right\|down\|left\|up] [type] [purpose…]` | Enable team mode and have the LLM create a worker with `CreateAgentPanel` |
-| `/team list` | Show workers / orchestrator |
+| `/team list` or `/team status` | Show saved workers / orchestrator, even if a peer is no longer live |
 | `/team release <name>` | Stop orchestrating that worker (pane stays open) |
 | `/team adopt <name>` | Control an existing Herdr agent without creating a pane |
 | `/team from <id>` | Worker: adopt an orchestrator after startup |
+| `/orchestrated-by <id>` | Set an orchestrator using the full trimmed argument, without enabling team mode |
+| `/team help` | Show command usage |
 
-`/team` once flips **team mode**: status shows `Orchestrator …`, the system prompt gets the orchestrator brief, and `CreateAgentPanel` appears. The pane is renamed `orchestrator` if it has no Herdr agent name.
+On a fresh, unowned pane, bare `/team` enables team mode and displays `team · orchestrator`. The system prompt gets the orchestrator brief and `CreateAgentPanel` becomes active. Bare `/team` does not rename the pane. During creation, an unnamed pane is renamed `orchestrator`.
+
+```text
+/team
+/team add right explore inspect the authentication system
+/team list
+/team release agent-explore
+```
+
+`/team add` submits an instruction asking the model to call `CreateAgentPanel` with a charter and concrete initial brief. If Pi is busy, that instruction queues as a follow-up. The command itself does not split a pane, start an agent, or register an assignment. Only the later tool call creates the worker. Use the actual returned worker name when listing, messaging, or releasing it; collisions can change the name.
+
+The direction defaults to right. Bare `right`, `down`, `left`, and `up` are aliases after `/team`. The first recognized direction can appear after the type, as in `/team add explore down inspect auth`. Verbs, directions, and command type hints are case-sensitive. Arguments split on whitespace, not shell quoting; purpose text loses only its outermost leading/trailing quote characters. `adopt`, `release`, and `from` use their first argument and ignore extra words.
+
+Adoption and release change the saved relationship without creating or closing a pane. Release removes worker metadata but preserves assignment and lifecycle history; it does not report completion, failure, or a stopped process. Worker panes cannot add team members or use `CreateAgentPanel`. Commands require an interactive TUI session in a Herdr pane.
+
+Command and model-tool compatibility tests characterize checkout `112410ca26e8a95b0c4f3b4e5b9fa81899313e4a`, not every historical release. They invoke the registered adapters and check exact prompts, notifications, completions, schemas, activation gates, detailed errors, result objects, and renderer text and semantic styling. Paired tool/RPC cases compare journals, pane placement, launch arguments, re-adoption, delivery, and failure evidence in separate fixtures. Mixed-entry tests check the shared creation queue and existing cancellation boundaries.
+
+Herdr calls and host UI calls are mocked. These tests do not run a live model-to-worker workflow or an external `pi-rpi` consumer. The Pi 0.84.4 fixture remains focused on queues and storage, without synthetic model tool calls. Live Herdr verification is a separate release check requiring explicit approval to create panes; automated success does not mean that check passed. Run the automated compatibility checks with:
+
+```sh
+node --import tsx --test tests/extensions/herdr-worker-adapter.test.ts tests/rpc/*.test.ts
+npm run typecheck
+npm test
+git diff --check
+```
 
 ### `CreateAgentPanel`
 
@@ -90,6 +117,10 @@ Uncertain contract 2 runs can be resolved through the separate process-local rec
 ### Inter-extension RPC
 
 Extensions loaded in the same Pi process can probe `herdr-workers:rpc:probe` and call the worker provider directly, without a model turn. Probe first, negotiate protocol 1, select one available provider instance, and use its request-specific reply channels. The fixed capabilities are `spawn`, `send`, `steer`, and team-scoped `inspect`; existing `/team`, `CreateAgentPanel`, and `SendToAgent` behavior is unchanged.
+
+Inside `extensions/herdr-worker.ts`, a closure-local `workerService` owns spawn, send, and inspect. Both tools and the thin `rpcService` adapter delegate to it. Spawning retains one creation queue and the existing registration, endpoint, and lifecycle ordering. `/team add` still submits model intent, while list, adopt, release, and ownership commands keep their relationship handlers.
+
+The adapters keep different contracts. Local tools retain detailed errors and display data: creation includes `how` and the original `initial_prompt`; send details remain exactly `{ target, priority, message, status }`. RPC explicitly selects public worker fields and returns transport receipts without prompt/message echoes. Tool activation still depends on team state; RPC readiness does not require team mode. A tool signal retains its existing abort checkpoints, while RPC client abort only ends the caller's wait and may be followed by provider effects and a late reply.
 
 The event bus is process-local, requests are not durable, and callers should use bounded waits and fall back when no provider is available. A spawn reply identifies the run and closes the request; a send receipt confirms transport acceptance; lifecycle observations record evidence; only explicit run-aware `completed` or `failed` reports state an assignment outcome. The registered stop channel is reserved: stop is not advertised and returns `UNSUPPORTED_OPERATION`; it does not release a worker, close a pane, or send Ctrl-C. See `docs/rpc-protocol.md` for the import-free JSON contract, limits, routing, errors, and raw `pi.events` usage.
 
