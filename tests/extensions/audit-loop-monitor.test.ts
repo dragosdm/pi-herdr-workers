@@ -81,13 +81,14 @@ test("Known audit gap: a second continue update succeeds without another wake", 
   assert.equal(f.store.get(loop.id)?.dynamic?.iteration, 2);
   assert.equal(f.store.get(loop.id)?.fireCount, 0);
 });
-test("Known audit gap: pause checkpoints are not applied to dynamic state", async () => {
+test("Dynamic pause checkpoints are saved to dynamic state", async () => {
   const f = fixture();
   const loop = f.store.create({ type: "dynamic" }, "audit", { recurring: true, maxFires: 3, dynamic: { goal: "audit", state: "old", iteration: 0, awaitingUpdate: true } });
   await f.call("LoopUpdate", { id: loop.id, status: "paused", state: "new", metrics: "new-metrics", doneCriteria: "new-done" });
   assert.equal(f.store.get(loop.id)?.status, "paused");
-  assert.equal(f.store.get(loop.id)?.dynamic?.state, "old");
-  assert.equal(f.store.get(loop.id)?.dynamic?.metrics, undefined);
+  assert.equal(f.store.get(loop.id)?.dynamic?.state, "new");
+  assert.equal(f.store.get(loop.id)?.dynamic?.metrics, "new-metrics");
+  assert.equal(f.store.get(loop.id)?.dynamic?.doneCriteria, "new-done");
 });
 test("Known audit gap: dynamic loops awaiting an update bypass scheduler expiry", () => {
   const f = fixture();
