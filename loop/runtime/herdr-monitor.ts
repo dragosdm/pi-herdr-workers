@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { setTimeout as delay } from "node:timers/promises";
+import { stripVTControlCharacters } from "node:util";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 export type HerdrMonitorStatus = "running" | "idle" | "stopped" | "error" | "unknown";
@@ -70,14 +71,22 @@ export class HerdrMonitorManager {
   get(id: string): HerdrMonitor | undefined { return this.byId.get(id); }
   private persist() { if (!this.lifetime.signal.aborted) this.onChange?.(this.snapshot()); }
   private signal(signal?: AbortSignal) { return signal ? AbortSignal.any([signal, this.lifetime.signal]) : this.lifetime.signal; }
-  private async herdr(args: string[], signal?: AbortSignal, timeout = 15000): Promise<any> {
+  throwIfAborted(signal?: AbortSignal): void {
+    signal?.throwIfAborted();
+    this.lifetime.signal.throwIfAborted();
+  }
+  private async herdrText(args: string[], signal?: AbortSignal, timeout = 15000): Promise<string> {
     if (process.env.HERDR_ENV !== "1" || !process.env.HERDR_WORKSPACE_ID) throw new Error("Monitors require a Herdr-managed pane.");
+    this.throwIfAborted(signal);
     signal = this.signal(signal);
-    signal.throwIfAborted();
     const result = await abortable(this.exec("herdr", args, { timeout, signal }), signal);
-    signal.throwIfAborted();
+    this.throwIfAborted(signal);
     if (result.code !== 0 || result.killed) throw new Error(clean(result.stderr || result.stdout || "Herdr request failed"));
-    return result.stdout.trim() ? JSON.parse(result.stdout) : {};
+    return result.stdout;
+  }
+  private async herdr(args: string[], signal?: AbortSignal, timeout = 15000): Promise<any> {
+    const stdout = await this.herdrText(args, signal, timeout);
+    return stdout.trim() ? JSON.parse(stdout) : {};
   }
   private serialize<T>(fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     const next = this.mutation.then(() => { signal?.throwIfAborted(); return fn(); });
@@ -218,10 +227,15 @@ export class HerdrMonitorManager {
     return m;
   }
   async readTail(paneId: string, lines = 5, signal?: AbortSignal): Promise<string[]> {
-    const raw = await this.herdr(["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", String(lines)], signal);
-    const result = raw.result ?? {};
-    const text = result.text ?? result.output ?? JSON.stringify(result);
-    return String(text).split("\n").filter(Boolean).slice(-lines);
+    if (!Number.isSafeInteger(lines) || lines <= 0) throw new RangeError("Tail lines must be a positive safe integer.");
+    // Herdr 0.8.0 counts terminal rows before dropping trailing blanks from stdout.
+    // Keep one bounded capture window, separate from the nonblank display-row limit.
+    const captureLines = Math.max(50, lines);
+    const stdout = await this.herdrText(["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", String(captureLines), "--format", "text"], signal);
+    return stripVTControlCharacters(stdout)
+      .replace(/\r\n?/g, "\n")
+      .replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, " ")
+      .split("\n").filter(row => row.trim().length > 0).slice(-lines);
   }
   stop(id: string, signal?: AbortSignal): Promise<boolean> {
     signal = this.signal(signal);

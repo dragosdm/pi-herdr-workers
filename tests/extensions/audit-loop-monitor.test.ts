@@ -117,13 +117,14 @@ test("Continue preserves omitted checkpoint fields and rejects renewal beyond th
   await assert.rejects(async () => f.call("LoopUpdate", { id: loop.id, status: "continue" }), /fire cap/);
 });
 
-test("Known audit gap: monitor readTail assumes JSON for Herdr's text output", async () => {
+test("Monitor readTail returns Herdr text output", async () => {
   const old = { env: process.env.HERDR_ENV, workspace: process.env.HERDR_WORKSPACE_ID };
   process.env.HERDR_ENV = "1"; process.env.HERDR_WORKSPACE_ID = "audit";
   try {
     const manager = new HerdrMonitorManager(async () => ({ stdout: "AUDIT_SERVER_READY\n", stderr: "", code: 0, killed: false }));
-    await assert.rejects(manager.readTail("audit-pane"), SyntaxError);
-    manager.dispose();
+    try {
+      assert.deepEqual(await manager.readTail("audit-pane"), ["AUDIT_SERVER_READY"]);
+    } finally { manager.dispose(); }
   } finally {
     if (old.env === undefined) delete process.env.HERDR_ENV; else process.env.HERDR_ENV = old.env;
     if (old.workspace === undefined) delete process.env.HERDR_WORKSPACE_ID; else process.env.HERDR_WORKSPACE_ID = old.workspace;

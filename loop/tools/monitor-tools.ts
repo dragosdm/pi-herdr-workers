@@ -72,6 +72,7 @@ export function registerMonitorTools(options: MonitorToolsOptions): void {
     parameters: Type.Object({}),
     async execute(_id, _params, signal) {
       const manager = getMonitors();
+      manager.throwIfAborted(signal);
       const monitors = manager.list();
       if (monitors.length === 0) {
         return textResult("No monitors.", {
@@ -86,14 +87,17 @@ export function registerMonitorTools(options: MonitorToolsOptions): void {
         lines.push(`${icon} #${m.id} [${m.status}${launch}] ${m.command.slice(0, 60)} · pane ${m.paneId} (${formatAge(Date.now() - m.startedAt)})`);
         try {
           const tail = await manager.readTail(m.paneId, 5, signal);
+          if (tail.length === 0) lines.push("  | (no output captured)");
           for (const out of tail) lines.push(`  | ${out.slice(0, 100)}`);
         } catch {
-          signal?.throwIfAborted();
+          manager.throwIfAborted(signal);
           lines.push("  | (could not read pane)");
         }
       }
+      manager.throwIfAborted(signal);
       updateWidget();
       const running = monitors.filter((monitor) => monitor.status === "running").length;
+      manager.throwIfAborted(signal);
       return textResult(lines.join("\n"), {
         kind: "monitor",
         action: "list",
