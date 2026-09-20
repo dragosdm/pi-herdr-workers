@@ -6,7 +6,7 @@ import { CronScheduler } from "../../loop/scheduler.js";
 import { TriggerSystem } from "../../loop/trigger-system.js";
 import { registerLoopTools } from "../../loop/tools/loop-tools.js";
 import { registerLoopCommand } from "../../loop/commands/loop-command.js";
-import { HerdrMonitorManager } from "../../loop/runtime/herdr-monitor.js";
+import { HerdrMonitorManager, commandKey } from "../../loop/runtime/herdr-monitor.js";
 
 // Passing characterizations of audit findings, NOT assertions that these are desirable.
 // Invert the relevant expectations when fixing the documented gaps.
@@ -33,11 +33,11 @@ function fixture() {
   return { store, scheduler, triggers, subscriptions, commands, call: (name: string, input: any) => tools.get(name).execute("audit", input) };
 }
 
-test("Known audit gap: zero duration silently creates a minute cadence", () => {
-  assert.equal(parseInterval("0m").cron, "*/1 * * * *");
+test("Zero duration is rejected without rounding", () => {
+  assert.throws(() => parseInterval("0m"), /positive safe integer/);
 });
-test("Known audit gap: two days silently becomes daily", () => {
-  assert.equal(parseInterval("2d").cron, "0 0 * * *");
+test("Two-day shorthand is rejected without becoming daily", () => {
+  assert.throws(() => parseInterval("2d"), /Unsupported cron interval/);
 });
 test("Known audit gap: day-of-month and weekday use AND, not conventional cron OR", () => {
   const next = cronToNextFire("0 0 1 * 1", new Date(2026, 8, 20, 12));
@@ -53,19 +53,23 @@ test("Known audit gap: full cron in a hybrid spec is truncated to one field", as
   await assert.rejects(f.call("LoopCreate", { trigger: "cron: */5 * * * * event: audit", triggerType: "hybrid", prompt: "audit", maxFires: 1 }), /Cannot parse interval/);
   assert.equal(f.store.list().length, 0);
 });
-test("Known audit gap: failed scheduling leaves an active saved loop and breaks restoration subscriptions", async () => {
+test("Failed scheduling leaves no saved loop and healthy restoration subscribes", async () => {
   const f = fixture();
+  const before = f.store.snapshot();
   await assert.rejects(f.call("LoopCreate", { trigger: "0 0 31 2 *", triggerType: "cron", prompt: "audit", maxFires: 1 }), /No matching time/);
-  assert.equal(f.store.list()[0].status, "active");
+  assert.deepEqual(f.store.snapshot(), before);
   const event = f.store.create({ type: "event", source: "audit" }, "audit", { recurring: true, maxFires: 1 });
-  assert.throws(() => f.triggers.start(), /No matching time/);
-  assert.equal(f.subscriptions.get("audit"), undefined);
-  assert.equal(f.store.get(event.id)?.fireCount, 0);
+  try {
+    assert.doesNotThrow(() => f.triggers.start());
+    assert.equal(f.subscriptions.get("audit")?.size, 1);
+    assert.equal(f.store.get(event.id)?.fireCount, 0);
+  } finally { f.triggers.stop(); }
 });
 test("Command creation rolls back the same impossible cron", async () => {
   const f = fixture(); const notices: string[] = [];
+  const before = f.store.snapshot();
   await f.commands.get("loop").handler("0 0 31 2 * audit", { hasUI: true, ui: { notify: (message: string) => notices.push(message) } });
-  assert.equal(f.store.list().length, 0);
+  assert.deepEqual(f.store.snapshot(), before);
   assert.match(notices[0], /No matching time/);
 });
 test("Known audit gap: cron without a prompt is interpreted as a dynamic goal", async () => {
@@ -93,12 +97,12 @@ test("Dynamic pause checkpoints are saved to dynamic state", async () => {
   assert.equal(f.store.get(loop.id)?.dynamic?.metrics, "new-metrics");
   assert.equal(f.store.get(loop.id)?.dynamic?.doneCriteria, "new-done");
 });
-test("Known audit gap: dynamic loops awaiting an update bypass scheduler expiry", () => {
+test("Dynamic loops awaiting an update expire without another wake", () => {
   const f = fixture();
   const loop = f.store.create({ type: "dynamic" }, "audit", { recurring: true, maxFires: 3, dynamic: { goal: "audit", iteration: 0, awaitingUpdate: true } });
   f.scheduler.add(loop);
   f.scheduler.pump(loop.expiresAt + 1);
-  assert.equal(f.store.get(loop.id)?.status, "active");
+  assert.equal(f.store.get(loop.id), undefined);
 });
 
 test("Loop store enforces the 25-controller cap", () => {
@@ -118,39 +122,46 @@ test("Continue preserves omitted checkpoint fields and rejects renewal beyond th
   await assert.rejects(async () => f.call("LoopUpdate", { id: loop.id, wakeId: final, status: "continue" }), /fire cap/);
 });
 
-test("Known audit gap: monitor readTail assumes JSON for Herdr's text output", async () => {
+test("Monitor readTail returns Herdr text output", async () => {
   const old = { env: process.env.HERDR_ENV, workspace: process.env.HERDR_WORKSPACE_ID };
   process.env.HERDR_ENV = "1"; process.env.HERDR_WORKSPACE_ID = "audit";
   try {
     const manager = new HerdrMonitorManager(async () => ({ stdout: "AUDIT_SERVER_READY\n", stderr: "", code: 0, killed: false }));
-    await assert.rejects(manager.readTail("audit-pane"), SyntaxError);
-    manager.dispose();
+    try {
+      assert.deepEqual(await manager.readTail("audit-pane"), ["AUDIT_SERVER_READY"]);
+    } finally { manager.dispose(); }
   } finally {
     if (old.env === undefined) delete process.env.HERDR_ENV; else process.env.HERDR_ENV = old.env;
     if (old.workspace === undefined) delete process.env.HERDR_WORKSPACE_ID; else process.env.HERDR_WORKSPACE_ID = old.workspace;
   }
 });
 
-test("Known audit gap: busy shell startup in a new monitor pane reports success without running its command", async () => {
+test("A01: new monitor waits for shell startup and submits once", async () => {
   const old = { env: process.env.HERDR_ENV, workspace: process.env.HERDR_WORKSPACE_ID };
   process.env.HERDR_ENV = "1"; process.env.HERDR_WORKSPACE_ID = "audit";
   const calls: string[][] = [];
+  let probes = 0;
+  let manager: HerdrMonitorManager | undefined;
   try {
-    const manager = new HerdrMonitorManager(async (_command, args) => {
+    manager = new HerdrMonitorManager(async (_command, args) => {
       calls.push(args);
       let result: any = {};
       if (args[0] === "tab") result = { tabs: [{ label: "Monitor", tab_id: "tab" }] };
       if (args[0] === "pane" && args[1] === "list") result = { panes: [{ pane_id: "root", tab_id: "tab", label: "existing" }] };
       if (args[1] === "split") result = { pane: { pane_id: "new" } };
-      if (args[1] === "process-info") result = { process_info: { shell_pid: 1, foreground_processes: [{ pid: 2, name: "shell-startup-helper" }] } };
+      if (args[1] === "process-info") result = { process_info: { shell_pid: 1, foreground_processes: [++probes === 1 ? { pid: 2, name: "shell-startup-helper" } : { pid: 1, name: "zsh" }] } };
+      if (args[1] === "get") result = { pane: { label: `mon:${commandKey("printf canary", "/tmp")} canary` } };
       return { stdout: JSON.stringify({ result }), stderr: "", code: 0, killed: false };
     });
-    const monitor = await manager.create("printf never-ran", undefined, "/tmp");
+    const monitor = await manager.create("printf canary", undefined, "/tmp");
     assert.equal(monitor.status, "running");
     assert.equal(monitor.reused, false);
-    assert.equal(calls.some(args => args[1] === "run"), false);
-    manager.dispose();
+    assert.equal(monitor.launchState, "submitted");
+    assert.equal(monitor.createAction, "submitted");
+    assert.equal(calls.filter(args => args[1] === "run").length, 1);
+    assert.equal(calls.some(args => args[1] === "send-keys"), false);
   } finally {
+    manager?.dispose();
     if (old.env === undefined) delete process.env.HERDR_ENV; else process.env.HERDR_ENV = old.env;
     if (old.workspace === undefined) delete process.env.HERDR_WORKSPACE_ID; else process.env.HERDR_WORKSPACE_ID = old.workspace;
   }

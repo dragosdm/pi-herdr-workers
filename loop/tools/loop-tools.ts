@@ -2,7 +2,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 import { dynamicAckError, invalidDynamicWakeState, isOrdinaryDynamic, validWakeId } from "../dynamic-ack.js";
 import { formatTrigger } from "../loop-format.js";
-import { parseInterval } from "../loop-parse.js";
+import { CRON_TIMING_NOTE, matchIntervalPrefix, parseInterval } from "../loop-parse.js";
 import { getOrchestrationCounts } from "../orchestration-reducer.js";
 import type { LoopEntry, Trigger } from "../types.js";
 import { renderToolCall, renderToolResult, toolArg } from "../ui/tool-renderer.js";
@@ -90,8 +90,9 @@ function validateTrigger(trigger: Trigger): string | null {
 
 function inferTriggerType(input: string): "cron" | "event" | "hybrid" {
   if (input.includes("hybrid") || (input.includes("cron") && input.includes("event"))) return "hybrid";
-  if (/^\d+\s*[smhd]$/i.test(input.trim())) return "cron";
   if (/^(\*|\d+)/.test(input.trim()) && input.trim().split(/\s+/).length === 5) return "cron";
+  const interval = matchIntervalPrefix(input);
+  if (interval && !interval.rest) return "cron";
   return "event";
 }
 
@@ -235,7 +236,7 @@ export function registerLoopTools(options: LoopToolsOptions): void {
       "Use LoopDelete only for explicit cancellation or a satisfied stop condition—not after a normal, empty, or unchanged iteration. Report the created loop ID.",
     ],
     parameters: Type.Object({
-      trigger: Type.String({ description: "Cron expression (e.g., '5m', '1h', '0 9 * * 1-5'), event source (e.g., 'tool_execution_start'), hybrid spec, or literal 'idle' with triggerType='idle'" }),
+      trigger: Type.String({ description: "Five-field cron expression (e.g., '0 9 * * 1-5') or supported cron shorthand (e.g., '5m', '1h'; no rounding), event source (e.g., 'tool_execution_start'), hybrid spec, or literal 'idle' with triggerType='idle'" }),
       prompt: Type.String({ description: "Prompt to run when the loop fires" }),
       recurring: Type.Optional(Type.Boolean({ description: "Whether loop repeats (default: true)", default: true })),
       triggerType: Type.Optional(Type.String({ description: "cron, event, hybrid, or idle (cron/event inferred from trigger string if omitted)", enum: ["cron", "event", "hybrid", "idle"] })),
@@ -243,7 +244,8 @@ export function registerLoopTools(options: LoopToolsOptions): void {
       readOnly: Type.Optional(Type.Boolean({ description: "Restrict the agent to read-only tools when this loop fires (default: false)", default: false })),
       maxFires: Type.Optional(Type.Integer({ description: "Auto-stop after N fires. Prevents infinite token burn on polling loops.", minimum: 1 })),
     }, { additionalProperties: false }),
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, signal) {
+      signal?.throwIfAborted();
       const { trigger: triggerInput, prompt, recurring, triggerType, debounceMs, readOnly, maxFires } = params;
 
       let trigger: Trigger;
@@ -288,7 +290,9 @@ export function registerLoopTools(options: LoopToolsOptions): void {
           expanded: [validationError],
         }));
       }
-      const entry = getStore().create(trigger, prompt, {
+      const store = getStore();
+      const triggerSystem = getTriggerSystem();
+      const entry = store.create(trigger, prompt, {
         recurring: recurring ?? true,
         readOnly,
         maxFires: maxFires ?? 25,
@@ -297,7 +301,19 @@ export function registerLoopTools(options: LoopToolsOptions): void {
           : undefined,
       });
 
-      getTriggerSystem().add(entry);
+      try {
+        triggerSystem.add(entry);
+      } catch (error) {
+        const cleanupErrors: unknown[] = [];
+        try { triggerSystem.remove(entry.id); } catch (cause) { cleanupErrors.push(cause); }
+        try { store.delete(entry.id); } catch (cause) { cleanupErrors.push(cause); }
+        // Rendering is not allowed to hide the registration or cleanup failure.
+        try { updateWidget(); } catch { /* primary error takes precedence */ }
+        if (cleanupErrors.length) {
+          throw new AggregateError([error, ...cleanupErrors], `Loop #${entry.id} registration failed: ${String(error)}; rollback failed: ${cleanupErrors.map(String).join("; ")}`, { cause: error });
+        }
+        throw error;
+      }
       if (trigger.type === "dynamic") onDynamicLoopActivated?.(entry);
 
       if (trigger.type === "event" && trigger.source === "monitor:done" && trigger.filter) {
@@ -319,11 +335,13 @@ export function registerLoopTools(options: LoopToolsOptions): void {
       updateWidget();
 
       const triggerDesc = trigger.type === "dynamic" ? "idle-driven" : formatTrigger(trigger, "create");
+      const timingNote = trigger.type === "cron" || trigger.type === "hybrid" ? CRON_TIMING_NOTE : undefined;
 
       return Promise.resolve(textResult(
         `Loop #${entry.id} created: ${entry.prompt.slice(0, 60)}\n` +
         `Trigger: ${triggerDesc}\n` +
         `Recurring: ${entry.recurring}\n` +
+        (timingNote ? `${timingNote}\n` : "") +
         (trigger.type === "dynamic" ? "Wake: when idle (first wake queued now)\n" : "") +
         `ID: ${entry.id} (persists until explicitly canceled or a configured stop condition is met)`,
         {
@@ -334,6 +352,7 @@ export function registerLoopTools(options: LoopToolsOptions): void {
           expanded: [
             `Goal: ${entry.prompt}`,
             `Trigger: ${triggerDesc}`,
+            ...(timingNote ? [timingNote] : []),
           ],
         },
       ));
@@ -380,6 +399,7 @@ export function registerLoopTools(options: LoopToolsOptions): void {
           line += ` age: ${formatRemaining(Math.max(0, now - entry.createdAt))}`;
         }
         if (entry.pause) line += ` [pause:${entry.pause.kind}]`;
+        if (entry.pause?.reason) line += ` reason: ${entry.pause.reason}`;
         if (isOrdinaryDynamic(entry)) {
           line += ` awaitingUpdate: ${entry.dynamic!.awaitingUpdate === true}`;
           if (invalidDynamicWakeState(entry)) {

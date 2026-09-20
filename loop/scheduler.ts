@@ -4,6 +4,13 @@ import type { LoopStore } from "./store.js";
 import type { LoopEntry, LoopExpiryDisposition, LoopFireOrigin } from "./types.js";
 import { atWorkflowStateFireLimit, getActiveWorkflowStateLoop, isTerminalWorkflowRun } from "./workflow-reducer.js";
 
+class ScheduleResolutionError extends Error {
+  constructor(cause: unknown) {
+    super(cause instanceof Error ? cause.message : String(cause), { cause });
+    this.name = "ScheduleResolutionError";
+  }
+}
+
 function computeNextFire(entry: LoopEntry): Date {
   const workflowLoop = entry.workflow && getActiveWorkflowStateLoop(entry.workflow);
   if (workflowLoop) return cronToNextFire(workflowLoop.schedule);
@@ -28,8 +35,8 @@ export class CronScheduler {
   ) {}
 
   start(): void {
-    for (const storedEntry of this.store.list()) {
-      let entry = storedEntry;
+    this.stop();
+    for (const entry of this.store.list()) {
       if (entry.status !== "active" || entry.orchestration || entry.workflow?.waitingMonitor || isTerminalWorkflowRun(entry.workflow)) continue;
       if (entry.trigger.type === "event") {
         this.expiryTimes.set(entry.id, entry.expiresAt);
@@ -37,7 +44,17 @@ export class CronScheduler {
       }
       // A dispatched iteration remains awaiting its durable LoopUpdate after reload.
       // Re-arming it here would repeat external work (and race a recovered pending wake).
-      this.armTimer(entry);
+      try {
+        this.armTimer(entry);
+      } catch (error) {
+        if (!(error instanceof ScheduleResolutionError)) throw error;
+        this.remove(entry.id);
+        try {
+          this.store.pause(entry.id, "administrative", `Schedule unavailable: ${error.message}`);
+        } catch (cause) {
+          throw new Error(`Failed to persist schedule quarantine for loop #${entry.id}: ${cause instanceof Error ? cause.message : String(cause)}`, { cause });
+        }
+      }
     }
   }
 
@@ -96,7 +113,12 @@ export class CronScheduler {
 
   private armTimer(entry: LoopEntry): void {
     if (entry.workflow?.waitingMonitor) return;
-    const nextFire = computeNextFire(entry);
+    let nextFire: Date;
+    try {
+      nextFire = computeNextFire(entry);
+    } catch (cause) {
+      throw new ScheduleResolutionError(cause);
+    }
     let jitter = 0;
     const workflowLoop = entry.workflow && getActiveWorkflowStateLoop(entry.workflow);
     if (workflowLoop || entry.trigger.type === "cron" || entry.trigger.type === "hybrid") {
@@ -142,14 +164,15 @@ export class CronScheduler {
         continue;
       }
 
-      if (entry.trigger.type === "dynamic" && entry.dynamic?.awaitingUpdate) continue;
-
-      if (filter && !filter(entry)) continue;
-
+      // Lifetime enforcement precedes work eligibility, including awaiting updates.
       if (now >= entry.expiresAt) {
         this.retireExpired(entry, now);
         continue;
       }
+
+      if (entry.trigger.type === "dynamic" && entry.dynamic?.awaitingUpdate) continue;
+
+      if (filter && !filter(entry)) continue;
 
       this.onFire(entry, "scheduler");
 
