@@ -230,7 +230,7 @@ export function registerLoopTools(options: LoopToolsOptions): void {
       "Use LoopDelete only for explicit cancellation or a satisfied stop condition—not after a normal, empty, or unchanged iteration. Report the created loop ID.",
     ],
     parameters: Type.Object({
-      trigger: Type.String({ description: "Five-field cron expression (e.g., '0 9 * * 1-5') or supported cron shorthand (e.g., '5m', '1h'; no rounding), event source (e.g., 'tool_execution_start'), hybrid spec, or literal 'idle' with triggerType='idle'" }),
+      trigger: Type.String({ description: "Local-time numeric five-field cron expression (e.g., '0 9 * * 1-5') or supported cron shorthand (e.g., '5m', '1h'; no rounding), event source (e.g., 'tool_execution_start'), hybrid spec, or literal 'idle' with triggerType='idle'" }),
       prompt: Type.String({ description: "Prompt to run when the loop fires" }),
       recurring: Type.Optional(Type.Boolean({ description: "Whether loop repeats (default: true)", default: true })),
       triggerType: Type.Optional(Type.String({ description: "cron, event, hybrid, or idle (cron/event inferred from trigger string if omitted)", enum: ["cron", "event", "hybrid", "idle"] })),

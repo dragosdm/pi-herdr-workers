@@ -39,14 +39,13 @@ test("Zero duration is rejected without rounding", () => {
 test("Two-day shorthand is rejected without becoming daily", () => {
   assert.throws(() => parseInterval("2d"), /Unsupported cron interval/);
 });
-test("Known audit gap: day-of-month and weekday use AND, not conventional cron OR", () => {
+test("Restricted day-of-month and weekday use conventional cron OR", () => {
   const next = cronToNextFire("0 0 1 * 1", new Date(2026, 8, 20, 12));
-  assert.equal(next.getFullYear(), 2027);
-  assert.equal(next.getMonth(), 1);
-  assert.equal(next.getDate(), 1);
+  assert.equal(next.getTime(), new Date(2026, 8, 21).getTime());
 });
-test("Known audit gap: valid leap-day schedule beyond 366 days is rejected", () => {
-  assert.throws(() => cronToNextFire("0 0 29 2 *", new Date(2026, 8, 20)), /No matching time/);
+test("Valid leap-day schedule beyond 366 days returns its next occurrence", () => {
+  const next = cronToNextFire("0 0 29 2 *", new Date(2026, 8, 20));
+  assert.equal(next.getTime(), new Date(2028, 1, 29).getTime());
 });
 test("Known audit gap: full cron in a hybrid spec is truncated to one field", async () => {
   const f = fixture();
