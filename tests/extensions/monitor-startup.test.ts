@@ -28,6 +28,7 @@ function fixture(t: TestContext, mode: "split" | "new-root" | "idle-root" = "spl
     hook: undefined as undefined | ((args: string[], options: any) => any),
     waitHook: undefined as undefined | ((ms: number, signal: AbortSignal) => Promise<void>),
     persistHook: undefined as undefined | ((snapshot: MonitorSnapshot) => void),
+    widgetHook: undefined as undefined | (() => void),
     tick(ms: number) { now += ms; for (const timer of [...timers]) if (timer.at <= now) { timers.delete(timer); timer.expire(); } },
     advanceWithoutTimers(ms: number) { now += ms; },
     count(verb: string) { return calls.filter(c => c.args[1] === verb).length; },
@@ -64,7 +65,7 @@ function fixture(t: TestContext, mode: "split" | "new-root" | "idle-root" = "spl
   });
   manager.onChange = s => { snapshots.push(s); order.push(`save:${s.monitors.at(-1)?.launchState}`); f.persistHook?.(s); };
   const tools = new Map<string, any>(); let widgets = 0;
-  registerMonitorTools({ pi: { registerTool: (tool: any) => tools.set(tool.name, tool) } as any, getMonitors: () => manager, updateWidget: () => { widgets++; } });
+  registerMonitorTools({ pi: { registerTool: (tool: any) => tools.set(tool.name, tool) } as any, getMonitors: () => manager, updateWidget: () => { widgets++; f.widgetHook?.(); } });
   t.after(() => {
     manager.dispose(); assert.equal(timers.size, 0, "readiness deadline cleaned up");
     for (const [key, value] of Object.entries(env)) { if (value === undefined) delete process.env[key]; else process.env[key] = value; }
@@ -347,6 +348,29 @@ test("tool text follows submission action, reports uncertainty and updates failu
   assert.deepEqual(Object.keys(f.tools.get("MonitorCreate").parameters.properties), ["command", "description"]);
   assert.deepEqual(Object.keys(f.tools.get("MonitorList").parameters.properties), []);
   assert.deepEqual(Object.keys(f.tools.get("MonitorStop").parameters.properties), ["monitorId"]);
+});
+test("adapter preserves uncertain pane warning when failure-path widget refresh throws", async t => {
+  const f = fixture(t);
+  const warning = "Monitor #7 submission may have happened; inspect pane retained-pane before retrying. run timed out";
+  f.manager.create = async () => { throw new Error(warning); };
+  f.widgetHook = () => { throw new Error("widget unavailable"); };
+  await assert.rejects(f.call("MonitorCreate", { command: "printf canary" }), error => {
+    assert.equal((error as Error).message, warning);
+    return true;
+  });
+  assert.equal(f.widgets(), 1);
+  assert.equal(f.count("run"), 0);
+});
+test("adapter preserves acknowledged submission when success-path widget refresh throws", async t => {
+  const f = fixture(t);
+  f.widgetHook = () => { throw new Error("widget unavailable"); };
+  const result = await f.call("MonitorCreate", { command: "printf canary" });
+  assert.match(result.content[0].text, /Monitor #1 command submitted \(new pane\)/);
+  assert.match(result.content[0].text, /pane split-1/);
+  assert.equal(result.details.tone, "success");
+  assert.equal(f.manager.get("1")?.launchState, "submitted");
+  assert.equal(f.count("run"), 1);
+  assert.equal(f.widgets(), 1);
 });
 test("pending tool failure has no started/attached success and still updates widget", async t => {
   const f = fixture(t); f.observations = [busy];

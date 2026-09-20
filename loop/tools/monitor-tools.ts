@@ -30,9 +30,13 @@ export function registerMonitorTools(options: MonitorToolsOptions): void {
       description: Type.Optional(Type.String({ description: "Human-readable description" })),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const refreshWidget = () => {
+        // UI failure must not replace submission evidence or the retained-pane warning.
+        try { updateWidget(); } catch { /* Best effort; the tool result remains authoritative. */ }
+      };
       try {
         const entry = await getMonitors().create(params.command, params.description, ctx.cwd, signal);
-        updateWidget();
+        refreshWidget();
         const reuse = entry.reused ? "reused existing pane" : "new pane";
         const action = entry.createAction === "submitted" ? `command submitted (${reuse})` : "attached to existing busy pane; no command submitted";
         return textResult(
@@ -50,7 +54,7 @@ export function registerMonitorTools(options: MonitorToolsOptions): void {
           },
         );
       } catch (error) {
-        updateWidget();
+        refreshWidget();
         const message = error instanceof Error ? error.message : String(error);
         return textResult(message, {
           kind: "monitor", action: "create", tone: "error", summary: "Monitor command not submitted or submission uncertain", expanded: [message],
