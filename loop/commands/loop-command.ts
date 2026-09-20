@@ -42,6 +42,7 @@ type LoopCommandRoute =
   | { type: "event"; source: string; prompt: string }
   | { type: "cron"; interval: string; prompt: string; notifyEvery: boolean }
   | { type: "invalid-cron"; interval: string }
+  | { type: "invalid-event-command" }
   | { type: "missing-interval-prompt" }
   | { type: "dynamic"; goal: string };
 
@@ -54,12 +55,15 @@ function parseLoopCommandRoute(input: string): LoopCommandRoute {
     return { type: "event", source: eventMatch[1], prompt: eventMatch[2].trim() };
   }
 
+  if (/^(?:event|when)(?:\s|$)/i.test(trimmed)) return { type: "invalid-event-command" };
+
   const parts = trimmed.split(/\s+/);
-  if (parts.length > 5) {
+  if (parts.length >= 5) {
     const interval = parts.slice(0, 5).join(" ");
     const cronShaped = parts.slice(0, 5).every((part) => /^[\d*/,-]+$/.test(part));
     if (cronShaped) {
       if (!isValidCronExpression(interval)) return { type: "invalid-cron", interval };
+      if (parts.length === 5) return { type: "missing-interval-prompt" };
       return { type: "cron", interval, prompt: parts.slice(5).join(" "), notifyEvery: false };
     }
   }
@@ -265,8 +269,12 @@ export function registerLoopCommand(options: LoopCommandOptions): void {
         ui.notify(`Invalid cron expression: ${route.interval}`, "error");
         return;
       }
+      if (route.type === "invalid-event-command") {
+        ui.notify("Provide an event source and prompt, e.g., /loop event tool_execution_end review that tool", "warning");
+        return;
+      }
       if (route.type === "missing-interval-prompt") {
-        ui.notify("Provide a prompt after the interval, e.g., /loop 5m check the deploy", "warning");
+        ui.notify("Provide a prompt after the interval or cron expression, e.g., /loop 5m check the deploy or /loop 0 9 * * 1-5 check the deploy", "warning");
         return;
       }
       return dynamicLoop(ui, route.goal);
