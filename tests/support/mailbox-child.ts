@@ -2,7 +2,7 @@ import assert from "node:assert/strict";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { inboxDir, listeningFile } from "../../mailbox/paths.js";
-import { createMailboxTransport, type MailboxTransport } from "../../mailbox/transport.js";
+import { createMailboxTransport, type MailboxTransport, type MailboxDeliveryDisposition } from "../../mailbox/transport.js";
 import { createWorkerRpcClient } from "../../rpc/client.js";
 import { createControlledPiHost, type ControlledEntry, type ControlledPersistenceMode, type QueuedMessage } from "./controlled-pi-host.js";
 import { LIFECYCLE_JOURNAL_ENTRY } from "../../lifecycle/acceptor.js";
@@ -71,7 +71,7 @@ async function main() {
 	const inbox = inboxDir(mailboxRoot, "self-pane");
 	const schedules: Array<{ disposed: boolean }> = [];
 	const boundaries: string[] = [];
-	const pending = new Set<Promise<void>>();
+	const pending = new Set<Promise<MailboxDeliveryDisposition>>();
 	let transport!: MailboxTransport;
 	let receiptReturned = false;
 	let removeFailures = 0;

@@ -230,8 +230,9 @@ test("snapshot round trip preserves legacy daily, new shorthand, explicit cron, 
 for (const [nextInterval, delay] of [["30s", 30000], ["3m", 180000], ["2d", 172800000]] as const) test(`dynamic elapsed nextInterval remains exact: ${nextInterval}`, async () => {
   const f = fixture();
   try {
-    const entry = f.store.create({ type: "dynamic" }, "goal", { recurring: true, maxFires: 3, dynamic: { goal: "goal", awaitingUpdate: true, iteration: 0 } });
-    await f.call("LoopUpdate", { id: entry.id, status: "continue", nextInterval });
+    const entry = f.store.create({ type: "dynamic" }, "goal", { recurring: true, maxFires: 3, dynamic: { goal: "goal", iteration: 0 } });
+    const wakeId = f.store.beginDynamicWake(entry.id)!.dynamic!.pendingWakeId!;
+    await f.call("LoopUpdate", { id: entry.id, wakeId, status: "continue", nextInterval });
     assert.equal(f.store.get(entry.id)?.dynamic?.nextWakeAt, Date.now() + delay);
     assert.equal(f.scheduler.nextFire(entry.id), Date.now() + delay);
   } finally { f.triggers.stop(); }

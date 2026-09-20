@@ -9,6 +9,7 @@ export interface MailboxTransport {
 	stopListening(): void;
 	isStarted(): boolean;
 	drainInbox(): Promise<void>;
+	drainInboxAfterCurrent(): Promise<void>;
 	markInFlight(envelopeId: string): void;
 	acknowledgeEntries(): void;
 }
@@ -18,11 +19,13 @@ export interface AcknowledgedEntry {
 	details?: unknown;
 }
 
+export type MailboxDeliveryDisposition = void | "retry";
+
 export interface MailboxCallbacks {
 	selfId(): string;
 	isInteractive(): boolean;
 	isStopped(): boolean;
-	deliver(envelope: unknown, envelopeId: string): Promise<void>;
+	deliver(envelope: unknown, envelopeId: string): Promise<MailboxDeliveryDisposition>;
 	getAcknowledgedEntries(): readonly AcknowledgedEntry[];
 	handleAcknowledged(entry: AcknowledgedEntry): boolean;
 	warn(error: unknown): void;
@@ -76,6 +79,9 @@ export function createMailboxTransport(callbacks: MailboxCallbacks, options: Mai
 	let watcher: { close(): void } | undefined;
 	let poller: { dispose(): void } | undefined;
 	let draining = false;
+	let activeScan: Promise<void> | undefined;
+	let queuedScan: Promise<void> | undefined;
+	let listeningStopped = false;
 	const inFlightEnvelopes = new Set<string>();
 
 	function removeEnvelope(envelopeId: string, fullPath: string) {
@@ -84,9 +90,8 @@ export function createMailboxTransport(callbacks: MailboxCallbacks, options: Mai
 		observeBoundary?.({ name: "after-delete", paneId, envelopeId, fullPath });
 	}
 
-	async function drainInbox() {
-		if (draining || !callbacks.isInteractive()) return;
-		draining = true;
+	async function scanInbox() {
+		if (listeningStopped || callbacks.isStopped() || !callbacks.isInteractive()) return;
 		try {
 			const dir = inboxDir(root, paneId);
 			let files: string[] = [];
@@ -96,7 +101,7 @@ export function createMailboxTransport(callbacks: MailboxCallbacks, options: Mai
 				return;
 			}
 			for (const f of files) {
-				if (callbacks.isStopped()) return;
+				if (listeningStopped || callbacks.isStopped()) return;
 				if (inFlightEnvelopes.has(f)) continue;
 				const full = path.join(dir, f);
 				const acknowledgedEntry = callbacks.getAcknowledgedEntries().find((e) => (e.details as { envelopeId?: string })?.envelopeId === f);
@@ -111,14 +116,33 @@ export function createMailboxTransport(callbacks: MailboxCallbacks, options: Mai
 					continue; // probably mid-write; next drain picks it up
 				}
 				observeBoundary?.({ name: "after-parse", paneId, envelopeId: f, fullPath: full });
-				if (env) await callbacks.deliver(env, f);
-				if (!callbacks.isStopped() && !inFlightEnvelopes.has(f)) removeEnvelope(f, full);
+				if (env && await callbacks.deliver(env, f) === "retry") continue;
+				if (!listeningStopped && !callbacks.isStopped() && !inFlightEnvelopes.has(f)) removeEnvelope(f, full);
 			}
 		} catch (error) {
 			if (!callbacks.isStopped()) callbacks.warn(error);
-		} finally {
-			draining = false;
 		}
+	}
+
+	function drainInbox(): Promise<void> {
+		// Watch/poll overlaps remain suppressed, including the gap before a reserved scan.
+		if (draining || queuedScan) return Promise.resolve();
+		// Set this before calling delivery, which can synchronously trigger a watch/poll callback.
+		draining = true;
+		activeScan = scanInbox().finally(() => { draining = false; activeScan = undefined; });
+		return activeScan;
+	}
+
+	function drainInboxAfterCurrent(): Promise<void> {
+		if (queuedScan) return queuedScan;
+		if (!activeScan) return drainInbox();
+		const next = () => {
+			queuedScan = undefined;
+			return drainInbox();
+		};
+		// A failed preceding scan must not consume this explicit delivery opportunity.
+		queuedScan = activeScan.then(next, next);
+		return queuedScan;
 	}
 
 	return {
@@ -147,6 +171,7 @@ export function createMailboxTransport(callbacks: MailboxCallbacks, options: Mai
 		},
 		startListening() {
 			if (!callbacks.isInteractive() || watcher || poller) return;
+			listeningStopped = false;
 			const dir = inboxDir(root, paneId);
 			io.mkdir(dir);
 			io.write(listeningFile(root, paneId), JSON.stringify({ pid: process.pid, ts: Date.now(), id: callbacks.selfId() }));
@@ -157,6 +182,7 @@ export function createMailboxTransport(callbacks: MailboxCallbacks, options: Mai
 			void drainInbox();
 		},
 		stopListening() {
+			listeningStopped = true;
 			watcher?.close();
 			watcher = undefined;
 			poller?.dispose();
@@ -165,6 +191,7 @@ export function createMailboxTransport(callbacks: MailboxCallbacks, options: Mai
 		},
 		isStarted: () => !!watcher || !!poller,
 		drainInbox,
+		drainInboxAfterCurrent,
 		markInFlight: (envelopeId) => { inFlightEnvelopes.add(envelopeId); },
 		acknowledgeEntries() {
 			for (const entry of callbacks.getAcknowledgedEntries()) {

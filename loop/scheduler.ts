@@ -1,3 +1,4 @@
+import { isOrdinaryDynamic } from "./dynamic-ack.js";
 import { computeJitter, cronToNextFire } from "./loop-parse.js";
 import type { LoopStore } from "./store.js";
 import type { LoopEntry, LoopExpiryDisposition, LoopFireOrigin } from "./types.js";
@@ -87,8 +88,8 @@ export class CronScheduler {
     return this.fireTimes.get(id);
   }
 
-  private retire(entry: LoopEntry): void {
-    if (entry.dynamic || entry.workflow || entry.taskBacklog) this.store.pause(entry.id, "controller_limit", "scheduler fire cap reached");
+  private retire(entry: LoopEntry, cause: "fire_cap" | "one_shot"): void {
+    if (entry.dynamic || entry.workflow || entry.taskBacklog) this.store.pause(entry.id, "controller_limit", "scheduler fire cap reached", isOrdinaryDynamic(entry) ? cause : undefined);
     else this.store.delete(entry.id);
     this.remove(entry.id);
   }
@@ -163,14 +164,15 @@ export class CronScheduler {
         continue;
       }
 
-      if (entry.trigger.type === "dynamic" && entry.dynamic?.awaitingUpdate) continue;
-
-      if (filter && !filter(entry)) continue;
-
+      // Lifetime enforcement precedes work eligibility, including awaiting updates.
       if (now >= entry.expiresAt) {
         this.retireExpired(entry, now);
         continue;
       }
+
+      if (entry.trigger.type === "dynamic" && entry.dynamic?.awaitingUpdate) continue;
+
+      if (filter && !filter(entry)) continue;
 
       this.onFire(entry, "scheduler");
 
@@ -181,17 +183,17 @@ export class CronScheduler {
       }
 
       if (!fresh.recurring) {
-        this.retire(fresh);
+        this.retire(fresh, "one_shot");
         continue;
       }
 
       if (fresh.maxFires && (fresh.fireCount ?? 0) >= fresh.maxFires) {
-        this.retire(fresh);
+        this.retire(fresh, "fire_cap");
         continue;
       }
 
       if (fresh.workflow && atWorkflowStateFireLimit(fresh.workflow)) {
-        this.retire(fresh);
+        this.retire(fresh, "fire_cap");
         continue;
       }
 

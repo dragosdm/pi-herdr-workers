@@ -4,6 +4,7 @@
 import { existsSync } from "node:fs";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { registerLoopCommand } from "./commands/loop-command.js";
+import { isOrdinaryDynamic } from "./dynamic-ack.js";
 import { atMaxFires } from "./loop-reducer.js";
 import type { ReducerNotification } from "./notification-reducer.js";
 import { buildLoopExpiredPayload } from "./runtime/loop-events.js";
@@ -206,6 +207,14 @@ export default function (pi: ExtensionAPI) {
       return;
     }
     if (current.workflow?.waitingMonitor) return;
+
+    if (isOrdinaryDynamic(current)) {
+      const admitted = store.beginDynamicWake(current.id);
+      if (!admitted) return;
+      if (atMaxFires(admitted)) triggerSystem.remove(admitted.id);
+      emitLoopFire(admitted);
+      return;
+    }
 
     if (atMaxFires(current)) {
       triggerSystem.remove(current.id);

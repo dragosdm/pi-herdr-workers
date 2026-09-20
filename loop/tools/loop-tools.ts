@@ -1,5 +1,7 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { HYBRID_TRIGGER_EXAMPLE, parseHybridTriggerInput } from "../hybrid-parse.js";
+import { dynamicAckError, invalidDynamicWakeState, isOrdinaryDynamic, validWakeId } from "../dynamic-ack.js";
 import { formatTrigger } from "../loop-format.js";
 import { CRON_TIMING_NOTE, matchIntervalPrefix, parseInterval } from "../loop-parse.js";
 import { getOrchestrationCounts } from "../orchestration-reducer.js";
@@ -22,12 +24,15 @@ interface LoopStoreLike {
   continueDynamic(
     id: string,
     fields: { prompt?: string; dynamic: Partial<NonNullable<LoopEntry["dynamic"]>> },
+    wakeId: string,
     expected?: { status: LoopEntry["status"]; iteration: number; updatedAt: number },
   ): LoopEntry | undefined;
   stopDynamic(
     id: string,
     status: "completed" | "paused",
+    wakeId: string,
     expected: { status: LoopEntry["status"]; iteration: number; updatedAt: number },
+    checkpoint?: { state?: string; metrics?: string; doneCriteria?: string; prompt?: string },
   ): boolean;
   getDeletionTombstone(id: string): { reason: string; pendingCount?: number } | undefined;
   delete(id: string): boolean;
@@ -111,6 +116,7 @@ function parseDelayMs(input: string): number | undefined {
 
 interface LoopUpdateParams {
   id: string;
+  wakeId: string;
   status: "continue" | "completed" | "paused";
   state?: string;
   metrics?: string;
@@ -120,18 +126,18 @@ interface LoopUpdateParams {
 }
 
 function resolveNextWakeAt(nextInterval?: string): { nextWakeAt?: number; error?: string } {
-  if (!nextInterval) return { nextWakeAt: undefined };
+  if (nextInterval === undefined) return { nextWakeAt: undefined };
   const parsedDelayMs = parseDelayMs(nextInterval);
   if (!parsedDelayMs) return { error: `Invalid nextInterval "${nextInterval}". Use formats like 3m, 30s, or 1h.` };
   return { nextWakeAt: Date.now() + parsedDelayMs };
 }
 
 
-function formatDynamicUpdateResult(id: string, iteration: number | undefined, nextWakeAt: number | undefined, resumed: boolean): string {
+function formatDynamicUpdateResult(id: string, iteration: number | undefined, nextWakeAt: number | undefined): string {
   const mode = nextWakeAt === undefined
     ? "Next wake: when idle"
     : `Next wake: ${formatRemaining(Math.max(0, nextWakeAt - Date.now()))}`;
-  return `Dynamic loop #${id} ${resumed ? "resumed and updated" : "updated"}\n` +
+  return `Dynamic loop #${id} updated\n` +
     `Iteration: ${iteration ?? "?"}` +
     `\n${mode}`;
 }
@@ -159,30 +165,26 @@ function continueDynamicLoop(
   if (entry.maxFires && (entry.fireCount ?? 0) >= entry.maxFires) {
     return { applied: false, message: `Loop #${params.id} reached its fire cap. Complete or pause it; renewing the goal requires explicit authorization.` };
   }
-  const resumed = entry.status === "paused";
   const updated = store.continueDynamic(params.id, {
     prompt: params.prompt,
     dynamic: {
-      goal: params.prompt ?? entry.dynamic.goal,
+      goal: params.prompt,
       state: params.state,
       metrics: params.metrics,
       doneCriteria: params.doneCriteria,
-      iteration: (entry.dynamic.iteration ?? 0) + 1,
       nextWakeAt,
-      awaitingUpdate: false,
-      lastUpdatedAt: Date.now(),
     },
-  }, {
+  }, params.wakeId, {
     status: entry.status,
     iteration: entry.dynamic.iteration ?? 0,
     updatedAt: entry.updatedAt,
   });
   if (!updated) {
-    return { applied: false, message: `Loop #${params.id} changed while the update was applied; inspect LoopList and retry.` };
+    return { applied: false, message: `Loop #${params.id} changed while the update was applied; inspect LoopList and the saved checkpoint before recovery. Do not automatically resubmit old work with a newer token.` };
   }
   triggerSystem.remove(params.id);
   triggerSystem.add(updated);
-  return { applied: true, message: formatDynamicUpdateResult(params.id, updated.dynamic?.iteration, nextWakeAt, resumed) };
+  return { applied: true, message: formatDynamicUpdateResult(params.id, updated.dynamic?.iteration, nextWakeAt) };
 }
 
 function stopDynamicLoop(
@@ -192,13 +194,18 @@ function stopDynamicLoop(
   triggerSystem: TriggerSystemLike,
 ): { applied: boolean; message: string } {
   const status = params.status === "completed" ? "completed" : "paused";
-  const applied = store.stopDynamic(params.id, status, {
+  const applied = store.stopDynamic(params.id, status, params.wakeId, {
     status: entry.status,
     iteration: entry.dynamic.iteration ?? 0,
     updatedAt: entry.updatedAt,
+  }, {
+    state: params.state,
+    metrics: params.metrics,
+    doneCriteria: params.doneCriteria,
+    prompt: params.prompt,
   });
   if (!applied) {
-    return { applied: false, message: `Loop #${params.id} changed while the update was applied; inspect LoopList and retry.` };
+    return { applied: false, message: `Loop #${params.id} changed while the update was applied; inspect LoopList and the saved checkpoint before recovery. Do not automatically resubmit old work with a newer token.` };
   }
   triggerSystem.remove(params.id);
   return {
@@ -230,7 +237,7 @@ export function registerLoopTools(options: LoopToolsOptions): void {
       "Use LoopDelete only for explicit cancellation or a satisfied stop condition—not after a normal, empty, or unchanged iteration. Report the created loop ID.",
     ],
     parameters: Type.Object({
-      trigger: Type.String({ description: "Local-time numeric five-field cron expression (e.g., '0 9 * * 1-5') or supported cron shorthand (e.g., '5m', '1h'; no rounding), event source (e.g., 'tool_execution_start'), hybrid spec, or literal 'idle' with triggerType='idle'" }),
+      trigger: Type.String({ description: "Local-time numeric five-field cron expression (e.g., '0 9 * * 1-5') or supported cron shorthand (e.g., '5m', '1h'; no rounding), event source (e.g., 'tool_execution_start'), hybrid 'cron: */5 * * * * event: audit:test' or 'cron: 1h event: audit:hybrid', or literal 'idle' with triggerType='idle'. Hybrid grammar: lowercase cron/event labels, optional colons, whitespace-separated clauses in either order; schedule is complete five-field cron or supported shorthand, source is one exact token. Prefer explicit triggerType='hybrid'; bare or cron-only schedules require it and default to tool_execution_start. Empty clauses, extra words, duplicate labels and hybrid: prefixes are rejected; quotes/backslashes do not escape whitespace." }),
       prompt: Type.String({ description: "Prompt to run when the loop fires" }),
       recurring: Type.Optional(Type.Boolean({ description: "Whether loop repeats (default: true)", default: true })),
       triggerType: Type.Optional(Type.String({ description: "cron, event, hybrid, or idle (cron/event inferred from trigger string if omitted)", enum: ["cron", "event", "hybrid", "idle"] })),
@@ -263,13 +270,17 @@ export function registerLoopTools(options: LoopToolsOptions): void {
       } else if (inferred === "event") {
         trigger = { type: "event", source: triggerInput };
       } else {
-        const cronPart = triggerInput.match(/cron:?\s*(\S+)/)?.[1] || triggerInput;
-        const eventPart = triggerInput.match(/event:?\s*(\S+)/)?.[1];
-        const parsed = parseInterval(cronPart);
+        const { schedule, eventSource } = parseHybridTriggerInput(triggerInput);
+        let parsed: ReturnType<typeof parseInterval>;
+        try {
+          parsed = parseInterval(schedule);
+        } catch (cause) {
+          throw new Error(`Invalid hybrid trigger: ${cause instanceof Error ? cause.message : String(cause)} Use ${HYBRID_TRIGGER_EXAMPLE}`, { cause });
+        }
         trigger = {
           type: "hybrid",
           cron: parsed.cron,
-          event: { source: eventPart || "tool_execution_start" },
+          event: { source: eventSource },
           debounceMs: debounceMs ?? 30000,
         };
       }
@@ -394,6 +405,14 @@ export function registerLoopTools(options: LoopToolsOptions): void {
         }
         if (entry.pause) line += ` [pause:${entry.pause.kind}]`;
         if (entry.pause?.reason) line += ` reason: ${entry.pause.reason}`;
+        if (isOrdinaryDynamic(entry)) {
+          line += ` awaitingUpdate: ${entry.dynamic!.awaitingUpdate === true}`;
+          if (invalidDynamicWakeState(entry)) {
+            line += " invalid pending wake metadata; inspect checkpoint and pause/resume through /loop";
+          } else if (entry.dynamic!.awaitingUpdate === true) {
+            line += ` wakeId: ${entry.dynamic!.pendingWakeId}`;
+          }
+        }
         if (entry.orchestration) {
           const counts = getOrchestrationCounts(entry.orchestration);
           line += ` [orchestration:${entry.orchestration.status}]`;
@@ -430,9 +449,10 @@ export function registerLoopTools(options: LoopToolsOptions): void {
     label: "LoopUpdate",
     renderCall: renderToolCall("Loop", (args) => `update · #${String(toolArg(args, "id") ?? "?")} · ${String(toolArg(args, "status") ?? "continue")}`),
     renderResult: renderToolResult,
-    description: `Update a dynamic loop exactly once after each wake. Use "continue" with state/metrics and optional nextInterval whenever work remains, including empty or unchanged iterations; "completed" only when done; "paused" only for a genuine blocker or required user authority. Persist before notifying the user; never use LoopDelete to finish an iteration.`,
+    description: `Update a dynamic loop at most once per recorded wake, using that wake's required wakeId. Inspect LoopList and the saved checkpoint after stale-token or ambiguous errors; never resubmit old work with a newer token automatically. Resume paused loops explicitly through /loop. Use "continue" with state/metrics and optional nextInterval whenever work remains, including empty or unchanged iterations; "completed" only when done; "paused" only for a genuine blocker or required user authority. Persist before notifying the user; never use LoopDelete to finish an iteration.`,
     parameters: Type.Object({
       id: Type.String({ description: "Dynamic loop ID to update" }),
+      wakeId: Type.String({ minLength: 1, maxLength: 128, pattern: "^\\S+$", description: "Exact Wake ID from this wake's message or explicit LoopList recovery" }),
       status: Type.String({ description: "continue, completed, or paused", enum: ["continue", "completed", "paused"] }),
       state: Type.Optional(Type.String({ description: "Current progress/state summary" })),
       metrics: Type.Optional(Type.String({ description: "Current metrics/check results" })),
@@ -441,6 +461,8 @@ export function registerLoopTools(options: LoopToolsOptions): void {
       prompt: Type.Optional(Type.String({ description: "Optional updated goal/prompt text" })),
     }),
     execute(_toolCallId, params: LoopUpdateParams) {
+      if (!validWakeId(params.wakeId)) throw new Error("wakeId is required: use a nonempty string of at most 128 characters without whitespace. Inspect LoopList and the saved checkpoint before recovery.");
+      if (!["continue", "completed", "paused"].includes(params.status)) throw new Error("Invalid status: use continue, completed, or paused.");
       const store = getStore();
       const triggerSystem = getTriggerSystem();
       const entry = store.get(params.id);
@@ -461,12 +483,17 @@ export function registerLoopTools(options: LoopToolsOptions): void {
           kind: "loop", action: "update", tone: "error", summary: `Loop #${params.id} update rejected`, expanded: [message],
         }));
       }
-      if (entry.trigger.type !== "dynamic" || !entry.dynamic) {
+      if (entry.trigger.type !== "dynamic" || !entry.dynamic || entry.taskBacklog) {
         return Promise.resolve(textResult(`Loop #${params.id} is not a dynamic loop`, {
           kind: "loop", action: "update", tone: "error", summary: `Loop #${params.id} is not dynamic`, expanded: ["Use LoopUpdate only for dynamic loops."],
         }));
       }
 
+      if (params.status === "continue" && entry.maxFires && (entry.fireCount ?? 0) >= entry.maxFires) {
+        throw new Error(`Loop #${params.id} reached its fire cap. Inspect LoopList and the saved checkpoint.`);
+      }
+      const eligibilityError = dynamicAckError(entry, params.wakeId, params.status, Date.now());
+      if (eligibilityError) throw new Error(`${eligibilityError}; inspect LoopList and the saved checkpoint before recovery.`);
       const dynamicEntry = entry as LoopEntry & { dynamic: NonNullable<LoopEntry["dynamic"]> };
       const outcome = params.status === "continue"
         ? continueDynamicLoop(params, dynamicEntry, store, triggerSystem)
