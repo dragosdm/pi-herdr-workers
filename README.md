@@ -199,7 +199,7 @@ Same session, no extra workers. Idle-safe wakes when Pi is sitting there.
 
 Tools: `LoopCreate`, `LoopList`, `LoopUpdate`, `LoopDelete`.
 
-- Cron: supported shorthand such as `5m` or `2h`, or a five-field cron expression
+- Cron: supported shorthand such as `5m` or `2h`, or a [local-time numeric five-field cron expression](docs/cron-semantics.md)
 - Event: a Pi event source
 - Hybrid: a cron schedule plus an event source, configured with `LoopCreate`
 - Idle/dynamic: `/loop <goal>` then `LoopUpdate` with the wake's required `wakeId` and `continue` / `paused` / `completed`
@@ -223,6 +223,8 @@ Cron shorthand accepts exactly `1m`, `2m`, `5m`, `10m`, `15m`, `30m`, `1h`, `2h`
 Timing: local wall-clock cron with scheduler jitter, not an elapsed-time interval. Cron uses the runtime's local timezone. The first wake follows the next matching minute, not creation time plus a duration. Clock changes and DST affect elapsed spacing; `1d` selects local midnight slots, not guaranteed 86,400-second intervals. The scheduler adds stable, nonnegative per-ID jitter: recurring `*/N` minute expressions use `N` for the bound, while other minute fields fall back to 30. For accepted recurring minute shorthand, jitter is below half the cadence; for accepted hourly/daily shorthand it is below 15 minutes. Nonrecurring cron jitter is below 90 seconds. Busy agents may delay delivery further, so neither dispatch time nor elapsed cadence is exact.
 
 Dynamic `LoopUpdate.nextInterval` is separate: `30s`, `3m`, and `2d` remain elapsed delays, subject to the controller's remaining lifetime. Duration-looking tool inputs and command prefixes, including malformed `-1m` or `1.5h`, are reserved for schedule validation. To use such a literal event source, set `triggerType: "event"` or use `/loop event -1m <prompt>`. Ordinary event sources such as `audit:1m` and goals such as `review 3m timeout` are unchanged.
+
+Cron day matching has been corrected: two restricted day fields use OR, so `0 0 1 * 1` runs on the first of each month and on Mondays. If either day token starts with `*`, including `*/n`, both day predicates must match. Existing expressions receive these semantics on restoration or re-arm and may next wake sooner. No past occurrences are replayed, and counters, IDs, expiry times, and paused status are unchanged. See [cron semantics](docs/cron-semantics.md) for the numeric grammar, DST behavior, bounded search, and expiry-only schedules.
 
 Existing controllers retain their saved cron schedule. Original shorthand was not saved, so an old daily schedule cannot reveal whether it came from `1d` or a rounded `2d`. Inspect `LoopList` and explicitly cancel/recreate an incorrect schedule; this change does not migrate or replace controllers.
 
