@@ -201,6 +201,7 @@ Tools: `LoopCreate`, `LoopList`, `LoopUpdate`, `LoopDelete`.
 
 - Cron: supported shorthand such as `5m` or `2h`, or a five-field cron expression
 - Event: a Pi event source
+- Hybrid: a cron schedule plus an event source, configured with `LoopCreate`
 - Idle/dynamic: `/loop <goal>` then `LoopUpdate` with the wake's required `wakeId` and `continue` / `paused` / `completed`
 
 Each ordinary dynamic dispatch saves a UUID with its fire count before emitting the wake. Copy the exact `Wake ID` from that message:
@@ -224,6 +225,19 @@ Timing: local wall-clock cron with scheduler jitter, not an elapsed-time interva
 Dynamic `LoopUpdate.nextInterval` is separate: `30s`, `3m`, and `2d` remain elapsed delays, subject to the controller's remaining lifetime. Duration-looking tool inputs and command prefixes, including malformed `-1m` or `1.5h`, are reserved for schedule validation. To use such a literal event source, set `triggerType: "event"` or use `/loop event -1m <prompt>`. Ordinary event sources such as `audit:1m` and goals such as `review 3m timeout` are unchanged.
 
 Existing controllers retain their saved cron schedule. Original shorthand was not saved, so an old daily schedule cannot reveal whether it came from `1d` or a rounded `2d`. Inspect `LoopList` and explicitly cancel/recreate an incorrect schedule; this change does not migrate or replace controllers.
+
+Hybrid `LoopCreate` examples, not `/loop` slash-command syntax:
+
+```json
+{"trigger":"cron: */5 * * * * event: audit:test","triggerType":"hybrid","prompt":"Check the audit state","maxFires":5,"readOnly":true}
+{"trigger":"cron: 1h event: audit:hybrid","triggerType":"hybrid","prompt":"Check the audit state","maxFires":5,"readOnly":true}
+```
+
+Prefer explicit `triggerType: "hybrid"` and `cron: <schedule> event: <source>`. The schedule is a complete five-field cron or supported shorthand from the table above. Either the timer or the event can wake the loop. `debounceMs` defaults to 30000 and applies to event wakes; it does not merge timer and event wakes. An explicit zero disables event debounce.
+
+Hybrid input is fully consumed. Labels are lowercase `cron` and `event`; colons are optional when whitespace separates a label from its value. `cron:1h event:audit`, `cron 1h event audit`, and event-first `event: audit cron: */5 * * * *` work. Outer whitespace is ignored; spaces, tabs and newlines between fields normalize to single spaces. The event source is exactly one token, preserving case and internal colons, such as `Audit:event:Done`. Quotes and backslashes do not escape whitespace, and single-token sources are not unquoted or unescaped.
+
+For compatibility, explicit hybrid inputs `1h`, `cron: 1h`, or a bare five-field cron default to `tool_execution_start`. An empty event clause is an error, never a default. Both-label canonical inputs also infer hybrid when the type is omitted; explicit `triggerType: "event"` always keeps the input as an event source. Leading/trailing junk and duplicate clauses that older parsing sometimes ignored now fail before creation. Event-only input, a `hybrid:` prefix, JSON inside the trigger string, named cron macros, seconds/year fields, and quoted multiword sources are unsupported. Stored structured hybrid records, including optional event filters, restore without reparsing this input syntax or needing a migration.
 
 `LoopUpdate status="paused"` saves supplied `state`, `metrics`, and `doneCriteria` together with the pause in one snapshot. Omitted fields retain their values; empty strings clear them. A supplied `prompt` updates both the prompt and dynamic goal, including an empty string. Omitting it preserves both. `nextInterval` applies only to `continue`; pause ignores it, even if malformed. Pause does not renew the lifetime, increment counters, or schedule a wake. `completed` still deletes the controller rather than retaining its supplied checkpoint.
 
