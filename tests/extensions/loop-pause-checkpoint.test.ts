@@ -14,11 +14,12 @@ const CREATED = 1_800_000_000_000;
 const PAUSED = CREATED + 10_000;
 const checkpoint = { state: "new-state", metrics: "new-metrics", doneCriteria: "new-done", prompt: "new-prompt" };
 function seed(store: LoopStore) {
-  return store.create({ type: "dynamic" }, "old-prompt", {
+  const entry = store.create({ type: "dynamic" }, "old-prompt", {
     recurring: true, readOnly: true, maxFires: 3,
     dynamic: { goal: "old-goal", state: "old-state", metrics: "old-metrics", doneCriteria: "old-done", iteration: 2,
-      awaitingUpdate: true, nextWakeAt: CREATED + 60_000, lastUpdatedAt: CREATED },
+      nextWakeAt: CREATED + 60_000, lastUpdatedAt: CREATED },
   });
+  return store.beginDynamicWake(entry.id)!;
 }
 function expected(entry: LoopEntry) {
   return { status: entry.status, iteration: entry.dynamic!.iteration, updatedAt: entry.updatedAt };
@@ -46,7 +47,10 @@ function fixture(store = new LoopStore()) {
   });
   return { store, snapshots, audits, removed, added, tools,
     failSnapshot: () => { failSnapshot = true; }, failAudit: () => { failAudit = true; },
-    call: (input: object) => tools.get("LoopUpdate").execute("a09", input),
+    // A09 exercises checkpoint merging; use the token from its admitted wake.
+    call: (input: { id: string } & Record<string, unknown>) => tools.get("LoopUpdate").execute("a09", {
+      wakeId: store.get(input.id)?.dynamic?.pendingWakeId ?? "no-pending-wake", ...input,
+    }),
   };
 }
 function assertCheckpoint(entry: LoopEntry, fields = checkpoint) {
@@ -67,7 +71,7 @@ test("pause checkpoints save all fields in one final snapshot and preserve sched
   assertCheckpoint(saved);
   assert.deepEqual(saved, { ...entry, prompt: checkpoint.prompt, status: "paused", updatedAt: PAUSED,
     pause: { kind: "administrative", at: PAUSED }, dynamic: { ...entry.dynamic!, state: checkpoint.state, metrics: checkpoint.metrics,
-      doneCriteria: checkpoint.doneCriteria, goal: checkpoint.prompt, lastUpdatedAt: PAUSED } });
+      doneCriteria: checkpoint.doneCriteria, goal: checkpoint.prompt, lastUpdatedAt: PAUSED, awaitingUpdate: false, pendingWakeId: undefined } });
   assert.equal(f.snapshots.length, 1);
   assert.deepEqual(f.snapshots[0], f.store.snapshot());
   assert.deepEqual(f.removed, [entry.id]);
@@ -84,7 +88,7 @@ for (const field of ["state", "metrics", "doneCriteria", "prompt", "none"] as co
     t.mock.method(Date, "now", () => PAUSED);
     await f.call({ id: entry.id, status: "paused", ...(field === "none" ? {} : { [field]: checkpoint[field] }) });
     const saved = f.store.get(entry.id)!;
-    const dynamic = { ...entry.dynamic!, lastUpdatedAt: PAUSED };
+    const dynamic = { ...entry.dynamic!, lastUpdatedAt: PAUSED, awaitingUpdate: false, pendingWakeId: undefined };
     if (field === "prompt") dynamic.goal = checkpoint.prompt;
     else if (field !== "none") dynamic[field] = checkpoint[field];
     assert.deepEqual(saved.dynamic, dynamic);
@@ -106,19 +110,21 @@ for (const value of ["", "  Δ checkpoint 🦊\nsecond line\n  "]) {
 test("registered LoopUpdate schema rejects invalid field types and statuses", () => {
   const schema = fixture().tools.get("LoopUpdate").parameters;
   for (const field of ["state", "metrics", "doneCriteria", "prompt"]) {
-    for (const value of [null, 12, {}]) assert.equal(Check(schema, { id: "1", status: "paused", [field]: value }), false);
-    assert.equal(Check(schema, { id: "1", status: "paused", [field]: "" }), true);
+    for (const value of [null, 12, {}]) assert.equal(Check(schema, { id: "1", wakeId: "schema-token", status: "paused", [field]: value }), false);
+    assert.equal(Check(schema, { id: "1", wakeId: "schema-token", status: "paused", [field]: "" }), true);
   }
-  for (const status of ["pause", null, 1, {}]) assert.equal(Check(schema, { id: "1", status }), false);
-  assert.equal(Check(schema, { id: "1", status: "paused" }), true);
+  for (const status of ["pause", null, 1, {}]) assert.equal(Check(schema, { id: "1", wakeId: "schema-token", status }), false);
+  assert.equal(Check(schema, { id: "1", wakeId: "schema-token", status: "paused" }), true);
 });
 
 for (const nextInterval of ["1h", "malformed interval"]) {
   test(`pause ignores nextInterval ${nextInterval}`, async t => {
     t.mock.method(Date, "now", () => CREATED);
     const f = fixture(); const entry = seed(f.store);
+    // Legacy pending snapshots may retain a timed wake. Pause must not rewrite it.
+    f.store.updateDynamic(entry.id, { dynamic: { nextWakeAt: CREATED + 60_000 } });
     await f.call({ id: entry.id, status: "paused", ...checkpoint, nextInterval });
-    assert.equal(f.store.get(entry.id)?.dynamic?.nextWakeAt, entry.dynamic?.nextWakeAt);
+    assert.equal(f.store.get(entry.id)?.dynamic?.nextWakeAt, CREATED + 60_000);
     assert.deepEqual(f.added, []);
     const scheduler = new CronScheduler(f.store, () => assert.fail("paused wake"));
     scheduler.start(); scheduler.pump(CREATED + 120_000);
@@ -156,7 +162,9 @@ test("file reopening preserves the complete pause and shared mirror failure is n
     t.mock.method(Date, "now", () => PAUSED);
     await f.call({ id: entry.id, status: "paused", ...checkpoint });
     const reopened = new LoopStore(path);
-    assert.deepEqual(reopened.snapshot(), f.store.snapshot()); assertCheckpoint(reopened.get(entry.id)!);
+    assert.deepEqual(reopened.snapshot(), JSON.parse(JSON.stringify(f.store.snapshot()))); assertCheckpoint(reopened.get(entry.id)!);
+    // A second checkpoint needs explicit resume and a new recorded wake.
+    f.store.resume(entry.id); f.store.beginDynamicWake(entry.id);
     f.failSnapshot();
     assert.throws(() => f.call({ id: entry.id, status: "paused", state: "fully-committed-after-mirror-error" }), /Loop runtime closed/);
     const afterError = new LoopStore(path).get(entry.id)!;
@@ -177,7 +185,7 @@ for (const conflict of ["status", "iteration", "updatedAt"] as const) {
         ...(conflict === "iteration" ? { iteration: entry.dynamic!.iteration + 1 } : {}) } });
       if (conflict === "status") b.pause(entry.id);
       const latest = new LoopStore(path).snapshot();
-      assert.equal(a.stopDynamic(entry.id, "paused", expected(entry), checkpoint), false);
+      assert.equal(a.stopDynamic(entry.id, "paused", entry.dynamic!.pendingWakeId!, expected(entry), checkpoint), false);
       const f = fixture(a);
       // Model the tool read before B's commit; stopDynamic must still reload under lock.
       t.mock.method(a, "get", () => entry);
@@ -194,7 +202,7 @@ test("missing and non-dynamic targets reject without a saved update", async t =>
   const before = f.store.snapshot(); f.snapshots.length = 0;
   for (const id of ["missing", entry.id]) {
     await assert.rejects(async () => f.call({ id, status: "paused", ...checkpoint }), /not found|not a dynamic/);
-    assert.equal(f.store.stopDynamic(id, "paused", { status: "active", iteration: 0, updatedAt: CREATED }, checkpoint), false);
+    assert.equal(f.store.stopDynamic(id, "paused", "missing", { status: "active", iteration: 0, updatedAt: CREATED }, checkpoint), false);
   }
   assert.deepEqual(f.store.snapshot(), before); assert.deepEqual(f.snapshots, []);
   assert.deepEqual(f.audits, []); assert.deepEqual(f.removed, []);
@@ -210,11 +218,13 @@ test("completion deletes, continue preserves omissions and validates intervals, 
   const dynamic = structuredClone(f.store.get(entry.id)?.dynamic);
   t.mock.method(Date, "now", () => PAUSED);
   f.store.pause(entry.id); assert.deepEqual(f.store.get(entry.id)?.dynamic, dynamic);
+  f.store.resume(entry.id);
+  const wakeId = f.store.beginDynamicWake(entry.id)!.dynamic!.pendingWakeId!;
   f.snapshots.length = 0;
   await f.call({ id: entry.id, status: "completed", ...checkpoint });
   assert.equal(f.store.get(entry.id), undefined); assert.equal(f.snapshots.length, 1);
   assert.deepEqual(f.snapshots[0].loops, []);
-  assert.deepEqual(f.audits.at(-1), { id: entry.id, status: "completed", ...checkpoint, at: PAUSED });
+  assert.deepEqual(f.audits.at(-1), { id: entry.id, wakeId, status: "completed", ...checkpoint, at: PAUSED });
 });
 
 test("workflow and orchestration ownership rejection preserves checkpoints", async t => {
@@ -238,7 +248,10 @@ for (const limit of ["cap", "deadline"]) {
   test(`pause checkpoint does not renew ${limit}`, async t => {
     t.mock.method(Date, "now", () => CREATED);
     const f = fixture(); const entry = seed(f.store);
-    if (limit === "cap") for (let n = 0; n < 3; n++) f.store.fire(entry.id, "dynamic");
+    if (limit === "cap") for (let n = 0; n < 2; n++) {
+      await f.call({ id: entry.id, status: "continue" });
+      f.store.beginDynamicWake(entry.id);
+    }
     await f.call({ id: entry.id, status: "paused", ...checkpoint });
     if (limit === "deadline") t.mock.method(Date, "now", () => entry.expiresAt);
     assert.equal(f.store.resume(entry.id), undefined);
@@ -284,7 +297,10 @@ function runtime(entries: any[], cwd: string, sessionId = "a09-session") {
   } as any);
   const hook = async (name: string) => { for (const callback of hooks.get(name) ?? []) await callback({}, ctx); };
   return { entries, messages, events, hook,
-    call: (input: object) => tools.get("LoopUpdate").execute("a09-runtime", input),
+    call: (input: { id: string } & Record<string, unknown>) => tools.get("LoopUpdate").execute("a09-runtime", {
+      wakeId: entries.filter(e => e.customType === "herdr-loops.snapshot.v1").at(-1)?.data.snapshot.loops.find((e: LoopEntry) => e.id === input.id)?.dynamic?.pendingWakeId,
+      ...input,
+    }),
     list: () => tools.get("LoopList").execute("a09-list", {}),
     snapshot: () => entries.filter(e => e.customType === "herdr-loops.snapshot.v1").at(-1)?.data.snapshot as LoopStoreData,
     resume: async (entry: LoopEntry) => {
@@ -373,7 +389,7 @@ for (const scope of ["memory", "other-session", "shared"] as const) {
     let host: ReturnType<typeof runtime> | undefined;
     try {
       const store = new LoopStore(scope === "shared" ? path : undefined); const entry = seed(store);
-      store.stopDynamic(entry.id, "paused", expected(entry), checkpoint);
+      store.stopDynamic(entry.id, "paused", entry.dynamic!.pendingWakeId!, expected(entry), checkpoint);
       const stale = store.snapshot(); stale.loops[0].dynamic!.state = "stale-session-mirror";
       host = runtime([snapshotRecord(stale)], dir, scope === "other-session" ? "new-session" : "a09-session");
       await host.hook("session_start"); await host.hook("turn_start");

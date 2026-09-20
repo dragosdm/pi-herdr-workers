@@ -1,6 +1,8 @@
+import { createHash, randomUUID } from "node:crypto";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { cronToNextFire } from "./loop-parse.js";
+import { dynamicAckError, isFinalDynamicWake, isOrdinaryDynamic } from "./dynamic-ack.js";
 import { type LoopReducerEffect, type LoopReducerEvent, type LoopReducerState, reduceLoopState } from "./loop-reducer.js";
 import { applyOrchestrationEvent, type OrchestrationEvent, validateOrchestrationDefinition, validatePersistedOrchestration } from "./orchestration-reducer.js";
 import { ReducerBackedStore } from "./reducer-backed-store.js";
@@ -93,6 +95,19 @@ function normalizePauseRecord(entry: LoopEntry): LoopPauseRecord | undefined {
 
 function normalizeLoopEntry(entry: LoopEntry): LoopEntry {
   const pause = normalizePauseRecord(entry);
+  if (isOrdinaryDynamic(entry)) {
+    const dynamic = { ...entry.dynamic! };
+    if (dynamic.awaitingUpdate === true && dynamic.pendingWakeId === undefined) {
+      if (entry.status === "active" || isFinalDynamicWake(entry)) {
+        const identity = [entry.id, entry.createdAt, entry.fireCount ?? 0, dynamic.iteration, dynamic.lastUpdatedAt ?? entry.updatedAt];
+        dynamic.pendingWakeId = `legacy-${createHash("sha256").update(JSON.stringify(identity)).digest("hex")}`;
+      } else if (entry.status === "paused") {
+        dynamic.awaitingUpdate = false;
+        delete dynamic.pendingWakeId;
+      }
+    }
+    entry = { ...entry, dynamic };
+  }
   return {
     ...entry,
     ...(pause ? { pause } : {}),
@@ -190,11 +205,11 @@ export class LoopStore extends ReducerBackedStore<LoopEntry, LoopReducerState, L
     });
   }
 
-  pause(id: string, kind: LoopPauseKind = "administrative", reason?: string): LoopEntry | undefined {
+  pause(id: string, kind: LoopPauseKind = "administrative", reason?: string, retirementCause?: "fire_cap" | "one_shot"): LoopEntry | undefined {
     return this.withLock(() => {
       const entry = this.entries.get(id);
       if (!entry) return undefined;
-      if (entry.status === "paused") return entry;
+      if (entry.status === "paused" && (retirementCause || !isOrdinaryDynamic(entry))) return entry;
       const boundedReason = reason?.trim().slice(0, 512);
       this.applyReducerEvent({
         type: "LOOP_PAUSED",
@@ -202,7 +217,7 @@ export class LoopStore extends ReducerBackedStore<LoopEntry, LoopReducerState, L
         source: "tool",
         entityType: "loop",
         entityId: id,
-        payload: { id, kind, ...(boundedReason ? { reason: boundedReason } : {}) },
+        payload: { id, kind, ...(boundedReason ? { reason: boundedReason } : {}), ...(retirementCause ? { retirementCause } : {}) },
       });
       return this.entries.get(id);
     });
@@ -223,7 +238,7 @@ export class LoopStore extends ReducerBackedStore<LoopEntry, LoopReducerState, L
         entityId: id,
         payload: { id },
       });
-      if (entry.trigger.type === "dynamic" && entry.dynamic?.awaitingUpdate) {
+      if (entry.trigger.type === "dynamic" && (entry.dynamic?.awaitingUpdate || isOrdinaryDynamic(entry))) {
         this.applyReducerEvent({
           type: "LOOP_DYNAMIC_UPDATED",
           at: Date.now(),
@@ -234,6 +249,7 @@ export class LoopStore extends ReducerBackedStore<LoopEntry, LoopReducerState, L
             id,
             dynamic: {
               awaitingUpdate: false,
+              pendingWakeId: undefined,
               lastUpdatedAt: Date.now(),
             },
           },
@@ -241,6 +257,29 @@ export class LoopStore extends ReducerBackedStore<LoopEntry, LoopReducerState, L
       }
       return this.entries.get(id);
     });
+  }
+
+  /** One locked snapshot records dispatch and its acknowledgement identity. */
+  beginDynamicWake(id: string): LoopEntry | undefined {
+    return this.withLock(() => {
+      const entry = this.entries.get(id);
+      const at = Date.now();
+      if (!entry || !isOrdinaryDynamic(entry) || entry.status !== "active" || at >= entry.expiresAt
+        || (entry.maxFires && (entry.fireCount ?? 0) >= entry.maxFires)
+        || (entry.dynamic!.awaitingUpdate !== false && entry.dynamic!.awaitingUpdate !== undefined)
+        || entry.dynamic!.pendingWakeId !== undefined) return undefined;
+      const pendingWakeId = randomUUID();
+      this.applyReducerEvent({ type: "LOOP_FIRED", at, source: "system", payload: { id, origin: "dynamic" } });
+      this.applyReducerEvent({ type: "LOOP_DYNAMIC_UPDATED", at, source: "system", payload: {
+        id, dynamic: { awaitingUpdate: true, pendingWakeId, nextWakeAt: undefined, lastUpdatedAt: at },
+      } });
+      if (entry.maxFires && (entry.fireCount ?? 0) + 1 >= entry.maxFires) {
+        this.applyReducerEvent({ type: "LOOP_PAUSED", at, source: "system", payload: {
+          id, kind: "controller_limit", reason: "fire cap reached", retirementCause: "fire_cap",
+        } });
+      }
+      return this.entries.get(id);
+    }, result => result !== undefined);
   }
 
   fire(id: string, origin: LoopFireOrigin = "scheduler"): LoopEntry | undefined {
@@ -306,53 +345,49 @@ export class LoopStore extends ReducerBackedStore<LoopEntry, LoopReducerState, L
   continueDynamic(
     id: string,
     fields: { prompt?: string; dynamic: Partial<DynamicLoopState> },
+    wakeId: string,
     expected?: { status: LoopEntry["status"]; iteration: number; updatedAt: number },
   ): LoopEntry | undefined {
     return this.withLock(() => {
       const entry = this.entries.get(id);
-      if (!entry || entry.trigger.type !== "dynamic" || !entry.dynamic || entry.workflow) return undefined;
+      const now = Date.now();
+      if (!entry || dynamicAckError(entry, wakeId, "continue", now)) return undefined;
       if (expected && (
         entry.status !== expected.status
-        || entry.dynamic.iteration !== expected.iteration
+        || entry.dynamic!.iteration !== expected.iteration
         || entry.updatedAt !== expected.updatedAt
       )) return undefined;
-      const now = Date.now();
-      if (now >= entry.expiresAt) return undefined;
-      if (entry.status === "paused") {
-        this.applyReducerEvent({
-          type: "LOOP_RESUMED",
-          at: now,
-          source: "tool",
-          entityType: "loop",
-          entityId: id,
-          payload: { id },
-        });
-      }
+      const nextWakeAt = fields.dynamic.nextWakeAt;
+      if (nextWakeAt !== undefined && (!Number.isFinite(nextWakeAt) || nextWakeAt <= now
+        || nextWakeAt >= entry.expiresAt || nextWakeAt - now > 7 * 24 * 60 * 60 * 1000)) return undefined;
       this.applyReducerEvent({
         type: "LOOP_DYNAMIC_UPDATED",
         at: now,
         source: "tool",
         entityType: "loop",
         entityId: id,
-        payload: { id, prompt: fields.prompt, dynamic: fields.dynamic },
+        payload: { id, prompt: fields.prompt, dynamic: { ...fields.dynamic, nextWakeAt,
+          iteration: entry.dynamic!.iteration + 1, awaitingUpdate: false, pendingWakeId: undefined, lastUpdatedAt: now,
+        } },
       });
       return this.entries.get(id);
-    });
+    }, result => result !== undefined);
   }
 
   stopDynamic(
     id: string,
     status: "completed" | "paused",
+    wakeId: string,
     expected: { status: LoopEntry["status"]; iteration: number; updatedAt: number },
     checkpoint?: { state?: string; metrics?: string; doneCriteria?: string; prompt?: string },
   ): boolean {
     return this.withLock(() => {
       const entry = this.entries.get(id);
-      if (!entry || entry.trigger.type !== "dynamic" || !entry.dynamic || entry.workflow
+      const at = Date.now();
+      if (!entry || dynamicAckError(entry, wakeId, status, at) || !entry.dynamic
         || entry.status !== expected.status
         || entry.dynamic.iteration !== expected.iteration
         || entry.updatedAt !== expected.updatedAt) return false;
-      const at = Date.now();
       if (status === "paused") {
         // Both reducer events share this lock and publish only the final snapshot.
         this.applyReducerEvent({
@@ -369,6 +404,8 @@ export class LoopStore extends ReducerBackedStore<LoopEntry, LoopReducerState, L
               metrics: checkpoint?.metrics,
               doneCriteria: checkpoint?.doneCriteria,
               goal: checkpoint?.prompt,
+              awaitingUpdate: false,
+              pendingWakeId: undefined,
               lastUpdatedAt: at,
             },
           },
@@ -392,7 +429,7 @@ export class LoopStore extends ReducerBackedStore<LoopEntry, LoopReducerState, L
             payload: { id, kind: "administrative" },
           });
       return true;
-    });
+    }, result => result);
   }
 
   reviseWorkflow(
