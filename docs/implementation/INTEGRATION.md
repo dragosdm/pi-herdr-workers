@@ -1,8 +1,8 @@
 # Audit remediation: independent review and combined verification
 
-20 September 2026. All eleven implementation assignments have accepted run-aware completion reports, published PRs, independent source/test review and passing independent checks. This document records supervisor acceptance and supersedes the pending-review/live wording in the workers' original evidence files. No GitHub PR was merged.
+20 September 2026. All eleven implementation assignments have accepted run-aware completion reports, published PRs, independent source/test review and passing independent checks. This document consolidates supervisor acceptance and supersedes the pending-review/live wording in the archived worker reports. No GitHub PR was merged.
 
-Specs: [PR #11](https://github.com/dragosdm/pi-herdr-workers/pull/11), based on the unmerged audit [PR #10](https://github.com/dragosdm/pi-herdr-workers/pull/10). See [the dependency plan](../specs/README.md). Each implementation retains its isolated branch/worktree and stacked PR base.
+The consolidated integration PR targets `main` and replaces the need to merge the original audit, specs and implementation stack separately. Original reviews remain linked below. Planning specs, the raw audit JSON and detailed worker reports are archived at verified commit [`08c77a0`](https://github.com/dragosdm/pi-herdr-workers/tree/08c77a09dedf2d308889e249d8e6418df169f4c5/docs), rather than carried in the maintained documentation. The historical audit, runtime contracts, regression tests and manual verification tools remain in the repository.
 
 ## Reviewed implementations
 
@@ -34,7 +34,7 @@ No other finding required live acceptance. A04 uses controlled real-transport st
 
 ## Combined branch and conflict review
 
-Verification branch: `integration/audit-remediation`, separate worktree `pi-herdr-workers-integration`. Local integration merges contain every exact reviewed commit above; no implementation branch was rewritten. The tested code/test revision is `ec5e996` (this document is added afterward without production changes).
+Verification branch: `integration/audit-remediation`. Local integration merges contain every exact reviewed commit above; no implementation branch was rewritten. The tested code/test revision is `ec5e996`. Subsequent changes consolidate documentation only. Tests and production code are unchanged.
 
 Resolved shared hunks deliberately:
 
@@ -72,6 +72,6 @@ All exited zero, with no failed, skipped, canceled or todo tests:
 
 ## Remaining boundaries
 
-No required acceptance gate remains unmet. Merge approval is still required. These stacked PRs must be integrated with the reviewed shared-hunk and fixture adaptations, not treated as independent patches that can be applied in arbitrary order.
+No required acceptance gate remains unmet. Merge approval is still required. The consolidated PR already includes the reviewed shared-hunk resolutions and fixture adaptations. The original stacked PRs are review history, not additional patches to merge afterward.
 
-Tests do not prove exactly-once external execution, filesystem power-loss durability, exhaustive historical timezone behavior, or compatibility with every Herdr/Pi version. Cron search remains finite; monitor output remains a bounded observation; old shared-file writers must upgrade together for wake tokens. The pre-existing unsupported task-backlog stub still recommends tools inconsistently with ordinary dynamic ownership; this was disclosed and left outside the eleven fixes. See individual evidence files and the historical audit for other non-remediated limitations.
+Tests do not prove exactly-once external execution, filesystem power-loss durability, exhaustive historical timezone behavior, or compatibility with every Herdr/Pi version. Cron search remains finite; monitor output remains a bounded observation; old shared-file writers must upgrade together for wake tokens. The pre-existing unsupported task-backlog stub still recommends tools inconsistently with ordinary dynamic ownership; this was disclosed and left outside the eleven fixes. See the [archived worker evidence](https://github.com/dragosdm/pi-herdr-workers/tree/08c77a09dedf2d308889e249d8e6418df169f4c5/docs/implementation) and historical audit for other non-remediated limitations.
