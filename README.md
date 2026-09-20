@@ -252,6 +252,10 @@ MonitorStop monitorId="1"
 
 ---
 
+## Validation audit
+
+The [20 September 2026 audit](docs/audits/2026-09-20-live-extension.md) records live Herdr/Pi checks, reproducible defects, existing delivery limitations, and untested boundaries. It includes monitor startup/output failures and loop scheduling/recovery issues. Passing tests include intentional defect reproductions; they do not mean these issues are fixed.
+
 ## Layout
 
 ```text
