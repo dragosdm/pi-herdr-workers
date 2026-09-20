@@ -47,10 +47,16 @@ test("Valid leap-day schedule beyond 366 days returns its next occurrence", () =
   const next = cronToNextFire("0 0 29 2 *", new Date(2026, 8, 20));
   assert.equal(next.getTime(), new Date(2028, 1, 29).getTime());
 });
-test("Known audit gap: full cron in a hybrid spec is truncated to one field", async () => {
+test("Hybrid LoopCreate accepts a complete five-field cron", async () => {
   const f = fixture();
-  await assert.rejects(f.call("LoopCreate", { trigger: "cron: */5 * * * * event: audit", triggerType: "hybrid", prompt: "audit", maxFires: 1 }), /Cannot parse interval/);
-  assert.equal(f.store.list().length, 0);
+  try {
+    await f.call("LoopCreate", { trigger: "cron: */5 * * * * event: audit", triggerType: "hybrid", prompt: "audit", maxFires: 1 });
+    assert.equal(f.store.list().length, 1);
+    const entry = f.store.list()[0];
+    assert.deepEqual(entry.trigger, { type: "hybrid", cron: "*/5 * * * *", event: { source: "audit" }, debounceMs: 30000 });
+    assert.ok(f.scheduler.nextFire(entry.id));
+    assert.equal(f.subscriptions.get("audit")?.size, 1);
+  } finally { f.triggers.stop(); }
 });
 test("Failed scheduling leaves no saved loop and healthy restoration subscribes", async () => {
   const f = fixture();

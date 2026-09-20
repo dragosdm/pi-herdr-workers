@@ -1,5 +1,6 @@
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
+import { HYBRID_TRIGGER_EXAMPLE, parseHybridTriggerInput } from "../hybrid-parse.js";
 import { formatTrigger } from "../loop-format.js";
 import { CRON_TIMING_NOTE, matchIntervalPrefix, parseInterval } from "../loop-parse.js";
 import { getOrchestrationCounts } from "../orchestration-reducer.js";
@@ -230,7 +231,7 @@ export function registerLoopTools(options: LoopToolsOptions): void {
       "Use LoopDelete only for explicit cancellation or a satisfied stop condition—not after a normal, empty, or unchanged iteration. Report the created loop ID.",
     ],
     parameters: Type.Object({
-      trigger: Type.String({ description: "Local-time numeric five-field cron expression (e.g., '0 9 * * 1-5') or supported cron shorthand (e.g., '5m', '1h'; no rounding), event source (e.g., 'tool_execution_start'), hybrid spec, or literal 'idle' with triggerType='idle'" }),
+      trigger: Type.String({ description: "Local-time numeric five-field cron expression (e.g., '0 9 * * 1-5') or supported cron shorthand (e.g., '5m', '1h'; no rounding), event source (e.g., 'tool_execution_start'), hybrid 'cron: */5 * * * * event: audit:test' or 'cron: 1h event: audit:hybrid', or literal 'idle' with triggerType='idle'. Hybrid grammar: lowercase cron/event labels, optional colons, whitespace-separated clauses in either order; schedule is complete five-field cron or supported shorthand, source is one exact token. Prefer explicit triggerType='hybrid'; bare or cron-only schedules require it and default to tool_execution_start. Empty clauses, extra words, duplicate labels and hybrid: prefixes are rejected; quotes/backslashes do not escape whitespace." }),
       prompt: Type.String({ description: "Prompt to run when the loop fires" }),
       recurring: Type.Optional(Type.Boolean({ description: "Whether loop repeats (default: true)", default: true })),
       triggerType: Type.Optional(Type.String({ description: "cron, event, hybrid, or idle (cron/event inferred from trigger string if omitted)", enum: ["cron", "event", "hybrid", "idle"] })),
@@ -263,13 +264,17 @@ export function registerLoopTools(options: LoopToolsOptions): void {
       } else if (inferred === "event") {
         trigger = { type: "event", source: triggerInput };
       } else {
-        const cronPart = triggerInput.match(/cron:?\s*(\S+)/)?.[1] || triggerInput;
-        const eventPart = triggerInput.match(/event:?\s*(\S+)/)?.[1];
-        const parsed = parseInterval(cronPart);
+        const { schedule, eventSource } = parseHybridTriggerInput(triggerInput);
+        let parsed: ReturnType<typeof parseInterval>;
+        try {
+          parsed = parseInterval(schedule);
+        } catch (cause) {
+          throw new Error(`Invalid hybrid trigger: ${cause instanceof Error ? cause.message : String(cause)} Use ${HYBRID_TRIGGER_EXAMPLE}`, { cause });
+        }
         trigger = {
           type: "hybrid",
           cron: parsed.cron,
-          event: { source: eventPart || "tool_execution_start" },
+          event: { source: eventSource },
           debounceMs: debounceMs ?? 30000,
         };
       }
