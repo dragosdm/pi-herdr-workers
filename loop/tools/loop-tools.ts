@@ -28,6 +28,7 @@ interface LoopStoreLike {
     id: string,
     status: "completed" | "paused",
     expected: { status: LoopEntry["status"]; iteration: number; updatedAt: number },
+    checkpoint?: { state?: string; metrics?: string; doneCriteria?: string; prompt?: string },
   ): boolean;
   getDeletionTombstone(id: string): { reason: string; pendingCount?: number } | undefined;
   delete(id: string): boolean;
@@ -196,6 +197,11 @@ function stopDynamicLoop(
     status: entry.status,
     iteration: entry.dynamic.iteration ?? 0,
     updatedAt: entry.updatedAt,
+  }, {
+    state: params.state,
+    metrics: params.metrics,
+    doneCriteria: params.doneCriteria,
+    prompt: params.prompt,
   });
   if (!applied) {
     return { applied: false, message: `Loop #${params.id} changed while the update was applied; inspect LoopList and retry.` };

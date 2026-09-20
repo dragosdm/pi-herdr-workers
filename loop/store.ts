@@ -344,6 +344,7 @@ export class LoopStore extends ReducerBackedStore<LoopEntry, LoopReducerState, L
     id: string,
     status: "completed" | "paused",
     expected: { status: LoopEntry["status"]; iteration: number; updatedAt: number },
+    checkpoint?: { state?: string; metrics?: string; doneCriteria?: string; prompt?: string },
   ): boolean {
     return this.withLock(() => {
       const entry = this.entries.get(id);
@@ -352,6 +353,27 @@ export class LoopStore extends ReducerBackedStore<LoopEntry, LoopReducerState, L
         || entry.dynamic.iteration !== expected.iteration
         || entry.updatedAt !== expected.updatedAt) return false;
       const at = Date.now();
+      if (status === "paused") {
+        // Both reducer events share this lock and publish only the final snapshot.
+        this.applyReducerEvent({
+          type: "LOOP_DYNAMIC_UPDATED",
+          at,
+          source: "tool",
+          entityType: "loop",
+          entityId: id,
+          payload: {
+            id,
+            prompt: checkpoint?.prompt,
+            dynamic: {
+              state: checkpoint?.state,
+              metrics: checkpoint?.metrics,
+              doneCriteria: checkpoint?.doneCriteria,
+              goal: checkpoint?.prompt,
+              lastUpdatedAt: at,
+            },
+          },
+        });
+      }
       this.applyReducerEvent(status === "completed"
         ? {
             type: "LOOP_DELETED",

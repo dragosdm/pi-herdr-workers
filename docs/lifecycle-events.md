@@ -77,6 +77,16 @@ The provider classifies ambiguous pane split, agent start, assignment delivery, 
 
 Pure validation failures occur before worker side effects and remain RPC or tool failures; they do not invent a worker terminal event. One missing inspection result also does not create a lifecycle outcome.
 
+## Fresh-start readiness
+
+A child can publish `worker_ready` before `herdr agent start` returns. During that fresh spawn only, the parent retains a valid readiness envelope for its exact pending run ID, created pane, and selected lifecycle protocol. Retention neither injects a custom message nor accepts an event. Ordinary messages, terminal reports, unknown runs, and wrong panes or protocols receive no startup exception. Re-adoption does not use this permission.
+
+After successful start, the parent persists the relationship and observes provider start with unconfirmed readiness. It then closes the temporary permission and awaits one mailbox scan after any active scan, before sending the initial brief. The scan also runs when no brief was supplied. It reapplies normal live peer and run/pane checks, then uses the unchanged custom-message acknowledgement gate. Spawn does not wait for Pi consumption or a worker acknowledgement. Only the actual worker report confirms readiness; completion remains valid without it.
+
+Under one receiver and successful storage, a valid early readiness report for a successfully bound fresh spawn produces one accepted original readiness event. Failed start or persistence ends the temporary permission without changing the operation error or scoped uncertainty. A later scan uses normal authority, which can survive a persistence error in memory. Shutdown clears pending permission and stops queued scans without terminating worker panes.
+
+The permission is in memory, not a journal or migration. Restart can use a surviving relationship, custom entry, or accepted journal through normal restoration. Death before relationship persistence loses this permission: an endpoint registration and an arbitrary retained envelope do not establish a worker relationship. There is no crash-safe startup guarantee, historical readiness backfill, or new writer authentication. The trusted-local-mailbox-root assumption and the Pi handoff and memory-before-disk gaps below remain.
+
 ## Reconciliation evidence
 
 Reconciliation is a separate trusted provider operation for contract 2 runs. It can resolve only a currently `uncertain` run and requires the caller's inspected `expectedAcceptedSequence` to still equal the canonical sequence. A race returns `STALE_ACCEPTED_SEQUENCE`; the caller must refresh durable state and inspect again instead of overwriting newer worker evidence.

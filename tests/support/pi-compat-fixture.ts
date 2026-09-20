@@ -206,7 +206,7 @@ export async function piCompatFixture(t: TestContext, options: { disabled?: bool
 				transport = createMailboxTransport({ ...callbacks,
 					async deliver(envelope, envelopeId) {
 						deliveries.push(envelopeId);
-						await callbacks.deliver(envelope, envelopeId);
+						return callbacks.deliver(envelope, envelopeId);
 					},
 					warn(error) { failures.push(error); record("mailbox:warning"); },
 				}, { ...defaults, root: mailboxRoot,
