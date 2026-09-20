@@ -45,6 +45,8 @@ Local raw evidence is under `/tmp/pi-herdr-audit-20260920/`. It includes the dri
 - Fix: distinguish a newly created shell from an existing monitor. Wait for bounded, positively established shell readiness before launch. Return an explicit unstarted/uncertain result if readiness cannot be established. Do not report an attachment to an unrelated startup process as successful execution.
 - Regression test: a new pane initially has a startup helper in the foreground, later becomes ready, and runs the command exactly once. Existing busy monitors must still attach without interruption.
 
+Resolution note, 20 September 2026: [A01 implementation 5faabd2](https://github.com/dragosdm/pi-herdr-workers/commit/5faabd248e5bcba950ce42e61cb0572c4aeb65ce) adds bounded shell-readiness checks, retained pending handles and explicit submission/attachment/uncertainty results. [Dedicated regressions](../../tests/extensions/monitor-startup.test.ts) and the converted A01 regression cover those paths. [Implementation evidence](../implementation/A01.md) records automated results. Required disposable live acceptance is still pending supervisor verification; the historical observations above remain unchanged.
+
 ### A02. Medium: monitor output tails are unusable with Herdr 0.8.0
 
 **Reproduced live and deterministically.**
