@@ -3,6 +3,7 @@ import { execFile } from "node:child_process";
 import test, { type TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import type { MailboxCallbacks } from "../../mailbox/transport.js";
 import { LIFECYCLE_JOURNAL_ENTRY } from "../../lifecycle/acceptor.js";
 import { LIFECYCLE_CHANNELS, type AcceptedLifecycleEvent } from "../../lifecycle/protocol.js";
 import { RpcAbortError, WorkerRpcClient } from "../../rpc/client.js";
@@ -63,7 +64,7 @@ async function harness(options: {
 	const agentGetTargets: string[] = [];
 	const startedAgents = new Map<string, string>();
 	let splitCount = 0;
-	let inboxHandler: ((envelope: unknown, envelopeId: string) => Promise<void>) | undefined;
+	let inboxHandler: MailboxCallbacks["deliver"] | undefined;
 	let activeTools: string[] = [...(options.activeTools ?? [])];
 	const pi: any = {
 		events,
