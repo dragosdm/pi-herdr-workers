@@ -49,7 +49,7 @@ export type LoopReducerEvent =
     source: ReducerSource;
     entityType?: "loop";
     entityId?: string;
-    payload: { id: string; kind: LoopPauseKind; reason?: string };
+    payload: { id: string; kind: LoopPauseKind; reason?: string; retirementCause?: "fire_cap" | "one_shot" };
   }
   | {
     type:
@@ -229,6 +229,7 @@ export function reduceLoopState(state: LoopReducerState, event: LoopReducerEvent
             iteration: event.payload.dynamic?.iteration ?? 0,
             nextWakeAt: event.payload.dynamic?.nextWakeAt,
             awaitingUpdate: event.payload.dynamic?.awaitingUpdate ?? false,
+            pendingWakeId: event.payload.dynamic?.pendingWakeId,
             lastUpdatedAt: event.payload.dynamic?.lastUpdatedAt ?? event.at,
           }
         : undefined,
@@ -268,7 +269,11 @@ export function reduceLoopState(state: LoopReducerState, event: LoopReducerEvent
 
   if (event.type === "LOOP_PAUSED") {
     loop.status = "paused";
-    loop.pause = { kind: event.payload.kind, at: event.at, ...(event.payload.reason ? { reason: event.payload.reason } : {}) };
+    loop.pause = { kind: event.payload.kind, at: event.at, ...(event.payload.reason ? { reason: event.payload.reason } : {}),
+      ...(event.payload.retirementCause ? { retirementCause: event.payload.retirementCause } : {}) };
+    if (loop.dynamic && !loop.workflow && !loop.orchestration && !loop.taskBacklog && !event.payload.retirementCause) {
+      loop.dynamic = { ...loop.dynamic, awaitingUpdate: false, pendingWakeId: undefined };
+    }
     loop.updatedAt = event.at;
   }
 
@@ -303,6 +308,7 @@ export function reduceLoopState(state: LoopReducerState, event: LoopReducerEvent
       iteration: event.payload.dynamic.iteration ?? loop.dynamic?.iteration ?? 0,
       nextWakeAt: "nextWakeAt" in event.payload.dynamic ? event.payload.dynamic.nextWakeAt : loop.dynamic?.nextWakeAt,
       awaitingUpdate: event.payload.dynamic.awaitingUpdate ?? loop.dynamic?.awaitingUpdate ?? false,
+      pendingWakeId: "pendingWakeId" in event.payload.dynamic ? event.payload.dynamic.pendingWakeId : loop.dynamic?.pendingWakeId,
       lastUpdatedAt: event.payload.dynamic.lastUpdatedAt ?? event.at,
     };
     loop.updatedAt = event.at;

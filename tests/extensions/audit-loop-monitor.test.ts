@@ -86,21 +86,25 @@ test("Cron without a prompt is rejected without creating a loop", async () => {
   assert.equal(notices[0][1], "warning");
   assert.match(notices[0][0], /Provide a prompt after the interval or cron expression/);
 });
-test("Known audit gap: a second continue update succeeds without another wake", async () => {
+test("A second continue update rejects without another wake", async () => {
   const f = fixture();
-  const loop = f.store.create({ type: "dynamic" }, "audit", { recurring: true, maxFires: 3, dynamic: { goal: "audit", iteration: 0, awaitingUpdate: true } });
-  await f.call("LoopUpdate", { id: loop.id, status: "continue", nextInterval: "1h", state: "first" });
-  await f.call("LoopUpdate", { id: loop.id, status: "continue", nextInterval: "1h", state: "second" });
-  assert.equal(f.store.get(loop.id)?.dynamic?.iteration, 2);
-  assert.equal(f.store.get(loop.id)?.fireCount, 0);
+  const loop = f.store.create({ type: "dynamic" }, "audit", { recurring: true, maxFires: 3 });
+  const wakeId = f.store.beginDynamicWake(loop.id)!.dynamic!.pendingWakeId!;
+  await f.call("LoopUpdate", { id: loop.id, wakeId, status: "continue", nextInterval: "1h", state: "first" });
+  await assert.rejects(async () => f.call("LoopUpdate", { id: loop.id, wakeId, status: "continue", nextInterval: "1h", state: "second" }), /not awaiting/);
+  assert.equal(f.store.get(loop.id)?.dynamic?.iteration, 1);
+  assert.equal(f.store.get(loop.id)?.dynamic?.state, "first");
+  assert.equal(f.store.get(loop.id)?.fireCount, 1);
 });
-test("Known audit gap: pause checkpoints are not applied to dynamic state", async () => {
+test("Dynamic pause checkpoints are saved to dynamic state", async () => {
   const f = fixture();
-  const loop = f.store.create({ type: "dynamic" }, "audit", { recurring: true, maxFires: 3, dynamic: { goal: "audit", state: "old", iteration: 0, awaitingUpdate: true } });
-  await f.call("LoopUpdate", { id: loop.id, status: "paused", state: "new", metrics: "new-metrics", doneCriteria: "new-done" });
+  const loop = f.store.create({ type: "dynamic" }, "audit", { recurring: true, maxFires: 3, dynamic: { goal: "audit", state: "old", iteration: 0 } });
+  const wakeId = f.store.beginDynamicWake(loop.id)!.dynamic!.pendingWakeId!;
+  await f.call("LoopUpdate", { id: loop.id, wakeId, status: "paused", state: "new", metrics: "new-metrics", doneCriteria: "new-done" });
   assert.equal(f.store.get(loop.id)?.status, "paused");
-  assert.equal(f.store.get(loop.id)?.dynamic?.state, "old");
-  assert.equal(f.store.get(loop.id)?.dynamic?.metrics, undefined);
+  assert.equal(f.store.get(loop.id)?.dynamic?.state, "new");
+  assert.equal(f.store.get(loop.id)?.dynamic?.metrics, "new-metrics");
+  assert.equal(f.store.get(loop.id)?.dynamic?.doneCriteria, "new-done");
 });
 test("Dynamic loops awaiting an update expire without another wake", () => {
   const f = fixture();
@@ -118,11 +122,13 @@ test("Loop store enforces the 25-controller cap", () => {
 
 test("Continue preserves omitted checkpoint fields and rejects renewal beyond the fire cap", async () => {
   const f = fixture();
-  const loop = f.store.create({ type: "dynamic" }, "audit", { recurring: true, maxFires: 1, dynamic: { goal: "audit", state: "keep", metrics: "keep", iteration: 0 } });
-  await f.call("LoopUpdate", { id: loop.id, status: "continue", nextInterval: "1h" });
+  const loop = f.store.create({ type: "dynamic" }, "audit", { recurring: true, maxFires: 2, dynamic: { goal: "audit", state: "keep", metrics: "keep", iteration: 0 } });
+  const first = f.store.beginDynamicWake(loop.id)!.dynamic!.pendingWakeId!;
+  await f.call("LoopUpdate", { id: loop.id, wakeId: first, status: "continue", nextInterval: "1h" });
   assert.equal(f.store.get(loop.id)?.dynamic?.state, "keep");
-  f.store.fire(loop.id, "dynamic");
-  await assert.rejects(async () => f.call("LoopUpdate", { id: loop.id, status: "continue" }), /fire cap/);
+  assert.equal(f.store.get(loop.id)?.dynamic?.metrics, "keep");
+  const final = f.store.beginDynamicWake(loop.id)!.dynamic!.pendingWakeId!;
+  await assert.rejects(async () => f.call("LoopUpdate", { id: loop.id, wakeId: final, status: "continue" }), /fire cap/);
 });
 
 test("Known audit gap: monitor readTail assumes JSON for Herdr's text output", async () => {
