@@ -18,7 +18,7 @@ interface LoopStoreLike {
     maxFires?: number;
     dynamic?: Partial<DynamicLoopState>;
   }): LoopEntry;
-  pause(id: string): LoopEntry | undefined;
+  pause(id: string, kind?: "administrative", reason?: string): LoopEntry | undefined;
   resume(id: string): LoopEntry | undefined;
   delete(id: string): boolean;
 }
@@ -79,22 +79,30 @@ export function registerLoopCommand(options: LoopCommandOptions): void {
   const { pi, getStore, getTriggerSystem, updateWidget, onDynamicLoopActivated, cancelOrchestration } = options;
 
   function createCronLoop(ui: ExtensionUIContext, interval: string, prompt: string, notifyEvery: boolean) {
+    const store = getStore();
+    const triggerSystem = getTriggerSystem();
     let entry: LoopEntry | undefined;
+    let registered = false;
     try {
       const parsed = parseInterval(interval);
       const trigger: Trigger = { type: "cron", schedule: parsed.cron };
-      entry = getStore().create(trigger, prompt, { recurring: true, maxFires: 25 });
-      getTriggerSystem().add(entry);
+      entry = store.create(trigger, prompt, { recurring: true, maxFires: 25 });
+      triggerSystem.add(entry);
+      registered = true;
       updateWidget();
       const cadence = notifyEvery ? `every ${parsed.description}` : parsed.description;
       ui.notify(`Loop #${entry.id} created: ${cadence} — ${prompt.slice(0, 50)}`, "info");
     } catch (err: unknown) {
-      if (entry) {
-        getTriggerSystem().remove(entry.id);
-        getStore().delete(entry.id);
-        updateWidget();
+      const cleanupErrors: unknown[] = [];
+      if (entry && !registered) {
+        try { triggerSystem.remove(entry.id); } catch (cause) { cleanupErrors.push(cause); }
+        try { store.delete(entry.id); } catch (cause) { cleanupErrors.push(cause); }
+        try { updateWidget(); } catch { /* preserve primary error */ }
       }
-      ui.notify((err as Error).message, "error");
+      const message = err instanceof Error ? err.message : String(err);
+      ui.notify(cleanupErrors.length
+        ? `${message}; rollback failed for loop #${entry!.id}: ${cleanupErrors.map(String).join("; ")}`
+        : message, "error");
     }
   }
 
@@ -168,9 +176,11 @@ export function registerLoopCommand(options: LoopCommandOptions): void {
         ) actions.unshift("* Resume");
         actions.push("< Back");
 
-        const detail = entry.workflow
+        let detail = entry.workflow
           ? formatWorkflowInspection(entry)
           : `#${entry.id}: ${entry.prompt}\nTrigger: ${JSON.stringify(entry.trigger)}`;
+        if (entry.pause) detail += `\nPause: ${entry.pause.kind}`;
+        if (entry.pause?.reason) detail += `\nReason: ${entry.pause.reason}`;
         const action = await ui.select(detail, actions);
 
         if (action === "x Delete") {
@@ -190,9 +200,28 @@ export function registerLoopCommand(options: LoopCommandOptions): void {
           }
           ui.notify(`Loop #${entry.id} paused`, "info");
         } else if (action === "* Resume") {
-          const resumed = getStore().resume(entry.id);
-          if (!resumed) return viewLoops(ui);
-          getTriggerSystem().add(resumed);
+          const store = getStore();
+          const triggerSystem = getTriggerSystem();
+          let resumed: LoopEntry | undefined;
+          try {
+            resumed = store.resume(entry.id);
+            if (!resumed) return viewLoops(ui);
+            try {
+              triggerSystem.add(resumed);
+            } catch (error) {
+              const cleanupErrors: unknown[] = [];
+              try { triggerSystem.remove(entry.id); } catch (cause) { cleanupErrors.push(cause); }
+              try { store.pause(entry.id, "administrative", `Registration failed: ${String(error)}`); } catch (cause) { cleanupErrors.push(cause); }
+              if (cleanupErrors.length) {
+                throw new AggregateError([error, ...cleanupErrors], `Loop #${entry.id} resume registration failed: ${String(error)}; cleanup failed: ${cleanupErrors.map(String).join("; ")}`, { cause: error });
+              }
+              throw error;
+            }
+          } catch (error) {
+            try { updateWidget(); } catch { /* preserve primary error */ }
+            ui.notify(error instanceof Error ? error.message : String(error), "error");
+            return viewLoops(ui);
+          }
           updateWidget();
           ui.notify(`Loop #${entry.id} resumed`, "info");
           if (resumed.trigger.type === "dynamic") onDynamicLoopActivated?.(resumed);

@@ -237,7 +237,8 @@ export function registerLoopTools(options: LoopToolsOptions): void {
       readOnly: Type.Optional(Type.Boolean({ description: "Restrict the agent to read-only tools when this loop fires (default: false)", default: false })),
       maxFires: Type.Optional(Type.Integer({ description: "Auto-stop after N fires. Prevents infinite token burn on polling loops.", minimum: 1 })),
     }, { additionalProperties: false }),
-    async execute(_toolCallId, params) {
+    async execute(_toolCallId, params, signal) {
+      signal?.throwIfAborted();
       const { trigger: triggerInput, prompt, recurring, triggerType, debounceMs, readOnly, maxFires } = params;
 
       let trigger: Trigger;
@@ -282,7 +283,9 @@ export function registerLoopTools(options: LoopToolsOptions): void {
           expanded: [validationError],
         }));
       }
-      const entry = getStore().create(trigger, prompt, {
+      const store = getStore();
+      const triggerSystem = getTriggerSystem();
+      const entry = store.create(trigger, prompt, {
         recurring: recurring ?? true,
         readOnly,
         maxFires: maxFires ?? 25,
@@ -291,7 +294,19 @@ export function registerLoopTools(options: LoopToolsOptions): void {
           : undefined,
       });
 
-      getTriggerSystem().add(entry);
+      try {
+        triggerSystem.add(entry);
+      } catch (error) {
+        const cleanupErrors: unknown[] = [];
+        try { triggerSystem.remove(entry.id); } catch (cause) { cleanupErrors.push(cause); }
+        try { store.delete(entry.id); } catch (cause) { cleanupErrors.push(cause); }
+        // Rendering is not allowed to hide the registration or cleanup failure.
+        try { updateWidget(); } catch { /* primary error takes precedence */ }
+        if (cleanupErrors.length) {
+          throw new AggregateError([error, ...cleanupErrors], `Loop #${entry.id} registration failed: ${String(error)}; rollback failed: ${cleanupErrors.map(String).join("; ")}`, { cause: error });
+        }
+        throw error;
+      }
       if (trigger.type === "dynamic") onDynamicLoopActivated?.(entry);
 
       if (trigger.type === "event" && trigger.source === "monitor:done" && trigger.filter) {
@@ -374,6 +389,7 @@ export function registerLoopTools(options: LoopToolsOptions): void {
           line += ` age: ${formatRemaining(Math.max(0, now - entry.createdAt))}`;
         }
         if (entry.pause) line += ` [pause:${entry.pause.kind}]`;
+        if (entry.pause?.reason) line += ` reason: ${entry.pause.reason}`;
         if (entry.orchestration) {
           const counts = getOrchestrationCounts(entry.orchestration);
           line += ` [orchestration:${entry.orchestration.status}]`;

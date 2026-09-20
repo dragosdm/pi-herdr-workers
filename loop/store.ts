@@ -1,5 +1,6 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { cronToNextFire } from "./loop-parse.js";
 import { type LoopReducerEffect, type LoopReducerEvent, type LoopReducerState, reduceLoopState } from "./loop-reducer.js";
 import { applyOrchestrationEvent, type OrchestrationEvent, validateOrchestrationDefinition, validatePersistedOrchestration } from "./orchestration-reducer.js";
 import { ReducerBackedStore } from "./reducer-backed-store.js";
@@ -9,6 +10,13 @@ import { isTerminalWorkflowRun, transitionWorkflowRun, validateWorkflowAdmission
 import { validatePersistedWorkflowRevision, type WorkflowRevisionInput, type WorkflowRevisionSummary } from "./workflow-revision.js";
 
 const LOOPS_DIR = join(homedir(), ".pi", "loops");
+
+// Resolve before mutation, without restricting occurrences to the controller lifetime.
+function preflightSchedule(trigger: Trigger, now: number): void {
+  if (trigger.type === "cron" || trigger.type === "hybrid") {
+    cronToNextFire(trigger.type === "cron" ? trigger.schedule : trigger.cron, new Date(now));
+  }
+}
 
 /**
  * One-time normalization for workflows persisted by v0.7.3, which linked state
@@ -139,6 +147,7 @@ export class LoopStore extends ReducerBackedStore<LoopEntry, LoopReducerState, L
         if (validationError) throw new Error(`Invalid orchestration: ${validationError}`);
       }
       const now = Date.now();
+      preflightSchedule(trigger, now);
       this.applyReducerEvent({
         type: "LOOP_CREATED",
         at: now,
@@ -202,11 +211,13 @@ export class LoopStore extends ReducerBackedStore<LoopEntry, LoopReducerState, L
   resume(id: string): LoopEntry | undefined {
     return this.withLock(() => {
       const entry = this.entries.get(id);
-      if (!entry || Date.now() >= entry.expiresAt || isTerminalWorkflowRun(entry.workflow)
+      const now = Date.now();
+      if (!entry || now >= entry.expiresAt || isTerminalWorkflowRun(entry.workflow)
         || (entry.maxFires && (entry.fireCount ?? 0) >= entry.maxFires)) return undefined;
+      preflightSchedule(entry.trigger, now);
       this.applyReducerEvent({
         type: "LOOP_RESUMED",
-        at: Date.now(),
+        at: now,
         source: "tool",
         entityType: "loop",
         entityId: id,

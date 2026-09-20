@@ -206,6 +206,8 @@ State is journaled in pi's session JSONL via `appendEntry` by default. Existing 
 
 Recurring loops expire after seven days unless recreated. Cap: 25 loops. `LoopCreate` defaults to 25 wakes unless `maxFires` is supplied; `/loop` scheduled/event loops cap at 25, and dynamic goals at 20.
 
+Cron and hybrid timer creation checks the current scheduler before saving a controller. An unavailable schedule fails without consuming an ID or controller slot. On reload, an older unavailable schedule is retained as paused with a `Schedule unavailable:` reason in `LoopList` and `/loop` inspection; healthy controllers still restore. This recovery requires writable storage. A paused controller still counts toward the 25-controller cap. Delete it with `LoopDelete` and create a corrected schedule, or explicitly resume it from `/loop` after a scheduler upgrade supports it. Resume retries validation without changing a rejected paused record, and still enforces its original lifetime and fire cap. Reload never resumes it automatically. A valid occurrence beyond the seven-day lifetime follows normal expiry handling instead of quarantine.
+
 Event subscriptions survive reload/resume. Wakes wait for `agent_settled`, not the end of an individual retry or tool cycle. Built-in `tool_execution_start`, `tool_execution_end`, `turn_start`, `turn_end`, and `agent_settled` events are bridged onto the extension bus; Loop tools do not trigger their own tool-event loops. Other sources must be emitted by an extension.
 
 Read-only wakes enforce a tool-call gate (read/search/list and loop bookkeeping only); shell commands and arbitrary custom tools are blocked until the run settles. This deliberately stays conservative if other work is queued during that run.
