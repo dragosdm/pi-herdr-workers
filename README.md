@@ -192,6 +192,7 @@ Same session, no extra workers. Idle-safe wakes when Pi is sitting there.
 
 ```text
 /loop 5m check the deploy
+/loop 0 9 * * 1-5 check the deploy
 /loop event tool_execution_end review that tool
 /loop finish the release
 ```
@@ -211,6 +212,10 @@ LoopUpdate id="1" wakeId="<Wake ID from this wake>" status="continue" state="Che
 One recorded wake accepts at most one update. Missing, duplicate, stale, wrong-loop and expired tokens reject without changing the checkpoint or schedule. `continue` increments the iteration once and consumes the token; omitted `nextInterval` selects idle-driven continuation. Pause consumes the token without advancing the iteration; completion deletes the controller. `LoopUpdate` never resumes a paused loop. Use `/loop` Resume explicitly. Administrative Pause, Resume and Delete invalidate the old wake, even if its message is still visible. An unexpired final-cap or retired one-shot wake can still accept its pending token with `paused` or `completed`, never `continue`.
 
 `LoopList` shows `awaitingUpdate` and the full pending `wakeId`, including on capped paused controllers. For a legacy wake message without a token, inspect that list and the saved checkpoint before deciding whether an update is still relevant. Legacy awaiting snapshots receive a deterministic `legacy-<sha256>` identity on load, without replaying work or writing during inspection. Administratively paused legacy entries require explicit resume. Invalid pending metadata fails closed for that controller; inspect and explicitly pause/resume to repair it. Tokens correlate updates, not authenticate them: never automatically attach a newer token to old work. Upgrade every writer of a shared loop file together; mixed old/new writers are unsupported.
+
+Scheduled command forms require a prompt after the shorthand or five-field cron expression. A bare valid schedule warns without creating a controller; invalid numeric cron fields produce an error even without a prompt. Exactly five numeric/cron-shaped fields are reserved for schedules. To use that literal text as a goal, add ordinary prose before it or use `LoopCreate` with `triggerType: "idle"` and that prompt. Fewer than five fields keep the existing dynamic fallback; a sixth numeric token is prompt text, not a seconds/year field.
+
+Whole first tokens `event` and `when` reserve event syntax, case-insensitively: `/loop event <source> <prompt>` or `/loop when <source> <prompt>`. Incomplete forms such as `/loop when ready` show usage guidance without creating a goal or opening an input dialog. Prefixes such as `eventually` and `whenever` remain ordinary goals. Existing saved dynamic goals, including cron-looking text, restore unchanged; inspect and explicitly pause/delete any accidental controller.
 
 Cron shorthand accepts exactly `1m`, `2m`, `5m`, `10m`, `15m`, `30m`, `1h`, `2h`, `3h`, `4h`, `6h`, `8h`, `12h`, and `1d`. Equivalent integer-unit spellings such as `60s`, `60m`, and `24h` work, including uppercase units and whitespace. Unsupported values such as `0m`, `30s`, `3m`, and `2d` fail without creating a controller. Nothing is rounded. Explicit cron such as `*/3 * * * *` can express additional calendar schedules, but is not a general elapsed-time fallback.
 
