@@ -1,5 +1,7 @@
 # Extension audit, 20 September 2026
 
+This is the historical pre-fix audit. All eleven findings have since passed independent review and combined verification. See the [acceptance record](../implementation/INTEGRATION.md) for current results and remaining limitations. References below to failing behavior or characterization tests describe the audited baseline, not the current code.
+
 ## Result
 
 The worker happy paths worked in live Herdr panes. Monitors and loop recovery have release-blocking failures that the original test suite did not cover.
@@ -28,7 +30,7 @@ The opt-in driver in `tests/manual/live-audit.ts` loads the actual three extensi
 
 Herdr, process inspection, pane creation, filesystem mailboxes, Pi queues, session storage, and the event bus were real in the live tests. The audit driver used no fake Herdr backend. The new deterministic tests isolate loop parsing/state and monitor execution decisions with controlled inputs.
 
-Local raw evidence is under `/tmp/pi-herdr-audit-20260920/`. It includes the driver JSONL, session files, baseline/final logs, snapshots, and monitor canaries. These temporary files are not a portable or permanent artifact. Selected evidence is retained in [2026-09-20-evidence.json](2026-09-20-evidence.json).
+Local raw evidence is under `/tmp/pi-herdr-audit-20260920/`. It includes the driver JSONL, session files, baseline/final logs, snapshots, and monitor canaries. These temporary files are not a portable or permanent artifact. Selected evidence is retained in [the archived audit JSON](https://github.com/dragosdm/pi-herdr-workers/blob/08c77a09dedf2d308889e249d8e6418df169f4c5/docs/audits/2026-09-20-evidence.json).
 
 ## Findings requiring fixes
 
@@ -45,7 +47,7 @@ Local raw evidence is under `/tmp/pi-herdr-audit-20260920/`. It includes the dri
 - Fix: distinguish a newly created shell from an existing monitor. Wait for bounded, positively established shell readiness before launch. Return an explicit unstarted/uncertain result if readiness cannot be established. Do not report an attachment to an unrelated startup process as successful execution.
 - Regression test: a new pane initially has a startup helper in the foreground, later becomes ready, and runs the command exactly once. Existing busy monitors must still attach without interruption.
 
-Resolution note, 20 September 2026: [A01 implementation 5faabd2](https://github.com/dragosdm/pi-herdr-workers/commit/5faabd248e5bcba950ce42e61cb0572c4aeb65ce) adds bounded shell-readiness checks, retained pending handles and explicit submission/attachment/uncertainty results. [Dedicated regressions](../../tests/extensions/monitor-startup.test.ts) and the converted A01 regression cover those paths. [Implementation evidence](../implementation/A01.md) records automated results. Required disposable live acceptance is still pending supervisor verification; the historical observations above remain unchanged.
+Resolution note, 20 September 2026: [A01 implementation 5faabd2](https://github.com/dragosdm/pi-herdr-workers/commit/5faabd248e5bcba950ce42e61cb0572c4aeb65ce) adds bounded shell-readiness checks, retained pending handles and explicit submission/attachment/uncertainty results. [Dedicated regressions](../../tests/extensions/monitor-startup.test.ts) and the converted A01 regression cover those paths. The [acceptance record](../implementation/INTEGRATION.md) records passing independent automated and disposable live checks on the final revision. The historical observations above remain unchanged.
 
 ### A02. Medium: monitor output tails are unusable with Herdr 0.8.0
 
@@ -77,7 +79,7 @@ Resolution note, 20 September 2026: [A01 implementation 5faabd2](https://github.
 - Fix: validate schedulability before persistence or roll back both store and trigger registration. During recovery, quarantine one invalid controller without disabling unrelated controllers.
 - Recovery used in this audit: explicitly delete the impossible entry and reload. No loops were left active.
 
-**A03 resolution note, 2026-09-20:** The [creation/recovery regressions](../../tests/extensions/loop-creation-recovery.test.ts) now cover zero-mutation rejection, ID-local registration rollback, paused legacy-schedule recovery, persisted reasons, guarded resume, and actual healthy event firing through the wired extension. See [implementation evidence](../implementation/A03.md) for baseline failures, verification results, and limits. The historical observations above and retained evidence JSON are unchanged. Optional live verification was not run for this fix; coordinator review remains required.
+**A03 resolution note, 2026-09-20:** The [creation/recovery regressions](../../tests/extensions/loop-creation-recovery.test.ts) now cover zero-mutation rejection, ID-local registration rollback, paused legacy-schedule recovery, persisted reasons, guarded resume, and actual healthy event firing through the wired extension. See the [acceptance record](../implementation/INTEGRATION.md) for independent verification results and limits. Historical observations and archived evidence remain available. Optional live verification was not required for this fix.
 
 ### A04. Medium: fresh worker readiness is lost during startup
 
