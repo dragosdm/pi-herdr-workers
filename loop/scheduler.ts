@@ -163,14 +163,15 @@ export class CronScheduler {
         continue;
       }
 
-      if (entry.trigger.type === "dynamic" && entry.dynamic?.awaitingUpdate) continue;
-
-      if (filter && !filter(entry)) continue;
-
+      // Lifetime enforcement precedes work eligibility, including awaiting updates.
       if (now >= entry.expiresAt) {
         this.retireExpired(entry, now);
         continue;
       }
+
+      if (entry.trigger.type === "dynamic" && entry.dynamic?.awaitingUpdate) continue;
+
+      if (filter && !filter(entry)) continue;
 
       this.onFire(entry, "scheduler");
 
