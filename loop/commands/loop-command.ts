@@ -4,7 +4,7 @@ import type {
   ExtensionUIContext,
 } from "@earendil-works/pi-coding-agent";
 import { formatTrigger } from "../loop-format.js";
-import { isValidCronExpression, parseInterval } from "../loop-parse.js";
+import { CRON_TIMING_NOTE, isValidCronExpression, matchIntervalPrefix, parseInterval } from "../loop-parse.js";
 import type { DynamicLoopState, LoopEntry, Trigger } from "../types.js";
 import { formatWorkflowInspection, workflowActivityLabel } from "../ui/workflow-presentation.js";
 import { isTerminalWorkflowRun } from "../workflow-reducer.js";
@@ -64,10 +64,9 @@ function parseLoopCommandRoute(input: string): LoopCommandRoute {
     }
   }
 
-  const intervalMatch = trimmed.match(/^(\d+\s*[smhdS]\b)/i);
+  const intervalMatch = matchIntervalPrefix(trimmed);
   if (intervalMatch) {
-    const interval = intervalMatch[1] ?? intervalMatch[0];
-    const prompt = trimmed.slice(intervalMatch[0].length).trim();
+    const { interval, rest: prompt } = intervalMatch;
     if (!prompt) return { type: "missing-interval-prompt" };
     return { type: "cron", interval, prompt, notifyEvery: true };
   }
@@ -91,7 +90,7 @@ export function registerLoopCommand(options: LoopCommandOptions): void {
       registered = true;
       updateWidget();
       const cadence = notifyEvery ? `every ${parsed.description}` : parsed.description;
-      ui.notify(`Loop #${entry.id} created: ${cadence} — ${prompt.slice(0, 50)}`, "info");
+      ui.notify(`Loop #${entry.id} created: ${cadence} — ${prompt.slice(0, 50)}\n${CRON_TIMING_NOTE}`, "info");
     } catch (err: unknown) {
       const cleanupErrors: unknown[] = [];
       if (entry && !registered) {
