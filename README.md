@@ -224,9 +224,14 @@ Read-only wakes enforce a tool-call gate (read/search/list and loop bookkeeping 
 - Each command gets a **down-split** pane titled `mon:<hash> <command>`
 - **The same command in the same cwd reuses that pane**
 - Panes **stay open** when the command finishes
-- Creating an already-running monitor attaches to it; it never sends `ctrl+c` or restarts it
-- `MonitorStop` validates the pane identity and current process state before sending `ctrl+c` — it does not close the pane
-- Handles and command/cwd metadata survive reload; restored process status starts **unknown**, and `MonitorList` refreshes it
+- Creating an already-busy monitor attaches without submitting input or sending `ctrl+c`. Foreground identity is observational, not proof that it is the requested command. An explicit create on an idle matching pane may submit the command again.
+- A newly claimed pane waits up to 5,000 ms for a positively identified supported shell, including a final label check. A fresh tab uses its root rather than splitting around a startup helper.
+- `command submitted` means Herdr acknowledged one `pane run`, not that the application is ready or finished. `attached` means this call sent no command.
+- Readiness failure retains the pane and its `pending` handle. `MonitorList` says `command not submitted`; `MonitorStop` does not interrupt pending startup helpers. Inspect the named pane before an explicit retry.
+- If submission times out, is cancelled, or its acknowledgement cannot be saved, the handle is `uncertain`. Submission may have happened. Inspect the pane before retrying; the manager never retries submission within the failed call.
+- `MonitorStop` validates the pane identity and current process state before sending `ctrl+c`. It does not close the pane.
+- Handles and command/cwd metadata survive reload, with optional `pending`, `submitted` or `uncertain` launch evidence in the existing v1 snapshot. Restored process status starts **unknown**. Legacy handles have no submission evidence, and restoration never starts a command.
+- Readiness is a foreground-process observation, not a shell-prompt handshake. Another actor can change the pane after inspection. Session appends and terminal input are not a transaction or a power-loss guarantee; old snapshots or older binaries may lack launch evidence. Do not automatically replay pending launches or assume downgrade/replay is safe.
 
 ```text
 MonitorCreate command="npm test" description="Run test suite"

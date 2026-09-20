@@ -30,27 +30,34 @@ export function registerMonitorTools(options: MonitorToolsOptions): void {
       description: Type.Optional(Type.String({ description: "Human-readable description" })),
     }),
     async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+      const refreshWidget = () => {
+        // UI failure must not replace submission evidence or the retained-pane warning.
+        try { updateWidget(); } catch { /* Best effort; the tool result remains authoritative. */ }
+      };
       try {
         const entry = await getMonitors().create(params.command, params.description, ctx.cwd, signal);
-        updateWidget();
+        refreshWidget();
         const reuse = entry.reused ? "reused existing pane" : "new pane";
+        const action = entry.createAction === "submitted" ? `command submitted (${reuse})` : "attached to existing busy pane; no command submitted";
         return textResult(
-          `Monitor #${entry.id} ${entry.reused ? "attached" : "started"} (${reuse})\n` +
+          `Monitor #${entry.id} ${action}\n` +
           `Tab: Monitor · pane ${entry.paneId}\n` +
           `Command: ${entry.command}\n` +
-          `The pane stays open after the command ends. The same command reuses pane key mon:${entry.key}.`,
+          `The pane stays open after the command ends. The same command reuses pane key mon:${entry.key}.\n` +
+          (entry.createAction === "submitted" ? "Submission does not prove application readiness or completion." : "Foreground identity is observational, not proof that the requested command is running."),
           {
             kind: "monitor",
             action: "create",
             tone: "success",
-            summary: `Monitor #${entry.id} ${entry.status} · ${params.description ?? entry.command.slice(0, 48)}`,
+            summary: `Monitor #${entry.id} ${action} · ${params.description ?? entry.command.slice(0, 48)}`,
             expanded: [`Pane: ${entry.paneId}`, `Key: mon:${entry.key}`, reuse],
           },
         );
       } catch (error) {
+        refreshWidget();
         const message = error instanceof Error ? error.message : String(error);
         return textResult(message, {
-          kind: "monitor", action: "create", tone: "error", summary: "Monitor was not created", expanded: [message],
+          kind: "monitor", action: "create", tone: "error", summary: "Monitor command not submitted or submission uncertain", expanded: [message],
         });
       }
     },
@@ -75,7 +82,8 @@ export function registerMonitorTools(options: MonitorToolsOptions): void {
       for (const raw of monitors) {
         const m: HerdrMonitor = await manager.refresh(raw, signal);
         const icon = m.status === "running" ? ">" : m.status === "idle" ? "ok" : "x";
-        lines.push(`${icon} #${m.id} [${m.status}] ${m.command.slice(0, 60)} · pane ${m.paneId} (${formatAge(Date.now() - m.startedAt)})`);
+        const launch = m.launchState === "pending" ? " · command not submitted" : m.launchState === "submitted" ? " · command submitted" : m.launchState === "uncertain" ? " · submission uncertain" : "";
+        lines.push(`${icon} #${m.id} [${m.status}${launch}] ${m.command.slice(0, 60)} · pane ${m.paneId} (${formatAge(Date.now() - m.startedAt)})`);
         try {
           const tail = await manager.readTail(m.paneId, 5, signal);
           for (const out of tail) lines.push(`  | ${out.slice(0, 100)}`);

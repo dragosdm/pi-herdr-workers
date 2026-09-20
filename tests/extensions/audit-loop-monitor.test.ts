@@ -6,7 +6,7 @@ import { CronScheduler } from "../../loop/scheduler.js";
 import { TriggerSystem } from "../../loop/trigger-system.js";
 import { registerLoopTools } from "../../loop/tools/loop-tools.js";
 import { registerLoopCommand } from "../../loop/commands/loop-command.js";
-import { HerdrMonitorManager } from "../../loop/runtime/herdr-monitor.js";
+import { HerdrMonitorManager, commandKey } from "../../loop/runtime/herdr-monitor.js";
 
 // Passing characterizations of audit findings, NOT assertions that these are desirable.
 // Invert the relevant expectations when fixing the documented gaps.
@@ -130,26 +130,32 @@ test("Known audit gap: monitor readTail assumes JSON for Herdr's text output", a
   }
 });
 
-test("Known audit gap: busy shell startup in a new monitor pane reports success without running its command", async () => {
+test("A01: new monitor waits for shell startup and submits once", async () => {
   const old = { env: process.env.HERDR_ENV, workspace: process.env.HERDR_WORKSPACE_ID };
   process.env.HERDR_ENV = "1"; process.env.HERDR_WORKSPACE_ID = "audit";
   const calls: string[][] = [];
+  let probes = 0;
+  let manager: HerdrMonitorManager | undefined;
   try {
-    const manager = new HerdrMonitorManager(async (_command, args) => {
+    manager = new HerdrMonitorManager(async (_command, args) => {
       calls.push(args);
       let result: any = {};
       if (args[0] === "tab") result = { tabs: [{ label: "Monitor", tab_id: "tab" }] };
       if (args[0] === "pane" && args[1] === "list") result = { panes: [{ pane_id: "root", tab_id: "tab", label: "existing" }] };
       if (args[1] === "split") result = { pane: { pane_id: "new" } };
-      if (args[1] === "process-info") result = { process_info: { shell_pid: 1, foreground_processes: [{ pid: 2, name: "shell-startup-helper" }] } };
+      if (args[1] === "process-info") result = { process_info: { shell_pid: 1, foreground_processes: [++probes === 1 ? { pid: 2, name: "shell-startup-helper" } : { pid: 1, name: "zsh" }] } };
+      if (args[1] === "get") result = { pane: { label: `mon:${commandKey("printf canary", "/tmp")} canary` } };
       return { stdout: JSON.stringify({ result }), stderr: "", code: 0, killed: false };
     });
-    const monitor = await manager.create("printf never-ran", undefined, "/tmp");
+    const monitor = await manager.create("printf canary", undefined, "/tmp");
     assert.equal(monitor.status, "running");
     assert.equal(monitor.reused, false);
-    assert.equal(calls.some(args => args[1] === "run"), false);
-    manager.dispose();
+    assert.equal(monitor.launchState, "submitted");
+    assert.equal(monitor.createAction, "submitted");
+    assert.equal(calls.filter(args => args[1] === "run").length, 1);
+    assert.equal(calls.some(args => args[1] === "send-keys"), false);
   } finally {
+    manager?.dispose();
     if (old.env === undefined) delete process.env.HERDR_ENV; else process.env.HERDR_ENV = old.env;
     if (old.workspace === undefined) delete process.env.HERDR_WORKSPACE_ID; else process.env.HERDR_WORKSPACE_ID = old.workspace;
   }
