@@ -53,19 +53,23 @@ test("Known audit gap: full cron in a hybrid spec is truncated to one field", as
   await assert.rejects(f.call("LoopCreate", { trigger: "cron: */5 * * * * event: audit", triggerType: "hybrid", prompt: "audit", maxFires: 1 }), /Cannot parse interval/);
   assert.equal(f.store.list().length, 0);
 });
-test("Known audit gap: failed scheduling leaves an active saved loop and breaks restoration subscriptions", async () => {
+test("Failed scheduling leaves no saved loop and healthy restoration subscribes", async () => {
   const f = fixture();
+  const before = f.store.snapshot();
   await assert.rejects(f.call("LoopCreate", { trigger: "0 0 31 2 *", triggerType: "cron", prompt: "audit", maxFires: 1 }), /No matching time/);
-  assert.equal(f.store.list()[0].status, "active");
+  assert.deepEqual(f.store.snapshot(), before);
   const event = f.store.create({ type: "event", source: "audit" }, "audit", { recurring: true, maxFires: 1 });
-  assert.throws(() => f.triggers.start(), /No matching time/);
-  assert.equal(f.subscriptions.get("audit"), undefined);
-  assert.equal(f.store.get(event.id)?.fireCount, 0);
+  try {
+    assert.doesNotThrow(() => f.triggers.start());
+    assert.equal(f.subscriptions.get("audit")?.size, 1);
+    assert.equal(f.store.get(event.id)?.fireCount, 0);
+  } finally { f.triggers.stop(); }
 });
 test("Command creation rolls back the same impossible cron", async () => {
   const f = fixture(); const notices: string[] = [];
+  const before = f.store.snapshot();
   await f.commands.get("loop").handler("0 0 31 2 * audit", { hasUI: true, ui: { notify: (message: string) => notices.push(message) } });
-  assert.equal(f.store.list().length, 0);
+  assert.deepEqual(f.store.snapshot(), before);
   assert.match(notices[0], /No matching time/);
 });
 test("Known audit gap: cron without a prompt is interpreted as a dynamic goal", async () => {

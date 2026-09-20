@@ -18,6 +18,7 @@ export class TriggerSystem {
   ) {}
 
   start(): void {
+    this.stop();
     this.scheduler.start();
     for (const entry of this.store.list()) {
       if (entry.status !== "active" || isTerminalWorkflowRun(entry.workflow)) continue;
@@ -42,7 +43,16 @@ export class TriggerSystem {
     this.scheduler.add(entry);
     if (entry.trigger.type === "event" || entry.trigger.type === "hybrid") {
       const ev = entry.trigger.type === "hybrid" ? entry.trigger.event : entry.trigger;
-      this.subscribeEvent(entry, ev.source, ev.filter);
+      try {
+        this.subscribeEvent(entry, ev.source, ev.filter);
+      } catch (error) {
+        try {
+          this.remove(entry.id);
+        } catch (cleanupError) {
+          throw new AggregateError([error, cleanupError], `Loop #${entry.id} registration failed: ${String(error)}; cleanup failed: ${String(cleanupError)}`, { cause: error });
+        }
+        throw error;
+      }
     }
   }
 

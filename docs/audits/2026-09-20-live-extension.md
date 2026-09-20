@@ -75,6 +75,8 @@ Local raw evidence is under `/tmp/pi-herdr-audit-20260920/`. It includes the dri
 - Fix: validate schedulability before persistence or roll back both store and trigger registration. During recovery, quarantine one invalid controller without disabling unrelated controllers.
 - Recovery used in this audit: explicitly delete the impossible entry and reload. No loops were left active.
 
+**A03 resolution note, 2026-09-20:** The [creation/recovery regressions](../../tests/extensions/loop-creation-recovery.test.ts) now cover zero-mutation rejection, ID-local registration rollback, paused legacy-schedule recovery, persisted reasons, guarded resume, and actual healthy event firing through the wired extension. See [implementation evidence](../implementation/A03.md) for baseline failures, verification results, and limits. The historical observations above and retained evidence JSON are unchanged. Optional live verification was not run for this fix; coordinator review remains required.
+
 ### A04. Medium: fresh worker readiness is lost during startup
 
 **Observed live; the source ordering identifies a likely startup race.**
