@@ -2,11 +2,15 @@
 
 One Pi package for **teams of agents in [Herdr](https://herdr.dev) panes**, **`/split-handoff` / `/split-fork`**, **scheduled/event/idle `/loop` re-wakes**, and **background monitors** that are just Herdr panes.
 
-No extra npm dependencies. Peer APIs come from Pi (`pi-coding-agent`, `pi-tui`, `typebox`). Requires a Herdr-managed pane (`HERDR_ENV=1`) for `/team` and monitors.
+No extra npm runtime dependencies. Peer APIs come from Pi (`pi-ai`, `pi-coding-agent`, `pi-tui`, `typebox`). Requires a Herdr-managed pane (`HERDR_ENV=1`) for `/team` and monitors. Team commands also require an interactive Pi TUI session.
+
+Install this fork to use the worker RPC, run discovery, lifecycle reporting, and reconciliation changes described below:
 
 ```bash
-pi install git:github.com/tobi/pi-herdr-workers
+pi install git:github.com/dragosdm/pi-herdr-workers
 ```
+
+The original package is at [tobi/pi-herdr-workers](https://github.com/tobi/pi-herdr-workers).
 
 Or a local checkout:
 
@@ -69,6 +73,10 @@ git diff --check
 
 Workers are named `agent-<name>` (or `agent-<type>` / `agent-N`). First worker on a side splits toward it; further workers on that side stack. Starts `pi --orchestrated-by …` via `herdr agent start`.
 
+Workers use the current session's working directory and have their own conversation context. They do not get a separate Git worktree. `explore` and `research` default to `xai/grok-4.6`; other types default to the orchestrator's model. Set `model` to override this. Charters guide the worker through its prompt, not a filesystem permission boundary.
+
+If the requested name matches an existing worker in the same tab that is not already in the saved team, creation re-adopts that pane and binds a new assignment instead of starting another process. Otherwise, name collisions receive a suffix. The result includes the actual `name`, `paneId`, `runId`, and `adopted` flag. A successful creation is not proof that the assignment completed.
+
 ### `SendToAgent`
 
 ```json
@@ -110,6 +118,27 @@ Use a trusted mailbox root. Pane sanitization and acknowledgement filename check
 
 Each worker assignment has a provider-generated `runId`, separate from an RPC `requestId`, optional caller `correlationId`, worker name, and pane identity. New runs durably select lifecycle/report contract 2. A bound worker uses `ReportWorkerRun` for typed `message`, `completed`, or `failed` reports; completion requires a non-empty result and may include bounded artifact references and command/test checks. The extension supplies trusted identity and ordering fields. `SendToAgent` is for questions and ordinary communication, and its prose is never interpreted as a terminal outcome.
 
+The tool is active only for an interactive worker with an orchestrator and a valid run binding. Plain `/team adopt` establishes a messaging relationship but does not create a run binding. A bound worker can report progress, success, or failure:
+
+```json
+{ "status": "message", "message": "Mapped the authentication entry points." }
+```
+
+```json
+{
+  "status": "completed",
+  "result": "Implemented the requested change and verified it with the test suite.",
+  "artifacts": [{ "path": "reports/result.md", "description": "Implementation notes" }],
+  "checks": [{ "kind": "test", "command": "npm test", "outcome": "passed" }]
+}
+```
+
+```json
+{ "status": "failed", "error": "The required upstream API is unavailable." }
+```
+
+Artifact and check arrays are optional, with at most 32 entries each. Artifact references do not upload or verify files, and check results are worker-authored reports, not independently executed verification. Reports require a listening orchestrator; unlike ordinary messages, they do not fall back to typing a prompt into its pane. The tool's return confirms report publication to the inbox, not parent acceptance.
+
 Accepted observations are journaled in the parent session before publication on `herdr-workers:lifecycle` and the matching `herdr-workers:<status>` channel. Provider-observed start, worker readiness, explicit outcomes, and scoped uncertainty carry different evidence. Release and extension shutdown do not mean the worker stopped. See `docs/lifecycle-events.md` for the contract, durability, deduplication, and consumer boundaries.
 
 Uncertain contract 2 runs can be resolved through the separate process-local reconciliation provider. Reconciliation compares the caller's inspected accepted sequence, requires bounded evidence, verifies endpoint-bearing observations against the immutable binding, and records `started`, structured `completed`, or `failed` on the original run. It never retries or creates, sends to, stops, releases, or rebinds a worker. See `docs/reconciliation-protocol.md`.
@@ -127,6 +156,19 @@ The event bus is process-local, requests are not durable, and callers should use
 ### Durable run discovery
 
 Each spawn is registered before Herdr side effects. A separate run-query protocol lets extensions probe `herdr-workers:runs:rpc:probe`, fetch one run with `get`, page through current-session runs with `list`, and recover accepted evidence with bounded `replay`. Query protocol 2 is preferred and exposes the selected lifecycle contract, structured completion, and an `orchestrationGradeCompletion` marker. Protocol 1 remains an explicit readable compatibility projection without that marker. Strict handles combine immutable assignment and original endpoint facts with lifecycle state from accepted durable evidence. Optional live endpoint observation enriches only an exact original name-and-pane match and never rewrites durable identity. Older lifecycle-only runs remain visible as explicit legacy projections without fabricated registration or assignment fields. Consumers subscribe first, then list and replay, deduplicating by `(runId, acceptedSequence)`. See `docs/run-query-protocol.md` for schemas, pagination, routing, endpoint trust, and recovery behavior.
+
+### Integration reference
+
+Worker operations, run queries, and reconciliation have separate probes and version negotiation. A worker RPC provider selection does not select a run-query or reconciliation provider.
+
+| API | Versions | Client helper | Contract |
+|---|---|---|---|
+| Worker operations | 1 | `createWorkerRpcClient` in `rpc/client.ts` | [Spawn, send, inspect, routing, and errors](docs/rpc-protocol.md) |
+| Lifecycle observations | 2 for new runs; 1 readable | Subscribe through `pi.events` | [Evidence, reporting, and acceptance](docs/lifecycle-events.md) |
+| Run queries | 2 preferred; 1 compatibility | `createRunQueryClient` in `runs/client.ts` | [Get, list, and replay](docs/run-query-protocol.md) |
+| Reconciliation | 1, resolving lifecycle contract 2 | `createReconciliationClient` in `reconciliation/client.ts` | [Guarded uncertain-run resolution](docs/reconciliation-protocol.md) |
+
+Client helpers accept `{ events: pi.events }` and support bounded waits and abort signals. Raw JSON event-bus consumers do not need to import these helpers. See the [mailbox guarantee matrix](docs/mailbox-guarantees.md) for tested delivery and recovery limits.
 
 ---
 
@@ -216,8 +258,11 @@ MonitorStop monitorId="1"
 extensions/herdr-worker.ts   /team, CreateAgentPanel, SendToAgent, ReportWorkerRun
 mailbox/                     internal filesystem publication, listening, draining, acknowledgement
 lifecycle/                   worker lifecycle protocol, acceptance, persistence, publication
+rpc/                         worker RPC protocol, client, and server
 runs/                        durable run registry and run-query protocol
 reconciliation/              guarded uncertain-run reconciliation protocol
 extensions/split-handoff.ts  /split-handoff, /split-fork, /splits
 loop/                        /loop + Monitor* (Herdr-backed)
+docs/                        protocol contracts and mailbox guarantee matrix
+tests/                       adapter, protocol, mailbox, and recovery tests
 ```
