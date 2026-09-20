@@ -8,7 +8,7 @@ import type { TestContext } from "node:test";
 import { fileURLToPath } from "node:url";
 import type { ChildConfig, ChildRecord } from "./mailbox-child.js";
 import { inboxDir, listeningFile } from "../../mailbox/paths.js";
-import { createMailboxTransport, type MailboxBoundary, type MailboxCallbacks, type MailboxTransport, type MailboxTransportOptions } from "../../mailbox/transport.js";
+import { createMailboxTransport, type MailboxBoundary, type MailboxCallbacks, type MailboxDeliveryDisposition, type MailboxTransport, type MailboxTransportOptions } from "../../mailbox/transport.js";
 import { createControlledPiHost, type ControlledPiHost, type ControlledPiHostOptions, type ControlledPersistenceMode } from "./controlled-pi-host.js";
 
 interface ScheduledCallback {
@@ -52,7 +52,7 @@ export function mailboxFixture(t: TestContext) {
 	const transports: Array<{ transport: MailboxTransport; paneId: string }> = [];
 	const boundaries: MailboxBoundary[] = [];
 	const releaseGates: Array<() => void> = [];
-	const pendingDeliveries = new Set<Promise<void>>();
+	const pendingDeliveries = new Set<Promise<MailboxDeliveryDisposition>>();
 	const nativeWatchers: Array<{ watcher: fs.FSWatcher; closed: Promise<void> }> = [];
 	let disposed = false;
 
@@ -148,7 +148,7 @@ export function mailboxFixture(t: TestContext) {
 						deliver(envelope, envelopeId) {
 							const pending = (async () => {
 								await options.beforeDeliver?.(envelope, envelopeId);
-								await callbacks.deliver(envelope, envelopeId);
+								return callbacks.deliver(envelope, envelopeId);
 							})();
 							pendingDeliveries.add(pending);
 							void pending.then(() => pendingDeliveries.delete(pending), () => pendingDeliveries.delete(pending));

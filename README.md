@@ -202,6 +202,8 @@ Tools: `LoopCreate`, `LoopList`, `LoopUpdate`, `LoopDelete`.
 - Event: a Pi event source
 - Idle/dynamic: `/loop <goal>` then `LoopUpdate` with `continue` / `paused` / `completed`
 
+`LoopUpdate status="paused"` saves supplied `state`, `metrics`, and `doneCriteria` together with the pause in one snapshot. Omitted fields retain their values; empty strings clear them. A supplied `prompt` updates both the prompt and dynamic goal, including an empty string. Omitting it preserves both. `nextInterval` applies only to `continue`; pause ignores it, even if malformed. Pause does not renew the lifetime, increment counters, or schedule a wake. `completed` still deletes the controller rather than retaining its supplied checkpoint.
+
 State is journaled in pi's session JSONL via `appendEntry` by default. Existing session-specific `.pi/loops/` snapshots are imported on first use, without deleting the originals. Explicit project/shared-file scopes still use the locked file store, with a session-log audit mirror. `PI_LOOP_SCOPE=memory` remains ephemeral.
 
 Recurring loops expire after seven days unless recreated. Waiting for `LoopUpdate` does not suspend the original deadline: an active ordinary dynamic loop is deleted on the first eligible scheduler pump at or after expiry, or during recovery. Expiry prevents future scheduler work; it does not cancel a model turn or external work already executing. Cap: 25 loops. `LoopCreate` defaults to 25 wakes unless `maxFires` is supplied; `/loop` scheduled/event loops cap at 25, and dynamic goals at 20.
@@ -222,9 +224,14 @@ Read-only wakes enforce a tool-call gate (read/search/list and loop bookkeeping 
 - Each command gets a **down-split** pane titled `mon:<hash> <command>`
 - **The same command in the same cwd reuses that pane**
 - Panes **stay open** when the command finishes
-- Creating an already-running monitor attaches to it; it never sends `ctrl+c` or restarts it
-- `MonitorStop` validates the pane identity and current process state before sending `ctrl+c` — it does not close the pane
-- Handles and command/cwd metadata survive reload; restored process status starts **unknown**, and `MonitorList` refreshes it
+- Creating an already-busy monitor attaches without submitting input or sending `ctrl+c`. Foreground identity is observational, not proof that it is the requested command. An explicit create on an idle matching pane may submit the command again.
+- A newly claimed pane waits up to 5,000 ms for a positively identified supported shell, including a final label check. A fresh tab uses its root rather than splitting around a startup helper.
+- `command submitted` means Herdr acknowledged one `pane run`, not that the application is ready or finished. `attached` means this call sent no command.
+- Readiness failure retains the pane and its `pending` handle. `MonitorList` says `command not submitted`; `MonitorStop` does not interrupt pending startup helpers. Inspect the named pane before an explicit retry.
+- If submission times out, is cancelled, or its acknowledgement cannot be saved, the handle is `uncertain`. Submission may have happened. Inspect the pane before retrying; the manager never retries submission within the failed call.
+- `MonitorStop` validates the pane identity and current process state before sending `ctrl+c`. It does not close the pane.
+- Handles and command/cwd metadata survive reload, with optional `pending`, `submitted` or `uncertain` launch evidence in the existing v1 snapshot. Restored process status starts **unknown**. Legacy handles have no submission evidence, and restoration never starts a command.
+- Readiness is a foreground-process observation, not a shell-prompt handshake. Another actor can change the pane after inspection. Session appends and terminal input are not a transaction or a power-loss guarantee; old snapshots or older binaries may lack launch evidence. Do not automatically replay pending launches or assume downgrade/replay is safe.
 
 ```text
 MonitorCreate command="npm test" description="Run test suite"
@@ -242,6 +249,8 @@ MonitorStop monitorId="1"
 - Worker lifecycle observations are appended as `herdr-worker.lifecycle.v1` before local publication and restored from all entries in the current session. A surviving accepted journal suppresses another acceptance and restoration does not republish history. Memory-only journals do not establish process recovery; `/tree` does not erase all-entry lifecycle history.
 - An uncertain writer remains unsafe to replace automatically. The orchestration consumer owns explicit resource claims and quarantine, reconciles the same `runId`, releases the claim only under its phase policy after durable resolution, and treats retry as a separate explicit decision. The worker provider does not infer exclusivity from `cwd`.
 - Restoring state never creates panes, restarts commands, or re-sends an already recorded wake. An unexpired dynamic iteration awaiting `LoopUpdate` stays awaiting an update after reload; interrupted external work is not blindly repeated. Recovery retires overdue controllers before restoring triggers, without renewing their deadlines. Inspect an unexpired waiting iteration and provide the update, or pause/resume it explicitly from `/loop` when safe. A reached fire cap cannot be resumed; renewal requires a new authorized controller.
+- A paused checkpoint restores from the latest matching `herdr-loops.snapshot.v1` in all session entries, or from the authoritative shared file. Restoration does not fire a paused loop; the next wake after explicit `/loop` Resume uses that checkpoint. Supplementary `herdr-loops.update.v1` history is not replayed and cannot repair checkpoints lost before the [A09 fix](docs/implementation/A09.md). Legacy imports preserve only the checkpoint actually saved.
+- A pause checkpoint and status have one store commit boundary. A rejected session snapshot append rolls both back before trigger removal. If the later update-audit append fails, the whole pause remains committed. A shared-file save or mirror error can occur after atomic rename, leaving the whole new snapshot committed despite an error; inspect before retrying. Shared-file writes and Pi audit entries are not one transaction. A successful session append is not a disk-fsync guarantee.
 - Timers, subscriptions, in-flight requests, sampled process status and UI contexts are runtime resources, not replayed state. Shutdown aborts/cleans them without killing worker or monitor panes. Headless pi instances do not claim a pane's team mailbox.
 - Status items are compact counts, next-wake/awaiting-update state and unverified/unavailable monitors. Detailed rosters remain in `/team list`, `LoopList`, and `MonitorList`.
 - Durability follows pi's session storage contract: `--no-session` is still ephemeral, and a brand-new session may buffer entries until its first assistant response. External side effects and local journal appends are not a distributed transaction; inspect ambiguous interrupted operations rather than automatically retrying them.

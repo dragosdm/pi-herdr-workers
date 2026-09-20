@@ -179,7 +179,7 @@ interface HerdrWorkerTestOptions {
 	disableInbox?: boolean;
 	isListening?: (paneId: string) => boolean;
 	writeEnvelope?: (paneId: string, envelope: Envelope) => void;
-	onInboxHandler?: (deliverEnvelope: (envelope: unknown, envelopeId: string) => Promise<void>) => void;
+	onInboxHandler?: (deliverEnvelope: MailboxCallbacks["deliver"]) => void;
 }
 
 interface CreateOpts {
@@ -201,6 +201,7 @@ interface PendingSpawnLifecycle {
 	name: string;
 	paneId?: string;
 	scope: "pane_creation" | "agent_start" | "assignment_delivery";
+	awaitingReadinessBinding?: boolean;
 }
 
 export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions = {}) {
@@ -446,11 +447,24 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 		}
 	}
 
-	async function deliver(env: unknown, envelopeId: string) {
+	function isPendingStartupReadiness(envelope: Partial<Envelope>): boolean {
+		if (!interactive() || envelope.type !== "lifecycle" || !isWorkerRunReport(envelope.report)) return false;
+		const report = envelope.report;
+		if (report.status !== "started" || report.evidence.kind !== "worker_ready") return false;
+		const pending = pendingSpawnLifecycles.get(report.runId);
+		return pending?.awaitingReadinessBinding === true
+			&& pending.paneId !== undefined
+			&& pending.paneId === envelope.from?.paneId
+			&& pending.opts.lifecycleProtocol === report.protocol;
+	}
+
+	async function deliver(env: unknown, envelopeId: string): ReturnType<MailboxCallbacks["deliver"]> {
 		const ctx = ctxRef;
 		if (!env || typeof env !== "object") return;
 		const envelope = env as Partial<Envelope> & { from?: Partial<Sender> };
 		if (!envelope.from || typeof envelope.from.id !== "string" || typeof envelope.from.paneId !== "string") return;
+		// Retention is temporary startup permission, not peer or lifecycle acceptance.
+		if (isPendingStartupReadiness(envelope)) return "retry";
 		const peers = await knownPeerPanes();
 		if (stopped) return;
 		const known = peers.get(envelope.from.paneId);
@@ -1005,7 +1019,7 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			pendingSpawnLifecycles.delete(opts.runId);
 			throw error;
 		}
-		pendingSpawnLifecycles.set(opts.runId, { opts, name, paneId, scope: "agent_start" });
+		pendingSpawnLifecycles.set(opts.runId, { opts, name, paneId, scope: "agent_start", awaitingReadinessBinding: true });
 		try {
 			pi.appendEntry("herdr-worker.operation.v1", { name, paneId, phase: "pane-created", at: Date.now() });
 		} catch (error) {
@@ -1056,6 +1070,12 @@ export default function (pi: ExtensionAPI, testOptions: HerdrWorkerTestOptions =
 			throw error;
 		}
 		observeProviderStarted(opts, name, paneId);
+		const pending = pendingSpawnLifecycles.get(opts.runId);
+		if (pending) pending.awaitingReadinessBinding = false;
+		// Do not await Pi consumption. Only retry the retained filesystem snapshot after binding.
+		try { await mailbox.drainInboxAfterCurrent(); } catch {
+			// Mailbox warnings must not replace an otherwise successful provider operation.
+		}
 
 		if (opts.initialPrompt?.trim()) {
 			pendingSpawnLifecycles.set(opts.runId, { opts, name, paneId, scope: "assignment_delivery" });
