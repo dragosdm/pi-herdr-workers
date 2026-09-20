@@ -5,6 +5,7 @@ import {
   type ReducerEvent,
   type ReducerHandler,
 } from "../coordinator.js";
+import { validWakeId } from "../dynamic-ack.js";
 import { formatLastTransitionLines, formatTrigger } from "../loop-format.js";
 import {
   type NotificationReducerEvent,
@@ -262,13 +263,19 @@ export function createNotificationRuntime(options: NotificationRuntimeOptions): 
       return lines.join("\n");
     }
 
-    if (data.dynamic || (typeof data.trigger !== "string" && data.trigger?.type === "dynamic")) {
+    if (!data.taskBacklog && (data.dynamic || (typeof data.trigger !== "string" && data.trigger?.type === "dynamic"))) {
       const dynamic = data.dynamic;
       const lines = [
         `[pi-loop] Loop #${loopId} fired (dynamic).${constraint}`,
         `Goal: ${dynamic?.goal ?? prompt}`,
         `Iteration: ${dynamic?.iteration ?? 0}`,
       ];
+      if (validWakeId(dynamic?.pendingWakeId)) {
+        lines.push(`Wake ID: ${dynamic.pendingWakeId}`,
+          `Call LoopUpdate with id="${loopId}" and wakeId="${dynamic.pendingWakeId}" exactly once for this wake.`);
+      } else {
+        lines.push("This recovered wake has no valid Wake ID. Inspect LoopList and the saved checkpoint before explicitly recovering; do not submit a tokenless update.");
+      }
       if (dynamic?.state) lines.push(`State: ${dynamic.state}`);
       if (dynamic?.metrics) lines.push(`Metrics: ${dynamic.metrics}`);
       if (dynamic?.doneCriteria) lines.push(`Done criteria: ${dynamic.doneCriteria}`);
@@ -521,7 +528,11 @@ export function createNotificationRuntime(options: NotificationRuntimeOptions): 
       if (inFlight.delete(deliveryKey)) checkpoint("delivered");
     },
     restore(pending) {
-      notificationState.notificationsByKey = Object.fromEntries(pending.map((n) => [n.key, { ...n, sessionGeneration }]));
+      notificationState.notificationsByKey = Object.fromEntries(pending.map((n) => [n.key, { ...n, sessionGeneration,
+        // Old pending messages predate the required-token instructions. Do not mint a token here.
+        ...(!n.workflow && !n.orchestration && !n.taskBacklog && n.dynamic && !validWakeId(n.dynamic.pendingWakeId)
+          ? { message: buildLoopFireMessage({ ...n, prompt: n.dynamic.goal, trigger: { type: "dynamic" } }) } : {}),
+      }]));
     },
     syncRuntimeState,
     queueOrDeliverNotification,

@@ -19,6 +19,7 @@ export type LoopPauseKind = "administrative" | "controller_limit" | "semantic_te
 
 export interface LoopPauseRecord {
   kind: LoopPauseKind;
+  retirementCause?: "fire_cap" | "one_shot";
   at: number;
   reason?: string;
 }
@@ -57,6 +58,7 @@ export interface DynamicLoopState {
   iteration: number;
   nextWakeAt?: number;
   awaitingUpdate?: boolean;
+  pendingWakeId?: string;
   lastUpdatedAt?: number;
 }
 
