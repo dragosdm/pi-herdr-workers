@@ -77,10 +77,14 @@ test("Command creation rolls back the same impossible cron", async () => {
   assert.deepEqual(f.store.snapshot(), before);
   assert.match(notices[0], /No matching time/);
 });
-test("Known audit gap: cron without a prompt is interpreted as a dynamic goal", async () => {
+test("Cron without a prompt is rejected without creating a loop", async () => {
   const f = fixture();
-  await f.commands.get("loop").handler("0 9 * * 1-5", { hasUI: true, ui: { notify() {} } });
-  assert.equal(f.store.list()[0].trigger.type, "dynamic");
+  const notices: Array<[string, string]> = [];
+  await f.commands.get("loop").handler("0 9 * * 1-5", { hasUI: true, ui: { notify: (message: string, severity: string) => notices.push([message, severity]) } });
+  assert.equal(f.store.list().length, 0);
+  assert.equal(notices.length, 1);
+  assert.equal(notices[0][1], "warning");
+  assert.match(notices[0][0], /Provide a prompt after the interval or cron expression/);
 });
 test("Known audit gap: a second continue update succeeds without another wake", async () => {
   const f = fixture();
