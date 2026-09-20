@@ -25,7 +25,8 @@ function fixture(t: TestContext, store = new LoopStore()) {
   function waiting(dynamic: Partial<NonNullable<LoopEntry["dynamic"]>> = {}, opts: { taskBacklog?: boolean; maxFires?: number; recurring?: boolean } = {}) {
     return store.create({ type: "dynamic" }, "A11 regression", {
       recurring: true, maxFires: 10, ...opts,
-      dynamic: { goal: "finish regression", state: "checkpoint", metrics: "one iteration", doneCriteria: "verified", iteration: 1, awaitingUpdate: true, nextWakeAt: NOW, ...dynamic },
+      // A11 seeds already-dispatched snapshots; include A08's persisted wake identity.
+      dynamic: { goal: "finish regression", state: "checkpoint", metrics: "one iteration", doneCriteria: "verified", iteration: 1, awaitingUpdate: true, nextWakeAt: NOW, pendingWakeId: dynamic.awaitingUpdate === false ? undefined : "a11-fixture-wake", ...dynamic },
     });
   }
   return { store, scheduler, fires, expirations, waiting, clock: (at: number) => { now = at; }, permission: (value: boolean) => { allowed = value; } };
@@ -296,7 +297,8 @@ function updateTool(f: ReturnType<typeof fixture>) {
   const pi = { registerTool: (tool: any) => tools.set(tool.name, tool), appendEntry() {} } as unknown as ExtensionAPI;
   registerLoopTools({ pi, getStore: () => f.store, getScheduler: () => f.scheduler,
     getTriggerSystem: () => f.scheduler, getMonitorManager: () => ({ get: () => undefined }), updateWidget() {} });
-  return (id: string) => tools.get("LoopUpdate").execute("a11-update", { id, status: "continue", state: "updated checkpoint", nextInterval: "1s" });
+  const wakeIds = new Map(f.store.list().map(entry => [entry.id, entry.dynamic?.pendingWakeId]));
+  return (id: string) => tools.get("LoopUpdate").execute("a11-update", { id, wakeId: wakeIds.get(id), status: "continue", state: "updated checkpoint", nextInterval: "1s" });
 }
 
 test("A11 valid continue before deadline preserves lifetime and later expires", async (t) => {
@@ -323,7 +325,7 @@ for (const offset of [0, 1]) {
     f.clock(DEADLINE + offset);
     const before = f.store.snapshot();
     await assert.rejects(async () => update(entry.id), /has expired/);
-    assert.equal(f.store.continueDynamic(entry.id, { dynamic: { awaitingUpdate: false } }), undefined);
+    assert.equal(f.store.continueDynamic(entry.id, { dynamic: { awaitingUpdate: false } }, entry.dynamic!.pendingWakeId!), undefined);
     assert.equal(f.store.resume(entry.id), undefined);
     assert.deepEqual(f.store.snapshot(), before);
     f.scheduler.pump(Date.now());
