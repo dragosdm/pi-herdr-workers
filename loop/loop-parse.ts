@@ -24,16 +24,18 @@ const COMMON_INTERVALS: Record<number, string> = {
   86400: "0 0 * * *",
 };
 
-function roundToNearestCommon(seconds: number): { cron: string; description: string } {
-  // COMMON_INTERVALS is a non-empty const table, so keys[0] and
-  // COMMON_INTERVALS[best] below are true invariants, not runtime fallbacks.
-  const keys = Object.keys(COMMON_INTERVALS).map(Number).sort((a, b) => a - b);
-  let best = keys[0] as number;
-  for (const k of keys) {
-    if (Math.abs(k - seconds) < Math.abs(best - seconds)) best = k;
-  }
+export const CRON_TIMING_NOTE = "Timing: local wall-clock cron with scheduler jitter, not an elapsed-time interval.";
 
-  const mins = best / 60;
+// Recognition reserves duration-looking input for validation; it does not accept it.
+export function matchIntervalPrefix(input: string): { interval: string; rest: string } | undefined {
+  const trimmed = input.trim();
+  const match = trimmed.match(/^([+-]?(?:\d+(?:\.\d*)?|\.\d+)(?:e[+-]?\d+)?|[+-]?(?:Infinity|NaN))\s*[smhd](?=\s|$)/i);
+  if (!match) return undefined;
+  return { interval: match[0], rest: trimmed.slice(match[0].length).trim() };
+}
+
+function describeInterval(seconds: number): string {
+  const mins = seconds / 60;
   let description: string;
   if (mins < 60) {
     description = `${mins} minute${mins !== 1 ? "s" : ""}`;
@@ -47,7 +49,7 @@ function roundToNearestCommon(seconds: number): { cron: string; description: str
     }
   }
 
-  return { cron: COMMON_INTERVALS[best] as string, description };
+  return description;
 }
 
 function isFullCron(expr: string): boolean {
@@ -95,6 +97,10 @@ export function isValidCronExpression(expr: string): boolean {
   });
 }
 
+function boundedIntervalInput(input: string): string {
+  return input.length > 120 ? `${input.slice(0, 120)}…` : input;
+}
+
 export function parseInterval(input: string): { cron: string; description: string } {
   const trimmed = input.trim();
 
@@ -107,19 +113,21 @@ export function parseInterval(input: string): { cron: string; description: strin
 
   const match = trimmed.match(/^(\d+)\s*(s|m|h|d)$/i);
   if (match) {
-    const value = parseInt(match[1] ?? "", 10);
+    const value = Number(match[1]);
     const unit = (match[2] ?? "").toLowerCase();
-    const totalSec = value * (UNIT_TO_CRON[unit] ?? 60);
-
-    if (totalSec < 60) {
-      return { cron: `*/1 * * * *`, description: `${totalSec} seconds (rounded to 1 minute)` };
+    const totalSec = value * UNIT_TO_CRON[unit]!;
+    if (!Number.isSafeInteger(value) || value <= 0 || !Number.isSafeInteger(totalSec) || totalSec <= 0) {
+      throw new Error(`Interval must be a positive safe integer duration: "${boundedIntervalInput(input)}".`);
     }
-
-    return roundToNearestCommon(totalSec);
+    const cron = COMMON_INTERVALS[totalSec];
+    if (!cron) {
+      throw new Error(`Unsupported cron interval "${boundedIntervalInput(input)}". Supported durations: 1m, 2m, 5m, 10m, 15m, 30m, 1h, 2h, 3h, 4h, 6h, 8h, 12h, 1d. No rounding is applied; use an explicit five-field cron for a different wall-clock schedule.`);
+    }
+    return { cron, description: describeInterval(totalSec) };
   }
 
   throw new Error(
-    `Cannot parse interval "${input}". Use formats like "5m", "2h", "1d", or a full cron expression.`
+    `Cannot parse interval "${boundedIntervalInput(input)}". Use supported integer-unit cron shorthand (e.g., "5m", "2h", "1d") or an explicit five-field cron expression.`
   );
 }
 

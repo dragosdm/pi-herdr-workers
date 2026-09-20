@@ -33,11 +33,11 @@ function fixture() {
   return { store, scheduler, triggers, subscriptions, commands, call: (name: string, input: any) => tools.get(name).execute("audit", input) };
 }
 
-test("Known audit gap: zero duration silently creates a minute cadence", () => {
-  assert.equal(parseInterval("0m").cron, "*/1 * * * *");
+test("Zero duration is rejected without rounding", () => {
+  assert.throws(() => parseInterval("0m"), /positive safe integer/);
 });
-test("Known audit gap: two days silently becomes daily", () => {
-  assert.equal(parseInterval("2d").cron, "0 0 * * *");
+test("Two-day shorthand is rejected without becoming daily", () => {
+  assert.throws(() => parseInterval("2d"), /Unsupported cron interval/);
 });
 test("Known audit gap: day-of-month and weekday use AND, not conventional cron OR", () => {
   const next = cronToNextFire("0 0 1 * 1", new Date(2026, 8, 20, 12));
