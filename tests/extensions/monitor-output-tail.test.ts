@@ -1,4 +1,5 @@
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import test, { type TestContext } from "node:test";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { HerdrMonitorManager, type MonitorSnapshot } from "../../loop/runtime/herdr-monitor.js";
@@ -50,13 +51,61 @@ function fixture(t: TestContext, count = 1) {
   });
 }
 const tailRows = (result: any): string[] => result.content[0].text.split("\n").filter((line: string) => line.startsWith("  | "));
+const capturedMarkers = readFileSync(new URL("./fixtures/a02-herdr-0.8.0-markers.txt", import.meta.url), "utf8");
+const markerRows = ["A02_BEGIN_0909", "A02_READY_0909", "A02_END_0909"];
+
+test("A02 live capture: bounded wider window reaches markers above trailing blank screen rows", async t => {
+  const f = fixture(t);
+  // Only the markers are captured bytes. Padding models terminal rows selected before CLI output cleanup.
+  const screen = [...capturedMarkers.trimEnd().split("\n"), ...Array<string>(20).fill("")];
+  f.hook = args => args[1] === "read"
+    ? response(screen.slice(-Number(args[6])).join("\n").trimEnd()) : undefined;
+  assert.deepEqual(await f.manager.readTail("pane-1"), markerRows);
+  assert.deepEqual(tailRows(await f.list()), markerRows.map(row => `  | ${row}`));
+  assert.equal(f.reads().length, 2, "one capture per read, without retries");
+  assert.ok(f.reads().every(call => call.args[6] === "50"));
+});
+
+test("wider capture still displays only the last five nonblank rows", async t => {
+  const f = fixture(t);
+  const screen = [...Array.from({ length: 10 }, (_, i) => `row-${i}`), ...Array<string>(20).fill("")];
+  f.hook = args => args[1] === "read" ? response(screen.slice(-Number(args[6])).join("\n")) : undefined;
+  const listed = await f.list();
+  const expected = ["row-5", "row-6", "row-7", "row-8", "row-9"].map(row => `  | ${row}`);
+  assert.deepEqual(tailRows(listed), expected);
+  assert.deepEqual(listed.details.expanded.slice(1), expected);
+  assert.equal(f.reads().length, 1); assert.equal(f.reads()[0].args[6], "50");
+});
+
+test("markers outside the bounded window do not cause retries or scrollback fallback", async t => {
+  const f = fixture(t);
+  const screen = [...markerRows, ...Array<string>(50).fill("")];
+  f.hook = args => args[1] === "read" ? response(screen.slice(-Number(args[6])).join("\n")) : undefined;
+  assert.deepEqual(tailRows(await f.list()), ["  | (no output captured)"]);
+  assert.equal(f.reads().length, 1); assert.equal(f.reads()[0].args[6], "50");
+});
+
+test("explicit internal counts above the capture minimum retain their requested bound", async t => {
+  const f = fixture(t); const rows = Array.from({ length: 70 }, (_, i) => `row-${i}`);
+  f.output = rows.join("\n");
+  assert.deepEqual(await f.manager.readTail("pane-1", 60), rows.slice(-60));
+  assert.equal(f.reads().length, 1); assert.equal(f.reads()[0].args[6], "60");
+});
+
+test("A02 live capture: exact sanitized CLI marker rows survive manager and list", async t => {
+  const f = fixture(t); f.output = capturedMarkers;
+  assert.deepEqual(await f.manager.readTail("pane-1"), markerRows);
+  const listed = await f.list();
+  assert.deepEqual(tailRows(listed), markerRows.map(row => `  | ${row}`));
+  assert.deepEqual(listed.details.expanded.slice(1), markerRows.map(row => `  | ${row}`));
+});
 
 test("A02: ordinary terminal stdout is returned without JSON parsing", async t => {
   const f = fixture(t); const controller = new AbortController();
   assert.deepEqual(await f.manager.readTail("pane-1", undefined, controller.signal), ["AUDIT_SERVER_READY"]);
   assert.equal(f.calls.length, 1);
   assert.equal(f.calls[0].command, "herdr");
-  assert.deepEqual(f.calls[0].args, ["pane", "read", "pane-1", "--source", "recent-unwrapped", "--lines", "5", "--format", "text"]);
+  assert.deepEqual(f.calls[0].args, ["pane", "read", "pane-1", "--source", "recent-unwrapped", "--lines", "50", "--format", "text"]);
   assert.equal(f.calls[0].timeout, 15000);
   assert.ok(f.calls[0].signal instanceof AbortSignal); assert.equal(f.calls[0].signal.aborted, false);
   controller.abort(); assert.equal(f.calls[0].signal.aborted, true);
@@ -90,7 +139,7 @@ for (const [lines, stdout, expected] of [
 ] as [number | undefined, string, string[]][]) test(`last nonblank rows: count=${lines}, input=${JSON.stringify(stdout)}`, async t => {
   const f = fixture(t); f.output = stdout;
   assert.deepEqual(await f.manager.readTail("pane-1", lines), expected);
-  assert.equal(f.calls[0].args[6], String(lines ?? 5));
+  assert.equal(f.calls[0].args[6], String(Math.max(50, lines ?? 5)));
 });
 for (const lines of [0, -1, 1.5, NaN, Infinity, -Infinity, Number.MAX_SAFE_INTEGER + 1]) test(`invalid line count ${lines} rejects before exec`, async t => {
   const f = fixture(t);

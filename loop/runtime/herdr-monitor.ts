@@ -228,7 +228,10 @@ export class HerdrMonitorManager {
   }
   async readTail(paneId: string, lines = 5, signal?: AbortSignal): Promise<string[]> {
     if (!Number.isSafeInteger(lines) || lines <= 0) throw new RangeError("Tail lines must be a positive safe integer.");
-    const stdout = await this.herdrText(["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", String(lines), "--format", "text"], signal);
+    // Herdr 0.8.0 counts terminal rows before dropping trailing blanks from stdout.
+    // Keep one bounded capture window, separate from the nonblank display-row limit.
+    const captureLines = Math.max(50, lines);
+    const stdout = await this.herdrText(["pane", "read", paneId, "--source", "recent-unwrapped", "--lines", String(captureLines), "--format", "text"], signal);
     return stripVTControlCharacters(stdout)
       .replace(/\r\n?/g, "\n")
       .replace(/[\x00-\x09\x0b-\x1f\x7f-\x9f]/g, " ")
